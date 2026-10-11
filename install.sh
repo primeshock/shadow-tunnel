@@ -41,6 +41,7 @@ readonly SRC_DIR=$STATE_DIR/src
 readonly UNIT_DIR=${CANDY_UNIT_DIR:-/etc/systemd/system}
 readonly BIN_DIR=/usr/local/bin
 readonly CANDYCTL=$BIN_DIR/candyctl
+readonly CANDYSHADOW=$BIN_DIR/candyshadow
 readonly LIB_DIR=${CANDY_LIB_DIR:-/usr/local/lib/candy-spoof}
 readonly PANEL_PY=$LIB_DIR/candy-panel.py
 readonly PANEL_JSON=$ETC_DIR/panel.json
@@ -621,6 +622,9 @@ Usage: candyctl [-t NAME] <command>
   test [--host H --port P --secs N]
                          end-to-end tunnel test: handshake, real data, packet capture
   check                  validate the configuration with the binary (--check-config); exit 1 if rejected
+  diagnose [--link L]    full tunnel-path doctor; pass the peer's setup link for a two-sided check
+  update                 update to the latest release (rebuild), keeping your configuration
+  backup [FILE]          write a .tar.gz of /etc/candy-spoof (config + keys)
   config                 print the configuration (pre_shared_key redacted)
   config edit            edit in \$EDITOR; validated, applied with automatic rollback
   set key=value ...      change fields, e.g.  candyctl set icmp_id=17185 mtu=1300
@@ -883,11 +887,34 @@ cmd_check() { # validate each target's config with the binary's --check-config
   return $fail
 }
 
+cmd_backup() { # tar.gz of the whole config dir (config + keys + panel + tunnels)
+  local out=${1:-/root/candy-spoof-backup-$(date +%F-%H%M%S).tar.gz}
+  [[ -d $ETC ]] || die "nothing to back up ($ETC missing)"
+  tar czf "$out" -C "$(dirname "$ETC")" "$(basename "$ETC")" || die "backup failed"
+  chmod 0600 "$out" 2>/dev/null || true
+  echo "$out"
+}
+
+cmd_update() { # rebuild + reinstall from the latest release, keeping the config
+  local url=${CANDY_INSTALL_URL:-https://raw.githubusercontent.com/primeshock/shadow-tunnel/master/install.sh}
+  if [[ ${1-} != -y ]]; then
+    printf 'Update rebuilds the binary and reinstalls the panel/CLI, keeping %s. Continue? [y/N] ' "$ETC" >&2
+    local a=""; read -r a </dev/tty 2>/dev/null || true
+    case ${a,,} in y|yes) ;; *) echo "aborted" >&2; return 1 ;; esac
+  fi
+  command -v curl >/dev/null || die "curl is required"
+  echo "Backing up first: $(cmd_backup)" >&2
+  curl -fsSL "$url" | CANDY_NONINTERACTIVE=1 CANDY_RECONFIGURE=0 CANDY_ROLE="$ROLE" bash
+}
+
 cmd=$1; shift
 check_target
 case $cmd in
   status)      cmd_status ;;
   check)       cmd_check ;;
+  diagnose)    need_py; exec "${PY[@]}" diagnose ${TARGET:+-t "$TARGET"} "$@" ;;
+  update)      cmd_update "${1-}" ;;
+  backup)      cmd_backup "${1-}" ;;
   tunnels)     cmd_tunnels ;;
   start|stop|restart)
                for n in $(targets); do $SYSTEMCTL "$cmd" "$(unit_of "$n")"; done; echo "$cmd: $(targets | tr '\n' ' ')" ;;
@@ -908,6 +935,170 @@ esac
 CANDYCTL_EOF
   chmod 0755 "$CANDYCTL.new"; chown root:root "$CANDYCTL.new"; mv -f "$CANDYCTL.new" "$CANDYCTL"
   ok "Installed $CANDYCTL"
+}
+
+install_candyshadow() {
+  cat >"$CANDYSHADOW.new" <<'CANDYSHADOW_EOF'
+#!/usr/bin/env bash
+# candyshadow - friendly interactive menu over candyctl (installed by install.sh)
+set -Euo pipefail
+
+ETC=${CANDY_ETC_DIR:-/etc/candy-spoof}
+ROLE_FILE=$ETC/role
+TUNNELS=$ETC/tunnels
+CTL=${CANDY_CTL:-/usr/local/bin/candyctl}
+PANEL_JSON=$ETC/panel.json
+
+if [[ $EUID -ne 0 ]]; then
+  command -v sudo >/dev/null && exec sudo -- "$0" "$@"
+  echo "candyshadow: must run as root" >&2; exit 1
+fi
+[[ -r $ROLE_FILE ]] || { echo "candyshadow: not installed (missing $ROLE_FILE)"; exit 1; }
+ROLE=$(<"$ROLE_FILE")
+
+if [[ -t 0 ]]; then TTY=/dev/stdin; elif { : </dev/tty; } 2>/dev/null; then TTY=/dev/tty
+else echo "candyshadow needs a terminal; use 'candyctl' directly for scripting" >&2; exit 1; fi
+
+c_b=$'\e[36m'; c_g=$'\e[32m'; c_y=$'\e[33m'; c_d=$'\e[2m'; c_0=$'\e[0m'
+[[ -t 1 ]] || { c_b=; c_g=; c_y=; c_d=; c_0=; }
+
+ask()   { local p=$1 v=""; printf '%s' "$p" >&2; read -r v <"$TTY" || true; printf '%s' "$v"; }
+pause() { printf '\n%sEnter to continue%s ' "$c_d" "$c_0" >&2; read -r _ <"$TTY" || true; }
+names() { echo main; local f; for f in "$TUNNELS"/*.toml; do [[ -e $f ]] && basename "$f" .toml; done; return 0; }
+active(){ systemctl is-active "candy-spoof-$ROLE${1:+@$1}.service" 2>/dev/null || true; }
+unit_of(){ [[ $1 == main ]] && echo "candy-spoof-$ROLE.service" || echo "candy-spoof-$ROLE@$1.service"; }
+
+panel_url() { command -v python3 >/dev/null && python3 /usr/local/lib/candy-spoof/candy-panel.py admin info 2>/dev/null || true; }
+
+FIELDS_COMMON=(real_ip peer_real_ip spoofed_ip peer_spoofed_ip spoofed_ip_pool allowed_peers \
+               data_port icmp_id mtu initial_cwnd max_retries rto_min_ms interface pre_shared_key)
+
+edit_fields() { # edit_fields <tunnel>
+  local t=$1
+  while :; do
+    clear 2>/dev/null || true
+    echo "${c_b}Edit config — $t${c_0}"
+    local fields=("${FIELDS_COMMON[@]}"); [[ $ROLE == client ]] && fields+=(socks5_port)
+    local cur i=1
+    for f in "${fields[@]}"; do
+      cur=$("$CTL" -t "$t" config 2>/dev/null | sed -n "s/^[[:space:]]*$f[[:space:]]*=[[:space:]]*//p" | head -n1)
+      printf "  %2d) %-16s %s%s%s\n" "$i" "$f" "$c_d" "$cur" "$c_0"; ((i++))
+    done
+    echo "   0) back"
+    local sel; sel=$(ask "pick a field to edit: ")
+    [[ $sel == 0 || -z $sel ]] && return 0
+    local idx=$((sel-1))
+    [[ $idx -ge 0 && $idx -lt ${#fields[@]} ]] || continue
+    local key=${fields[$idx]} val
+    val=$(ask "new value for $key: ")
+    [[ -z $val ]] && { echo "unchanged"; pause; continue; }
+    if "$CTL" -t "$t" set "$key=$val"; then echo "${c_g}saved${c_0}"; else echo "${c_y}rejected (see message above)${c_0}"; fi
+    pause
+  done
+}
+
+tunnel_menu() { # tunnel_menu <tunnel>
+  local t=$1
+  while :; do
+    clear 2>/dev/null || true
+    echo "${c_b}Tunnel: $t${c_0}  (state: $(active "$([[ $t == main ]] || echo "$t")"))"
+    echo "  1) status      2) start      3) stop     4) restart"
+    echo "  5) edit config 6) logs       7) diagnose"
+    [[ $t != main ]] && echo "  8) delete tunnel"
+    echo "  0) back"
+    case "$(ask '> ')" in
+      1) "$CTL" -t "$t" status; pause ;;
+      2) "$CTL" -t "$t" start; pause ;;
+      3) "$CTL" -t "$t" stop; pause ;;
+      4) "$CTL" -t "$t" restart; pause ;;
+      5) edit_fields "$t" ;;
+      6) "$CTL" -t "$t" logs -n 60 --no-pager 2>/dev/null || "$CTL" -t "$t" logs; pause ;;
+      7) "$CTL" -t "$t" diagnose || true; pause ;;
+      8) if [[ $t != main ]]; then
+           [[ "$(ask "really delete '$t'? type the name: ")" == "$t" ]] && { systemctl disable --now "$(unit_of "$t")" 2>/dev/null; rm -f "$TUNNELS/$t.toml"; systemctl reset-failed "$(unit_of "$t")" 2>/dev/null; echo "deleted"; pause; return 0; }
+         fi ;;
+      0|"") return 0 ;;
+    esac
+  done
+}
+
+manage_tunnels() {
+  while :; do
+    clear 2>/dev/null || true
+    echo "${c_b}Tunnels${c_0}"
+    local list=() i=1 n st
+    while read -r n; do
+      [[ -z $n ]] && continue
+      st=$(active "$([[ $n == main ]] || echo "$n")")
+      local col=$c_y; [[ $st == active ]] && col=$c_g
+      printf "  %2d) %-16s %s%s%s\n" "$i" "$n" "$col" "${st:-unknown}" "$c_0"
+      list+=("$n"); ((i++))
+    done < <(names)
+    echo "   0) back"
+    local sel; sel=$(ask "pick a tunnel: ")
+    [[ $sel == 0 || -z $sel ]] && return 0
+    local idx=$((sel-1))
+    [[ $idx -ge 0 && $idx -lt ${#list[@]} ]] && tunnel_menu "${list[$idx]}"
+  done
+}
+
+panel_menu() {
+  while :; do
+    clear 2>/dev/null || true
+    echo "${c_b}Web panel${c_0}   $(panel_url)"
+    echo "  1) info / URL      2) reset password   3) watchdog"
+    echo "  4) bind address    5) port             6) TLS on/off"
+    echo "  7) start  8) stop  9) restart          0) back"
+    case "$(ask '> ')" in
+      1) "$CTL" panel info; pause ;;
+      2) "$CTL" panel passwd; pause ;;
+      3) echo "values: off 30m 1h 6h 12h 24h"; "$CTL" watchdog "$(ask 'watchdog: ')"; pause ;;
+      4) "$CTL" panel bind "$(ask 'bind IP (e.g. 0.0.0.0): ')"; pause ;;
+      5) "$CTL" panel port "$(ask 'port: ')"; pause ;;
+      6) "$CTL" panel tls "$(ask 'tls on|off: ')"; pause ;;
+      7) "$CTL" panel start; pause ;;
+      8) "$CTL" panel stop; pause ;;
+      9) "$CTL" panel restart; pause ;;
+      0|"") return 0 ;;
+    esac
+  done
+}
+
+main_menu() {
+  while :; do
+    clear 2>/dev/null || true
+    echo "${c_b}Shadow Tunnel${c_0}  —  role: $ROLE  host: $(hostname)"
+    local url; url=$(panel_url); [[ -n $url ]] && echo "${c_d}panel: $url${c_0}"
+    echo
+    echo "  1) Manage tunnels"
+    echo "  2) Open web panel (show URL)"
+    echo "  3) Diagnose (tunnel doctor)"
+    echo "  4) Health check"
+    echo "  5) Logs (follow)"
+    echo "  6) Setup link / pre-shared key"
+    echo "  7) Panel settings"
+    echo "  8) Backup config"
+    echo "  9) Update (keep config)"
+    echo "  0) Quit"
+    case "$(ask '> ')" in
+      1) manage_tunnels ;;
+      2) "$CTL" panel info 2>/dev/null; echo; echo "Reach it over SSH:  ssh -L 7777:127.0.0.1:7777 root@<server>"; pause ;;
+      3) "$CTL" diagnose; local l; l=$(ask "paste the peer's candyspoof:// link for a 2-sided check (or Enter to skip): "); [[ -n $l ]] && "$CTL" diagnose --link "$l"; pause ;;
+      4) command -v python3 >/dev/null && "$CTL" status; "$CTL" check || true; pause ;;
+      5) "$CTL" logs -f ;;
+      6) echo "pre-shared key:"; "$CTL" token; echo; echo "setup link for the other side:"; "$CTL" link; pause ;;
+      7) panel_menu ;;
+      8) echo "backup written to: $("$CTL" backup)"; pause ;;
+      9) "$CTL" update ;;
+      0|q|"") clear 2>/dev/null || true; exit 0 ;;
+    esac
+  done
+}
+
+main_menu
+CANDYSHADOW_EOF
+  chmod 0755 "$CANDYSHADOW.new"; chown root:root "$CANDYSHADOW.new"; mv -f "$CANDYSHADOW.new" "$CANDYSHADOW"
+  ok "Installed $CANDYSHADOW"
 }
 
 install_panel_files() {
@@ -3386,6 +3577,40 @@ def cmd_link(argv):
     print(make_link(inst.name, inst.role, inst.cfg()))
 
 
+def cmd_diagnose(argv):
+    ap = argparse.ArgumentParser(prog="candyctl diagnose")
+    ap.add_argument("-t", "--tunnel", default="main")
+    ap.add_argument("--link", default="")
+    args = ap.parse_args(argv)
+
+    class _Req:
+        pass
+    req = _Req()
+    req.json = {"name": args.tunnel, "link": args.link}
+    try:
+        r = api_diagnose(req)
+    except ApiError as e:
+        sys.exit("diagnose: %s" % e)
+
+    tty = sys.stdout.isatty()
+    C = {"ok": "\033[32m", "warn": "\033[33m", "fail": "\033[31m", "info": "\033[36m", "0": "\033[0m"} if tty \
+        else {k: "" for k in ("ok", "warn", "fail", "info", "0")}
+    sym = {"ok": "✓", "warn": "!", "fail": "✕", "info": "i"}
+    for f in r["findings"]:
+        lvl = f["level"]
+        line = "%s%s%s %s" % (C.get(lvl, ""), sym.get(lvl, "i"), C["0"], f["title"])
+        if f.get("field"):
+            line += "  [%s]" % f["field"]
+        print(line)
+        if f.get("detail"):
+            print("    " + f["detail"])
+        if f.get("fix"):
+            print("    %s→ %s%s" % (C["info"], f["fix"], C["0"]))
+    s = r["summary"]
+    print("\n%d fail · %d warn · %d ok" % (s.get("fail", 0), s.get("warn", 0), s.get("ok", 0)))
+    sys.exit(1 if s.get("fail", 0) else 0)
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
@@ -3406,6 +3631,8 @@ def main():
         cmd_cfg(sys.argv[2:])
     elif cmd == "link":
         cmd_link(sys.argv[2:])
+    elif cmd == "diagnose":
+        cmd_diagnose(sys.argv[2:])
     else:
         sys.exit(__doc__)
 
@@ -3706,6 +3933,7 @@ main() {
   configure
   write_service_unit
   install_candyctl
+  install_candyshadow
   setup_watchdog
   start_service
   setup_panel

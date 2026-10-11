@@ -50,12 +50,38 @@ the other side, and the web-panel URL + password.
 
 ## Use it
 
+**`candyshadow`** — one command opens an interactive menu for everything:
+manage tunnels (list/active state, per-field config edit, start/stop/restart/
+delete), open the web panel, **update**, **backup**, health, logs, the
+**Diagnose** tunnel-doctor, and panel settings (password/watchdog/bind/port/TLS).
+
+```bash
+sudo candyshadow
+```
+
+Or drive it directly with `candyctl`:
+
 ```bash
 candyctl status          # services, config (key redacted)
 candyctl check           # validate the config against the binary
+candyctl diagnose        # tunnel doctor (add --link <peer link> for a 2-sided check)
 candyctl test            # end-to-end tunnel test
 candyctl logs -f         # follow the logs
+candyctl backup          # tar.gz of /etc/candy-spoof (config + keys)
+candyctl update          # rebuild + reinstall the latest, keeping your config
 candyctl panel info      # print the panel URL
+```
+
+### Updating without losing your tunnels
+
+`candyctl update` (or re-running the installer) **keeps `/etc/candy-spoof`** —
+your config, keys, panel password and extra tunnels are preserved; only the
+binary, CLI and panel are rebuilt. It makes a backup first. To update by hand:
+
+```bash
+sudo candyctl update            # recommended
+# or, equivalently, re-run the installer (answer "y" to "keep configuration")
+curl -fsSL https://raw.githubusercontent.com/primeshock/shadow-tunnel/master/install.sh | sudo bash
 ```
 
 Reach the panel (loopback by default) over SSH:
