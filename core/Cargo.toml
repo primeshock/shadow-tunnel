@@ -1,0 +1,61 @@
+[package]
+name = "candy-spoof"
+version = "0.1.0"
+edition = "2021"
+authors = ["AmiRCandy"]
+description = "Bidirectional IP spoofing tunnel for heavily censored networks"
+license = "MIT"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Packet building/parsing
+pnet = "0.35"
+pnet_packet = "0.35"
+pnet_transport = "0.35"
+
+# Low-level OS interfaces
+libc = "0.2"
+
+# Randomness (for IP rotation, sequence numbers, etc.)
+rand = "0.8"
+
+# Byte manipulation
+bytes = "1"
+
+# Packet authentication (keyed HMAC over each CandyPacket using the PSK)
+hmac = "0.12"
+sha2 = "0.10"
+
+# Concurrent maps
+dashmap = "6"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,77 @@
+# Candy-Spoof – Client Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# IP Addressing
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The real IPv4 address of this machine (used as routing destination, not
+# as the source of tunnel packets).
+real_ip        = "10.0.0.1"
+
+# The real IPv4 address of the remote Candy-Spoof server.
+peer_real_ip   = "203.0.113.1"
+
+# The spoofed source IP this client puts in every outgoing packet.
+# Choose a routable, innocent-looking address.
+spoofed_ip     = "8.8.4.4"
+
+# Spoofed IP pool – one will be chosen at random per session for better
+# evasion.  Includes spoofed_ip so it is always a valid choice.
+spoofed_ip_pool = ["8.8.4.4", "1.1.1.1", "208.67.222.222"]
+
+# The spoofed source IP the server uses (what incoming server replies
+# will look like).
+peer_spoofed_ip = "1.2.3.4"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Channel Settings
+# ─────────────────────────────────────────────────────────────────────────────
+
+# UDP port for the data channel.  Must match server.
+data_port = 51820
+
+# ICMP echo identifier for the control channel.  Pick a random 16-bit value;
+# must match the server config.
+icmp_id = 0x4321
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Security
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Pre-shared key used to authenticate packets (hex string, any length).
+# Must match the server config exactly.
+pre_shared_key = "change-this-to-a-random-secret-key-at-least-32-chars"
+
+# Additional allowed peer IPs (beyond peer_real_ip and peer_spoofed_ip).
+allowed_peers = []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tunnel & Performance
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Number of independent parallel tunnels.
+tunnel_count = 4
+
+# Maximum payload bytes per packet (stay below 1400 to avoid fragmentation).
+mtu = 1380
+
+# Initial congestion window in packets.
+initial_cwnd = 10.0
+
+# Robustness knobs (optional; defaults shown). These tune the existing ARQ and
+# do NOT change how many packets are sent in the common case.
+#   max_retries : times a packet is retransmitted before giving up (1-100)
+#   rto_min_ms  : floor for the retransmission timeout, ms (10-60000); raise it
+#                 on high-latency/jittery links to avoid spurious retransmits
+# max_retries = 8
+# rto_min_ms = 200
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Network Interface & SOCKS5
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Network interface to bind raw sockets to (e.g. "eth0", "ens3", "enp3s0").
+interface = "eth0"
+
+# Local SOCKS5 proxy port.  Configure your browser / application to use
+# 127.0.0.1:1080 as a SOCKS5 proxy.
+socks5_port = 1080

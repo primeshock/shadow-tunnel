@@ -1,0 +1,105 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Linux binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --release --bins
+
+      - name: Rename binaries for upload
+        run: |
+          cp target/release/client candy-spoof-client-linux-x86_64
+          cp target/release/server candy-spoof-server-linux-x86_64
+
+      - name: Upload client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: candy-spoof-client-linux-x86_64
+          path: candy-spoof-client-linux-x86_64
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: candy-spoof-server-linux-x86_64
+          path: candy-spoof-server-linux-x86_64
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only run on version tags or manual dispatch from main
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    permissions:
+      contents: write
+    steps:
+      - name: Download client binary
+        uses: actions/download-artifact@v4
+        with:
+          name: candy-spoof-client-linux-x86_64
+
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: candy-spoof-server-linux-x86_64
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "TAG=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "TAG=nightly-$(date +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release and upload binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.TAG }}
+          name: "Candy-Spoof ${{ steps.tag.outputs.TAG }}"
+          body: |
+            ## Candy-Spoof Release ${{ steps.tag.outputs.TAG }}
+
+            ### Downloads
+            | Binary | Platform |
+            |--------|----------|
+            | `candy-spoof-client-linux-x86_64` | Linux x86_64 client (SOCKS5 proxy) |
+            | `candy-spoof-server-linux-x86_64` | Linux x86_64 server (tunnel endpoint) |
+
+            > **Note:** Both binaries require `CAP_NET_RAW` or root privileges to
+            > use raw sockets for IP spoofing.
+          files: |
+            candy-spoof-client-linux-x86_64
+            candy-spoof-server-linux-x86_64
+          draft: false
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}

@@ -1,0 +1,62 @@
+# Candy-Spoof – Server Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# IP Addressing
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The real IPv4 address of this server.
+real_ip        = "203.0.113.1"
+
+# The real IPv4 address of the client.
+peer_real_ip   = "10.0.0.1"
+
+# The spoofed source IP the server uses in outgoing replies.
+spoofed_ip     = "1.2.3.4"
+
+# Spoofed IP pool – server can rotate among multiple addresses.
+spoofed_ip_pool = ["1.2.3.4", "5.6.7.8"]
+
+# The spoofed source IP the client uses (what we expect to receive as
+# source in incoming packets).
+peer_spoofed_ip = "8.8.4.4"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Channel Settings
+# ─────────────────────────────────────────────────────────────────────────────
+
+# UDP port for the data channel.  Must match client.
+data_port = 51820
+
+# ICMP echo identifier.  Must match client config.
+icmp_id = 0x4321
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Security
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Pre-shared key – must match client exactly.
+pre_shared_key = "change-this-to-a-random-secret-key-at-least-32-chars"
+
+# Additional trusted client IPs.
+allowed_peers = []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tunnel & Performance
+# ─────────────────────────────────────────────────────────────────────────────
+
+tunnel_count = 4
+mtu = 1380
+initial_cwnd = 10.0
+
+# Robustness knobs (optional; defaults shown) — see client.toml for details.
+# max_retries = 8
+# rto_min_ms = 200
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Network Interface
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Network interface to bind raw sockets to.
+interface = "eth0"
+
+# socks5_port is unused on the server but can be left at the default.
+socks5_port = 1080
