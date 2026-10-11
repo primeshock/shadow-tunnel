@@ -14,7 +14,7 @@
 #   logging       : env_logger (RUST_LOG honoured, default "info")
 #
 # Also installs: shadow-spoof-monitor (metrics + log sampler), an optional web panel
-# (monitor, create/edit tunnels, tests) and `shadowctl` (see: shadowctl help).
+# (monitor, create/edit tunnels, tests) and `shadowctl` (see: shadowtun help).
 #
 # Usage:
 #   sudo ./install.sh                       interactive
@@ -616,7 +616,7 @@ write_service_unit() {
 install_shadowctl() {
   cat >"$SHADOWCTL.new" <<'SHADOWCTL_EOF'
 #!/usr/bin/env bash
-# shadowctl - runtime management for Shadow Spoof (installed by install.sh)
+# shadowtun - runtime management for Shadow Spoof (installed by install.sh)
 set -Eeuo pipefail
 umask 077
 
@@ -635,31 +635,32 @@ die() { printf 'shadowctl: %s\n' "$*" >&2; exit 1; }
 
 usage() {
 cat <<EOF
-Usage: shadowctl [-t NAME] <command>
+Usage: shadowtun [-t NAME] <command>
 
   status                 services, watchdog, panel and (redacted) configuration
   tunnels                list tunnels on this host
   start | stop | restart all tunnels (or one with -t NAME)
-  logs [journalctl args] e.g.  shadowctl logs -f
+  logs [journalctl args] e.g.  shadowtun logs -f
   monitor                live dashboard (CPU/RAM/connections/traffic/events)
   monitor logs [LEVEL]   live colourised logs (LEVEL: debug|info|warn|error)
   test [--host H --port P --secs N]
                          end-to-end tunnel test: handshake, real data, packet capture
   check                  validate the configuration with the binary (--check-config); exit 1 if rejected
   diagnose [--link L]    full tunnel-path doctor; pass the peer's setup link for a two-sided check
+  mtu                    path-MTU probe to the peer; recommends a tunnel mtu (Linux)
   update                 update to the latest release (rebuild), keeping your configuration
   backup [FILE]          write a .tar.gz of /etc/shadow-spoof (config + keys)
   restore <FILE>         restore config/keys from a backup, then restart (backs up current first)
   uninstall              remove services, binaries, panel and config
   config                 print the configuration (pre_shared_key redacted)
   config edit            edit in \$EDITOR; validated, applied with automatic rollback
-  set key=value ...      change fields, e.g.  shadowctl set icmp_id=17185 mtu=1300
+  set key=value ...      change fields, e.g.  shadowtun set icmp_id=17185 mtu=1300
   token                  print the pre-shared key
   link                   print the setup link for the other side
   watchdog <off|30m|1h|6h|12h|24h>   periodic restart via systemd timer
   restart-sec <1-3600>   crash-recovery delay (RestartSec)
   socks-port <PORT>      (client) change the local SOCKS5 port
-  panel [info|passwd|passwd-set|port N|bind IP|tls on|off|start|stop|restart]
+  panel [info|passwd|port N|bind IP|tls on|off|enable|disable|start|stop|restart]
 EOF
 }
 
@@ -855,7 +856,7 @@ cmd_socks_port() {
     echo "Confirmed: 127.0.0.1:$port is listening."
   else
     mv -f "$bak" "$cf"; $SYSTEMCTL restart "$unit" || true
-    die "service did not start listening on $port; reverted to $cur. See: shadowctl logs"
+    die "service did not start listening on $port; reverted to $cur. See: shadowtun logs"
   fi
 }
 
@@ -887,11 +888,13 @@ cmd_panel() {
       case ${2-} in
         on)  ensure_cert; "${PY[@]}" admin set tls 1 ;;
         off) "${PY[@]}" admin set tls 0 ;;
-        *)   die "usage: shadowctl panel tls on|off" ;;
+        *)   die "usage: shadowtun panel tls on|off" ;;
       esac
       $SYSTEMCTL restart shadow-spoof-panel.service; cmd_panel info ;;
     start|stop|restart) $SYSTEMCTL "$sub" shadow-spoof-panel.service && echo "panel $sub" ;;
-    *) die "usage: shadowctl panel [info|passwd|passwd-set|port N|bind IP|tls on|off|start|stop|restart]" ;;
+    enable)  $SYSTEMCTL enable --now shadow-spoof-panel.service && echo "panel enabled (autostart on)" ;;
+    disable) $SYSTEMCTL disable --now shadow-spoof-panel.service && echo "panel disabled (stopped, autostart off)" ;;
+    *) die "usage: shadowtun panel [info|passwd|passwd-set|port N|bind IP|tls on|off|enable|disable|start|stop|restart]" ;;
   esac
 }
 
@@ -965,7 +968,7 @@ cmd_uninstall() {
   rm -rf "$UNIT_DIR"/shadow-spoof-*.service.d 2>/dev/null || true
   $SYSTEMCTL daemon-reload 2>/dev/null || true
   rm -f  /usr/local/bin/shadow-spoof-client /usr/local/bin/shadow-spoof-server \
-         /usr/local/bin/shadowctl /usr/local/bin/shadowtun 2>/dev/null || true
+         /usr/local/bin/shadowtun /usr/local/bin/shadowtun 2>/dev/null || true
   rm -rf /usr/local/lib/shadow-spoof "$ETC" "${STATE:-/var/lib/shadow-spoof}" 2>/dev/null || true
   echo "Shadow Spoof removed. (the 'shadow-spoof' system user was left in place)"
 }
@@ -976,6 +979,7 @@ case $cmd in
   status)      cmd_status ;;
   check)       cmd_check ;;
   diagnose)    need_py; exec "${PY[@]}" diagnose ${TARGET:+-t "$TARGET"} "$@" ;;
+  mtu)         need_py; exec "${PY[@]}" mtu ${TARGET:+-t "$TARGET"} "$@" ;;
   update)      cmd_update "${1-}" ;;
   backup)      cmd_backup "${1-}" ;;
   restore)     cmd_restore "${1-}" ;;
@@ -1229,9 +1233,9 @@ install_panel_files() {
 
   shadow-panel.py panel          web panel (runs as root, hardened by systemd)
   shadow-panel.py monitor        metrics + log sampler (runs as the shadow-spoof user)
-  shadow-panel.py monitor-view   live terminal dashboard           (shadowctl monitor)
-  shadow-panel.py log-view [lvl] colourised live log follow        (shadowctl monitor logs)
-  shadow-panel.py admin ...      panel.json maintenance            (shadowctl panel ...)
+  shadow-panel.py monitor-view   live terminal dashboard           (shadowtun monitor)
+  shadow-panel.py log-view [lvl] colourised live log follow        (shadowtun monitor logs)
+  shadow-panel.py admin ...      panel.json maintenance            (shadowtun panel ...)
 
 Facts about the upstream binary this relies on (from its source):
   * one config file + one process = one "tunnel instance"; role is client OR server
@@ -2508,7 +2512,7 @@ def run_test(inst, host="example.com", port=80, secs=10):
     steps.append({"ok": acc > 0, "title": "Tunnels accepted in the last 10 minutes",
                   "detail": "%d accepted, %d forwarded to a target%s" % (acc, fwd, "" if acc else " (none yet)")})
     steps.append({"ok": None, "title": "Listening for %ds" % secs,
-                  "detail": "Run the test on the CLIENT now (shadowctl test) so packets flow while this captures."})
+                  "detail": "Run the test on the CLIENT now (shadowtun test) so packets flow while this captures."})
     sn = sniff(cfg, secs)
     steps += sniff_steps(cfg, sn, "client")
     good = "error" not in sn and (sum(sn["icmp"].values()) + sum(sn["udp"].values()) > 0)
@@ -2695,7 +2699,7 @@ def api_diagnose(req):
             add("ok", "", "service is active")
         else:
             add("fail", "", "service is %s" % st.get("active", "unknown"),
-                "the process is not running", "shadowctl start, then shadowctl logs -f")
+                "the process is not running", "shadowtun start, then shadowtun logs -f")
         if role == "client" and st.get("active") == "active":
             p = cfg.get("socks5_port", 0)
             if port_listening(p, True):
@@ -2703,7 +2707,7 @@ def api_diagnose(req):
             else:
                 add("fail", "socks5_port", "SOCKS5 is not listening on 127.0.0.1:%s" % p,
                     "the client proxy never bound - initialisation did not complete",
-                    "check shadowctl logs; another process may hold the port")
+                    "check shadowtun logs; another process may hold the port")
     safe(c_service)
 
     # 6 - can we even reach the peer's real IP? -------------------------------
@@ -2800,6 +2804,84 @@ def api_password(req):
     return {"ok": True}
 
 
+def api_mtu(req):
+    """Path-MTU probe to the peer (DF-set ICMP, binary search) + a recommended
+    tunnel mtu.  Linux only (uses `ping -M do`)."""
+    inst = _inst_or_404(str((req.json or {}).get("name", "main")))
+    cfg = inst.cfg()
+    peer = cfg.get("peer_real_ip")
+    if not peer or not v_ip(peer):
+        raise ApiError(400, "no valid peer_real_ip configured")
+
+    def fits(payload):
+        rc, _o, _e = run(["ping", "-M", "do", "-s", str(payload), "-c", "1", "-W", "1", peer], timeout=4)
+        return rc == 0
+
+    lo, hi = 500, 1472  # ICMP payload; +28 (IP20+ICMP8) = MTU; 1472 -> 1500
+    if not fits(lo):
+        raise ApiError(502, "no DF-ping reply from %s - is it reachable and is ICMP allowed through?" % peer)
+    best = lo
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            best = mid; lo = mid + 1
+        else:
+            hi = mid - 1
+    path_mtu = best + 28
+    # Tunnel overhead (spoof/UDP): IP20 + UDP8 + ShadowPacket header20 + HMAC16.
+    overhead = 64
+    recommended = max(512, min(1400, path_mtu - overhead))
+    return {"peer": peer, "path_mtu": path_mtu, "recommended_mtu": recommended,
+            "current_mtu": cfg.get("mtu"), "overhead": overhead}
+
+
+def _restart_panel_soon():
+    # Return the HTTP response first, then restart (which kills this process).
+    threading.Timer(1.0, lambda: run([CTL, "panel", "restart"], timeout=30)).start()
+
+
+def api_panel_cfg(req):
+    """Change the panel's own bind address / port / TLS, then restart it.
+    The caller will have to reconnect on the new address."""
+    d = req.json if isinstance(req.json, dict) else {}
+    p = load_panel()
+    changed = []
+    if "port" in d:
+        n = as_int(d.get("port"), 1, 65535)
+        if not n:
+            raise ApiError(400, "port must be 1-65535")
+        p["port"] = n; changed.append("port")
+    if "bind" in d:
+        b = str(d.get("bind", "")).strip()
+        if not v_ip(b):
+            raise ApiError(400, "bind must be an IPv4 address")
+        p["bind"] = b; changed.append("bind")
+    if "tls" in d:
+        p["tls"] = bool(d.get("tls")); changed.append("tls")
+    if not changed:
+        raise ApiError(400, "nothing to change")
+    save_panel(p)
+    if p.get("tls"):
+        run([CTL, "panel", "tls", "on"], timeout=30)  # ensures a cert exists
+    _restart_panel_soon()
+    return {"ok": True, "changed": changed, "bind": p.get("bind"), "port": p.get("port"),
+            "tls": bool(p.get("tls")),
+            "note": "panel is restarting - reconnect on %s:%s" % (p.get("bind"), p.get("port"))}
+
+
+def api_panel_toggle(req):
+    """Enable (autostart) or disable (stop + no autostart) the panel."""
+    on = bool((req.json or {}).get("on", True))
+    if on:
+        rc, out, err = run([CTL, "panel", "enable"], timeout=30)
+        if rc:
+            raise ApiError(500, (err or out or "failed").strip()[:300])
+        return {"ok": True, "enabled": True}
+    # Disable stops this very process, so return first, then disable.
+    threading.Timer(1.0, lambda: run([CTL, "panel", "disable"], timeout=30)).start()
+    return {"ok": True, "enabled": False, "note": "panel is being disabled; this session will end"}
+
+
 # ---------------------------------------------------------------- http server --
 INDEX_HTML = r'''<!doctype html>
 <html lang="en">
@@ -2813,7 +2895,9 @@ INDEX_HTML = r'''<!doctype html>
 :root{--bg:#0a0d14;--bg2:#0f1420;--card:#141a28;--card2:#182032;--line:#243049;--tx:#eef1f8;--mut:#8f9ab2;--acc:#ff6fae;--acc2:#6fb7ff;--ok:#3ddc97;--warn:#f5b54a;--bad:#ff5d6c;--r:16px;--grad:linear-gradient(135deg,#ff6fae,#b06bff 60%,#6fb7ff);--shadow:0 10px 30px -12px #000a;--ring:0 0 0 3px #ff6fae33}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Vazirmatn,Tahoma,sans-serif;-webkit-text-size-adjust:100%}
-body{background:radial-gradient(1200px 600px at 80% -10%,#20284a55,transparent 60%),radial-gradient(900px 500px at -10% 10%,#3a1b3a55,transparent 55%),var(--bg);background-attachment:fixed}
+body{background:radial-gradient(1200px 700px at 78% -12%,#14143a,transparent 60%),radial-gradient(1000px 600px at -8% 8%,#2a1040,transparent 58%),#070716;background-attachment:fixed}
+#bgwave{position:fixed;inset:0;width:100vw;height:100vh;z-index:-2;display:block;pointer-events:none}
+#app{position:relative;z-index:0}
 @media(prefers-reduced-motion:no-preference){.card,.btn,nav.dock button{transition:transform .15s ease,border-color .15s ease,background .15s ease,box-shadow .15s ease}}
 body{padding:env(safe-area-inset-top) env(safe-area-inset-right) calc(70px + env(safe-area-inset-bottom)) env(safe-area-inset-left)}
 button,input,select{font:inherit;color:inherit}
@@ -2890,14 +2974,44 @@ pre.log .t{color:var(--mut)}.lv-ERROR{color:var(--bad)}.lv-WARN{color:var(--warn
 </style>
 </head>
 <body>
+<canvas id="bgwave" aria-hidden="true"></canvas>
 <div id="app"></div>
 <script nonce="__NONCE__">
 'use strict';
+/* ---------- animated wave background ---------- */
+(function(){
+  var c=document.getElementById('bgwave'); if(!c||!c.getContext) return;
+  var ctx=c.getContext('2d'), W=1, H=1, DPR=1;
+  function resize(){ DPR=Math.min(2,window.devicePixelRatio||1); W=c.width=Math.max(1,innerWidth*DPR); H=c.height=Math.max(1,innerHeight*DPR); }
+  resize(); addEventListener('resize',resize);
+  var LINES=40;
+  function draw(t){
+    ctx.clearRect(0,0,W,H);
+    var baseY=H*0.54, step=14*DPR;
+    for(var i=0;i<LINES;i++){
+      var p=i/LINES, g=ctx.createLinearGradient(0,0,W,0);
+      g.addColorStop(0,   'rgba(236,72,153,'+(0.05+0.11*(1-p))+')');
+      g.addColorStop(0.5, 'rgba(34,197,94,' +(0.05+0.13*p)    +')');
+      g.addColorStop(1,   'rgba(147,112,219,0.09)');
+      ctx.strokeStyle=g; ctx.lineWidth=DPR; ctx.beginPath();
+      for(var x=0;x<=W;x+=step){
+        var nx=x/W, env=H*0.2*Math.sin(Math.PI*nx);
+        var y=baseY + Math.sin(nx*6 + t*0.00040 + i*0.17)*env*0.55
+                    + Math.sin(nx*3 - t*0.00028 + i*0.11)*env*0.32
+                    + (i-LINES/2)*2.1*DPR;
+        x===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+    }
+  }
+  try{ if(matchMedia('(prefers-reduced-motion: reduce)').matches){ draw(0); return; } }catch(e){}
+  (function loop(t){ draw(t||0); requestAnimationFrame(loop); })(0);
+})();
 /* ---------- i18n ---------- */
 const TR = {
 en: {
  overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
- diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis',
+ diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load / uptime', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX',
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
  events:'Recent events', none:'Nothing yet', details:'Details', start:'Start', stop:'Stop', restart:'Restart', del:'Delete', edit:'Edit', test:'Link test', key:'Key & link',
@@ -2909,12 +3023,13 @@ en: {
  paste_link:'Paste a shadowspoof:// link', apply:'Apply', pw_confirm:'Enter the panel password to reveal the key', reveal:'Reveal',
  level:'Level', search:'Search', lines:'Lines', auto_refresh:'Auto-refresh', run:'Run check', host:'Host', port:'Port', running:'Running...', avg:'Average', handshake_ok:'handshakes OK',
  wd:'Periodic restart (watchdog)', wd_hint:'Independent of crash recovery (Restart=on-failure).', chg_pw:'Change password', old_pw:'Current password', new_pw:'New password (10+ chars)',
+ panel_cfg:'Web panel address', panel_cfg_hint:'Changing the port/address restarts the panel — you will reconnect on the new address.', panel_bind:'Bind address', panel_port:'Port', panel_save:'Save & restart panel', panel_warn:'Change the panel address and restart now? You will need to reconnect.', panel_disable:'Disable panel', panel_dis_warn:'Stop the web panel and turn off autostart? This session will end; re-enable it with: shadowtun panel enable', panel_disabled:'panel is being disabled…',
  lang:'Language', copied:'Copied', copy:'Copy', not_listening:'SOCKS5 not listening', last_est:'Last handshake', ago:'ago', never:'never', build:'Build', role:'Role',
  note_key:'The pre-shared key authenticates every packet (HMAC). Both sides must use the identical key.', srv_test_hint:'Listens for client packets for 10 s. Press Run here, then run the test on the client at the same time.', no_tunnels:'No tunnels yet.', warnings:'Warnings'
 },
 fa: {
  overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
- diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی',
+ diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار / آپ‌تایم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال',
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
  events:'رویدادهای اخیر', none:'هنوز چیزی نیست', details:'جزئیات', start:'شروع', stop:'توقف', restart:'ری‌استارت', del:'حذف', edit:'ویرایش', test:'تست لینک', key:'کلید و لینک',
@@ -2926,6 +3041,7 @@ fa: {
  paste_link:'لینک shadowspoof:// را بچسبانید', apply:'اعمال', pw_confirm:'برای نمایش کلید، رمز پنل را وارد کنید', reveal:'نمایش',
  level:'سطح', search:'جستجو', lines:'تعداد خط', auto_refresh:'به‌روزرسانی خودکار', run:'اجرای بررسی', host:'هاست', port:'پورت', running:'در حال اجرا...', avg:'میانگین', handshake_ok:'هندشیک موفق',
  wd:'ری‌استارت دوره‌ای (watchdog)', wd_hint:'مستقل از بازیابی خطا (Restart=on-failure).', chg_pw:'تغییر رمز', old_pw:'رمز فعلی', new_pw:'رمز جدید (حداقل ۱۰ کاراکتر)',
+ panel_cfg:'آدرس وب‌پنل', panel_cfg_hint:'تغییر پورت/آدرس پنل را ری‌استارت می‌کند — روی آدرس جدید دوباره وصل می‌شوی.', panel_bind:'آدرس Bind', panel_port:'پورت', panel_save:'ذخیره و ری‌استارت پنل', panel_warn:'آدرس پنل عوض و همین حالا ری‌استارت شود؟ باید دوباره وصل شوی.', panel_disable:'غیرفعال‌کردن پنل', panel_dis_warn:'وب‌پنل متوقف و autostart خاموش شود؟ این نشست بسته می‌شود؛ دوباره فعال‌کردن: shadowtun panel enable', panel_disabled:'در حال غیرفعال‌کردن پنل…',
  lang:'زبان', copied:'کپی شد', copy:'کپی', not_listening:'SOCKS5 در حال شنیدن نیست', last_est:'آخرین هندشیک', ago:'پیش', never:'هرگز', build:'نسخه', role:'نقش',
  note_key:'کلید پیش‌اشتراکی هر بسته را احراز هویت می‌کند (HMAC). هر دو طرف باید کلید یکسان داشته باشند.', srv_test_hint:'۱۰ ثانیه به بسته‌های کلاینت گوش می‌دهد. همین‌جا اجرا را بزنید و هم‌زمان تست را روی کلاینت اجرا کنید.', no_tunnels:'هنوز تونلی نیست.', warnings:'هشدارها'
 }};
@@ -3227,12 +3343,26 @@ function viewDiagnose(m){
       out.replaceChildren(head,...rows);
     }catch(e){if(!e.handled)out.replaceChildren(h('div',{class:'err',text:e.message}))}
   };
+  const mout=h('div',{class:'hint'});
+  const mtu=async()=>{
+    mout.textContent=t('running');
+    try{
+      const r=await api('POST','/api/mtu',{name:'main'});
+      mout.replaceChildren(
+        h('div',{},t('mtu_path')+': '+r.path_mtu+'  \u00b7  '+t('mtu_rec')+': '+h_b(r.recommended_mtu)+'  \u00b7  '+t('mtu_cur')+': '+(r.current_mtu||'-')),
+        h('div',{class:'row'},h('button',{class:'btn sm',text:t('mtu_apply'),onclick:async()=>{try{await api('PUT','/api/tunnels/main',{mtu:r.recommended_mtu});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}})));
+    }catch(e){if(!e.handled)mout.textContent=e.message}
+  };
+  function h_b(x){return x} // plain value
   m.replaceChildren(
     h('div',{class:'card'},
       h('b',{text:t('diag_title')}),
       h('div',{class:'hint',text:t('diag_hint')}),
       h('label',{class:'f'},h('span',{text:t('peer_link')}),link),
-      h('div',{class:'row'},h('button',{class:'btn pri',onclick:run,text:t('run_diag')}))),
+      h('div',{class:'row'},
+        h('button',{class:'btn pri',onclick:run,text:t('run_diag')}),
+        h('button',{class:'btn',onclick:mtu,text:t('mtu_test')})),
+      mout),
     h('div',{class:'lbl',text:'\u00a0'}),
     out);
   run();
@@ -3245,8 +3375,19 @@ async function viewSettings(m){
   const wdBtn=h('button',{class:'btn',text:t('apply'),onclick:async()=>{try{await api('POST','/api/settings/watchdog',{value:wd.value});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
   const o=h('input',{type:'password',autocomplete:'current-password'}),n=h('input',{type:'password',autocomplete:'new-password'}),perr=h('div',{class:'err'});
   const pwBtn=h('button',{class:'btn',text:t('save'),onclick:async()=>{perr.textContent='';try{await api('POST','/api/settings/password',{old:o.value,new:n.value});o.value=n.value='';toast(t('saved'))}catch(e){if(!e.handled)perr.textContent=e.message}}});
+  // web-panel address / TLS / enable
+  const pbind=h('input',{value:st.bind||'127.0.0.1'});
+  const pport=h('input',{value:st.port||7777,inputmode:'numeric'});
+  const ptls=h('select',{},[['off','HTTP'],['on','HTTPS (TLS)']].map(a=>h('option',{value:a[0],text:a[1]})));ptls.value=st.tls?'on':'off';
+  const psave=h('button',{class:'btn',text:t('panel_save'),onclick:async()=>{if(!confirm(t('panel_warn')))return;try{const r=await api('POST','/api/settings/panel',{bind:pbind.value.trim(),port:+pport.value,tls:ptls.value==='on'});toast(r.note||t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+  const pdis=h('button',{class:'btn dng',text:t('panel_disable'),onclick:async()=>{if(!confirm(t('panel_dis_warn')))return;try{await api('POST','/api/settings/panel/toggle',{on:false});toast(t('panel_disabled'))}catch(e){if(!e.handled)toast(e.message,1)}}});
   const b=(S.meta.build||{});
   m.replaceChildren(
+    h('div',{class:'card'},h('b',{text:t('panel_cfg')}),h('div',{class:'hint',text:t('panel_cfg_hint')}),
+      h('div',{class:'two'},h('label',{class:'f'},h('span',{text:t('panel_bind')}),pbind),h('label',{class:'f'},h('span',{text:t('panel_port')}),pport)),
+      h('label',{class:'f'},h('span',{text:'TLS'}),ptls),
+      h('div',{class:'row'},psave,pdis)),
+    h('div',{class:'lbl',text:'\u00a0'}),
     h('div',{class:'card'},h('b',{text:t('wd')}),h('div',{class:'hint',text:t('wd_hint')}),h('div',{class:'row'},wd,wdBtn)),
     h('div',{class:'lbl',text:'\u00a0'}),
     h('div',{class:'card'},h('b',{text:t('chg_pw')}),h('label',{class:'f'},h('span',{text:t('old_pw')}),o),h('label',{class:'f'},h('span',{text:t('new_pw')}),n),perr,pwBtn),
@@ -3411,10 +3552,16 @@ class Handler(BaseHTTPRequestHandler):
                 return api_link_parse(req)
             if path == "/api/diagnose":
                 return api_diagnose(req)
+            if path == "/api/mtu":
+                return api_mtu(req)
             if path == "/api/settings/watchdog":
                 return api_watchdog(req)
             if path == "/api/settings/password":
                 return api_password(req)
+            if path == "/api/settings/panel":
+                return api_panel_cfg(req)
+            if path == "/api/settings/panel/toggle":
+                return api_panel_toggle(req)
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/(start|stop|restart)$", path)
             if m:
                 return api_action(req, m.group(1), m.group(2))
@@ -3459,7 +3606,7 @@ class Server(ThreadingHTTPServer):
 def cmd_panel():
     cfg = load_panel()
     if not cfg.get("pw"):
-        sys.exit("panel: no password configured (run: shadowctl panel passwd)")
+        sys.exit("panel: no password configured (run: shadowtun panel passwd)")
     bind, port = cfg.get("bind", "127.0.0.1"), int(cfg.get("port", 7777))
     srv = Server((bind, port), Handler)
     srv.tls = False
@@ -3624,7 +3771,7 @@ def _pick_inst(name):
 
 
 def cmd_test(argv):
-    ap = argparse.ArgumentParser(prog="shadowctl test")
+    ap = argparse.ArgumentParser(prog="shadowtun test")
     ap.add_argument("-t", "--tunnel", default="")
     ap.add_argument("--host", default="example.com")
     ap.add_argument("--port", type=int, default=80)
@@ -3632,7 +3779,7 @@ def cmd_test(argv):
     a = ap.parse_args(argv)
     inst = _pick_inst(a.tunnel)
     if inst.role == "server":
-        print("Server test: capturing for %ds. Run 'shadowctl test' on the CLIENT now.\n" % a.secs)
+        print("Server test: capturing for %ds. Run 'shadowtun test' on the CLIENT now.\n" % a.secs)
     else:
         print("Testing tunnel '%s' via %s:%d (takes ~20 s)...\n" % (inst.name, a.host, a.port))
     r = run_test(inst, a.host, a.port, a.secs)
@@ -3647,7 +3794,7 @@ def cmd_test(argv):
 
 
 def cmd_cfg(argv):
-    ap = argparse.ArgumentParser(prog="shadowctl set")
+    ap = argparse.ArgumentParser(prog="shadowtun set")
     ap.add_argument("action", choices=["set", "edit", "show"])
     ap.add_argument("-t", "--tunnel", default="")
     ap.add_argument("pairs", nargs="*")
@@ -3728,7 +3875,7 @@ def cmd_link(argv):
 
 
 def cmd_diagnose(argv):
-    ap = argparse.ArgumentParser(prog="shadowctl diagnose")
+    ap = argparse.ArgumentParser(prog="shadowtun diagnose")
     ap.add_argument("-t", "--tunnel", default="main")
     ap.add_argument("--link", default="")
     args = ap.parse_args(argv)
@@ -3761,6 +3908,24 @@ def cmd_diagnose(argv):
     sys.exit(1 if s.get("fail", 0) else 0)
 
 
+def cmd_mtu(argv):
+    ap = argparse.ArgumentParser(prog="shadowtun mtu")
+    ap.add_argument("-t", "--tunnel", default="main")
+    args = ap.parse_args(argv)
+
+    class _R:
+        pass
+    req = _R()
+    req.json = {"name": args.tunnel}
+    try:
+        r = api_mtu(req)
+    except ApiError as e:
+        sys.exit("mtu: %s" % e)
+    print("peer %s: path MTU %d  ->  recommended tunnel mtu %d  (current %s)"
+          % (r["peer"], r["path_mtu"], r["recommended_mtu"], r.get("current_mtu")))
+    print("apply with:  shadowtun -t %s set mtu=%d" % (args.tunnel, r["recommended_mtu"]))
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
@@ -3781,6 +3946,8 @@ def main():
         cmd_cfg(sys.argv[2:])
     elif cmd == "link":
         cmd_link(sys.argv[2:])
+    elif cmd == "mtu":
+        cmd_mtu(sys.argv[2:])
     elif cmd == "diagnose":
         cmd_diagnose(sys.argv[2:])
     else:
@@ -3936,12 +4103,12 @@ UNIT
 setup_panel() {
   write_aux_units
   systemctl daemon-reload
-  # monitor: always (feeds `shadowctl monitor` and the panel)
+  # monitor: always (feeds `shadowtun monitor` and the panel)
   systemctl enable shadow-spoof-monitor.service >/dev/null 2>&1
   if systemctl is-active --quiet shadow-spoof-monitor.service; then
     (( PANEL_CHANGED )) && systemctl restart shadow-spoof-monitor.service
   else systemctl start shadow-spoof-monitor.service; fi
-  ok "Monitor service running (shadowctl monitor)"
+  ok "Monitor service running (shadowtun monitor)"
   if (( ! PANEL_ENABLE )); then return 0; fi
 
   if (( ! PANEL_KEEP )); then
@@ -4023,13 +4190,13 @@ start_service() {
 summary() {
   echo >&2
   ok "Installation complete ($ROLE @ ${BUILD_REF:0:12})"
-  echo "  shadowctl status | tunnels | test | monitor | logs | config edit | set k=v | watchdog <v>" >&2
+  echo "  shadowtun status | tunnels | test | monitor | logs | config edit | set k=v | watchdog <v>" >&2
   if [[ $ROLE == client ]]; then
-    echo "  shadowctl socks-port <PORT>   change the local SOCKS5 port" >&2
-    echo "  Test the tunnel end to end:  shadowctl test" >&2
+    echo "  shadowtun socks-port <PORT>   change the local SOCKS5 port" >&2
+    echo "  Test the tunnel end to end:  shadowtun test" >&2
   else
     echo "  Make sure the firewall passes inbound UDP/$(cfg_get data_port) and ICMP echo from the client." >&2
-    echo "  Then run  shadowctl test  on the server AND on the client at the same time." >&2
+    echo "  Then run  shadowtun test  on the server AND on the client at the same time." >&2
   fi
   warn "pre_shared_key is validated but not yet enforced on the wire (packets are not authenticated); interface is now bound via SO_BINDTODEVICE."
 }
@@ -4042,7 +4209,7 @@ final_report() { # printed last, to the terminal only (never to logs)
   {
     echo
     echo "=================================================================="
-    echo " PRE-SHARED KEY  (show again any time:  shadowctl token)"
+    echo " PRE-SHARED KEY  (show again any time:  shadowtun token)"
     echo
     echo "   $key"
     echo
@@ -4059,7 +4226,7 @@ final_report() { # printed last, to the terminal only (never to logs)
       echo
       echo " WEB PANEL: $("${PY3[@]}" admin info)"
       if [[ -n $PANEL_PW_SHOWN ]]; then echo "   password: $PANEL_PW_SHOWN   (shown once)"
-      else echo "   password: unchanged  (reset with: shadowctl panel passwd)"; fi
+      else echo "   password: unchanged  (reset with: shadowtun panel passwd)"; fi
       if [[ $("${PY3[@]}" admin info) == *//127.0.0.1:* ]]; then
         echo "   local only - from your PC:  ssh -L 7777:127.0.0.1:$(sed -n 's/.*"port": *\([0-9]*\).*/\1/p' "$PANEL_JSON") root@<this-server>"
       fi
