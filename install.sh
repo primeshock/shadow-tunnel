@@ -2979,6 +2979,56 @@ def api_peer_set(req):
             "sync_token": reveal}
 
 
+UPDATE_LOG = os.path.join(STATE, "update.log")
+UPDATE_UNIT = "shadow-spoof-update"
+REPO_API = "https://api.github.com/repos/primeshock/shadow-tunnel/commits/master"
+
+
+def _update_running():
+    rc, out, _ = run([SYSTEMCTL, "is-active", UPDATE_UNIT + ".service"])
+    return (out or "").strip() in ("active", "activating")
+
+
+def api_update_status(req):
+    cur = ""
+    for line in read_text(BUILD_INFO).splitlines():
+        if line.startswith("commit="):
+            cur = line.split("=", 1)[1].strip()
+    latest, err = "", ""
+    if str(req.query.get("check", ["1"])[0]) != "0":
+        try:
+            r = urllib.request.Request(REPO_API, headers={"User-Agent": "shadow-spoof-panel",
+                                                          "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(r, timeout=6) as resp:
+                latest = json.loads(resp.read().decode()).get("sha", "")
+        except Exception as e:
+            err = "could not reach GitHub: %s" % e
+    log = read_text(UPDATE_LOG).splitlines()[-60:]
+    return {"current": cur[:12], "latest": latest[:12], "error": err,
+            "available": bool(latest and (not cur or (not latest.startswith(cur[:12]) and not cur.endswith(latest)))),
+            "running": _update_running(), "log": "\n".join(log)}
+
+
+def api_update_start(req):
+    if _update_running():
+        raise ApiError(409, "an update is already running")
+    if not os.access(CTL, os.X_OK):
+        raise ApiError(500, "%s not found - re-run the installer" % CTL)
+    os.makedirs(STATE, exist_ok=True)
+    try:
+        open(UPDATE_LOG, "w").close()
+    except OSError as e:
+        raise ApiError(500, "cannot write %s: %s" % (UPDATE_LOG, e))
+    # A transient unit outlives the panel restart that the installer performs.
+    rc, out, err = run(["systemd-run", "--unit=" + UPDATE_UNIT, "--collect", "--quiet",
+                        "-p", "StandardOutput=append:" + UPDATE_LOG,
+                        "-p", "StandardError=append:" + UPDATE_LOG,
+                        CTL, "update", "-y"], timeout=15)
+    if rc:
+        raise ApiError(500, (err or out or "systemd-run failed").strip()[:300])
+    return {"ok": True}
+
+
 def api_peer_status(req):
     return _peer_request("GET", "/api/sync/overview")
 
@@ -3013,8 +3063,18 @@ INDEX_HTML = r'''<!doctype html>
 :root{--bg:#0a0d14;--bg2:#0f1420;--card:#141a28;--card2:#182032;--line:#243049;--tx:#eef1f8;--mut:#8f9ab2;--acc:#ff6fae;--acc2:#6fb7ff;--ok:#3ddc97;--warn:#f5b54a;--bad:#ff5d6c;--r:16px;--grad:linear-gradient(135deg,#ff6fae,#b06bff 60%,#6fb7ff);--shadow:0 10px 30px -12px #000a;--ring:0 0 0 3px #ff6fae33}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Vazirmatn,Tahoma,sans-serif;-webkit-text-size-adjust:100%}
-body{background:radial-gradient(900px 740px at 14% 18%,rgba(236,72,153,.20),transparent 60%),radial-gradient(1000px 820px at 86% 12%,rgba(34,197,94,.17),transparent 60%),radial-gradient(1000px 900px at 50% 98%,rgba(147,112,219,.20),transparent 62%),radial-gradient(820px 720px at 92% 88%,rgba(111,183,255,.15),transparent 60%),#0b0b22;background-attachment:fixed}
-#bgwave{position:fixed;inset:0;width:100vw;height:100vh;z-index:-2;display:block;pointer-events:none}
+html{background:#06061a}body{background:transparent}
+#bg{position:fixed;inset:0;z-index:-1;overflow:hidden;pointer-events:none;background:radial-gradient(120% 90% at 50% 0%,#0d0d2e 0%,#06061a 70%);transform:translate3d(calc(var(--mx,0)*26px),calc(var(--my,0)*26px),0);transition:transform 1.6s cubic-bezier(.2,.7,.2,1)}
+#bg i{position:absolute;display:block;filter:blur(80px);opacity:.40;will-change:transform,border-radius}
+#bg .b1{width:64vmax;height:64vmax;left:-18vmax;top:-22vmax;background:#c026d3;animation:liq1 46s ease-in-out infinite}
+#bg .b2{width:58vmax;height:58vmax;right:-20vmax;top:-12vmax;background:#2563eb;animation:liq2 54s ease-in-out infinite}
+#bg .b3{width:60vmax;height:60vmax;left:8vmax;bottom:-30vmax;background:#7c3aed;animation:liq3 60s ease-in-out infinite}
+#bg .b4{width:44vmax;height:44vmax;right:-8vmax;bottom:-16vmax;background:#db2777;opacity:.30;animation:liq4 50s ease-in-out infinite}
+@keyframes liq1{0%,100%{transform:translate(0,0) rotate(0) scale(1);border-radius:42% 58% 61% 39%/45% 38% 62% 55%}33%{transform:translate(16vmax,8vmax) rotate(120deg) scale(1.12);border-radius:58% 42% 38% 62%/55% 62% 38% 45%}66%{transform:translate(5vmax,22vmax) rotate(240deg) scale(.94);border-radius:38% 62% 55% 45%/62% 40% 60% 38%}}
+@keyframes liq2{0%,100%{transform:translate(0,0) rotate(0) scale(1);border-radius:55% 45% 40% 60%/50% 58% 42% 50%}40%{transform:translate(-14vmax,14vmax) rotate(-140deg) scale(1.1);border-radius:40% 60% 58% 42%/60% 40% 60% 40%}70%{transform:translate(-4vmax,26vmax) rotate(-250deg) scale(.95);border-radius:60% 40% 45% 55%/42% 55% 45% 58%}}
+@keyframes liq3{0%,100%{transform:translate(0,0) rotate(0) scale(1);border-radius:48% 52% 56% 44%/58% 42% 58% 42%}35%{transform:translate(20vmax,-10vmax) rotate(110deg) scale(1.1);border-radius:60% 40% 42% 58%/44% 58% 42% 56%}70%{transform:translate(-8vmax,-18vmax) rotate(230deg) scale(.96);border-radius:42% 58% 60% 40%/56% 44% 56% 44%}}
+@keyframes liq4{0%,100%{transform:translate(0,0) rotate(0) scale(1);border-radius:50% 50% 44% 56%/52% 46% 54% 48%}50%{transform:translate(-18vmax,-12vmax) rotate(180deg) scale(1.15);border-radius:44% 56% 52% 48%/48% 56% 44% 52%}}
+@media(prefers-reduced-motion:reduce){#bg i{animation:none}#bg{transition:none}}
 #app{position:relative;z-index:0}
 @media(prefers-reduced-motion:no-preference){.card,.btn,nav.dock button{transition:transform .15s ease,border-color .15s ease,background .15s ease,box-shadow .15s ease}}
 body{padding:env(safe-area-inset-top) env(safe-area-inset-right) calc(70px + env(safe-area-inset-bottom)) env(safe-area-inset-left)}
@@ -3063,7 +3123,16 @@ pre.log .t{color:var(--mut)}.lv-ERROR{color:var(--bad)}.lv-WARN{color:var(--warn
 .copy{word-break:break-all;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:8px 10px;margin:6px 0}
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:90px;background:#202942;border:1px solid var(--line);padding:9px 16px;border-radius:12px;z-index:30;max-width:90vw}
 .toast.bad{border-color:var(--bad)}
-.login{max-width:360px;margin:12vh auto;padding:0 14px}
+.loginwrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.login{width:min(440px,100%)}
+.login .logo{font-size:34px;text-align:center;margin-bottom:18px}
+.login .card{padding:28px 26px}
+.login input{height:54px;font-size:16px;border-radius:14px;padding:0 16px}
+.login .btn.pri{width:100%;height:54px;font-size:16px;margin-top:6px}
+.login label.f span{font-size:13px}
+pre.log.ulog{height:150px;margin:10px 0 0}
+.ulog:empty{display:none}
+.sr{position:absolute;left:-9999px;width:1px;height:1px;opacity:0}
 [dir=rtl] .kv .v{text-align:start}
 .hint.fix{color:var(--acc2)}
 .chk .i{flex:0 0 22px}
@@ -3092,62 +3161,22 @@ pre.log .t{color:var(--mut)}.lv-ERROR{color:var(--bad)}.lv-WARN{color:var(--warn
 </style>
 </head>
 <body>
-<canvas id="bgwave" aria-hidden="true"></canvas>
+<div id="bg" aria-hidden="true"><i class="b1"></i><i class="b2"></i><i class="b3"></i><i class="b4"></i></div>
 <div id="app"></div>
 <script nonce="__NONCE__">
 'use strict';
-/* ---------- live background: drifting colour glows + soft waves ---------- */
+/* ---------- live background: slow mouse parallax ---------- */
 (function(){
-  var c=document.getElementById('bgwave'); if(!c||!c.getContext) return;
-  var ctx=c.getContext('2d'), W=1,H=1,DPR=1;
-  var mx=0.5,my=0.42, tmx=0.5,tmy=0.42;
-  function resize(){ DPR=Math.min(2,window.devicePixelRatio||1); W=c.width=Math.max(1,innerWidth*DPR); H=c.height=Math.max(1,innerHeight*DPR); }
-  resize(); addEventListener('resize',resize);
-  addEventListener('pointermove',function(e){ tmx=e.clientX/innerWidth; tmy=e.clientY/innerHeight; },{passive:true});
-  // soft colour blobs that fill the whole screen and slowly drift / follow the mouse
-  var blobs=[
-    {x:0.22,y:0.30,r:0.62,c:[236,72,153], ph:0.0, sp:0.00012},  // pink
-    {x:0.74,y:0.26,r:0.66,c:[34,197,94],  ph:2.1, sp:0.00010},  // green
-    {x:0.50,y:0.74,r:0.60,c:[147,112,219],ph:4.0, sp:0.00014},  // purple
-    {x:0.86,y:0.70,r:0.52,c:[111,183,255],ph:1.3, sp:0.00009}   // blue
-  ];
-  function blob(b,t){
-    var px=(b.x + Math.sin(t*b.sp+b.ph)*0.09 + (mx-0.5)*0.07)*W;
-    var py=(b.y + Math.cos(t*b.sp*1.3+b.ph)*0.09 + (my-0.42)*0.07)*H;
-    var rr=b.r*Math.max(W,H);
-    var g=ctx.createRadialGradient(px,py,0,px,py,rr);
-    g.addColorStop(0,'rgba('+b.c[0]+','+b.c[1]+','+b.c[2]+',0.34)');
-    g.addColorStop(0.45,'rgba('+b.c[0]+','+b.c[1]+','+b.c[2]+',0.12)');
-    g.addColorStop(1,'rgba('+b.c[0]+','+b.c[1]+','+b.c[2]+',0)');
-    ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
-  }
-  function waves(t){
-    var LINES=28, baseY=H*0.62, step=16*DPR;
-    for(var i=0;i<LINES;i++){
-      ctx.beginPath(); ctx.strokeStyle='rgba(190,205,255,'+(0.025+0.03*(i/LINES))+')'; ctx.lineWidth=DPR;
-      for(var x=0;x<=W;x+=step){
-        var nx=x/W, env=H*0.17*Math.sin(Math.PI*nx);
-        var y=baseY + Math.sin(nx*5 + t*0.00030 + i*0.20)*env*0.5 + (i-LINES/2)*2.3*DPR;
-        x===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
-      }
-      ctx.stroke();
-    }
-  }
-  function draw(t){
-    mx+=(tmx-mx)*0.05; my+=(tmy-my)*0.05;
-    ctx.clearRect(0,0,W,H);
-    ctx.globalCompositeOperation='lighter';
-    for(var i=0;i<blobs.length;i++) blob(blobs[i],t);
-    ctx.globalCompositeOperation='source-over';
-    waves(t);
-  }
-  try{ if(matchMedia('(prefers-reduced-motion: reduce)').matches){ draw(0); return; } }catch(e){}
-  (function loop(t){ draw(t||0); requestAnimationFrame(loop); })(0);
+  var r=document.documentElement, raf=0, x=0, y=0;
+  addEventListener('pointermove',function(e){
+    x=(e.clientX/innerWidth-0.5)*2; y=(e.clientY/innerHeight-0.5)*2;
+    if(raf) return; raf=requestAnimationFrame(function(){ raf=0; r.style.setProperty('--mx',x.toFixed(3)); r.style.setProperty('--my',y.toFixed(3)); });
+  },{passive:true});
 })();
 /* ---------- i18n ---------- */
 const TR = {
 en: {
- overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
+ ev_tab:'Events', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
  diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load / uptime', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX',
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
@@ -3165,7 +3194,7 @@ en: {
  note_key:'The pre-shared key authenticates every packet (HMAC). Both sides must use the identical key.', srv_test_hint:'Listens for client packets for 10 s. Press Run here, then run the test on the client at the same time.', no_tunnels:'No tunnels yet.', warnings:'Warnings'
 },
 fa: {
- overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
+ ev_tab:'رویدادها', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'آخرین نسخه', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
  diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار / آپ‌تایم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال',
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
@@ -3238,11 +3267,14 @@ function closeModal(){const o=document.getElementById('ovl');if(o)o.remove();S.m
 function renderLogin(){
   applyLang();closeModal();
   const root=document.getElementById('app');root.replaceChildren();
-  const pw=h('input',{type:'password',autocomplete:'current-password',placeholder:t('password')});
+  const user=h('input',{type:'text',name:'username',autocomplete:'username',value:'admin',class:'sr',tabindex:'-1','aria-hidden':'true'});
+  const pw=h('input',{type:'password',name:'password',id:'pw',autocomplete:'current-password',placeholder:t('password'),required:true});
   const err=h('div',{class:'err'});
-  const go=async()=>{try{const r=await api('POST','/api/login',{password:pw.value});S.csrf=r.csrf;boot()}catch(e){err.textContent=e.message}};
-  pw.addEventListener('keydown',e=>{if(e.key==='Enter')go()});
-  root.append(h('div',{class:'login'},h('div',{class:'logo',text:''},h('b',{text:'Shadow'}),' Spoof'),h('div',{class:'card'},h('label',{class:'f'},h('span',{text:t('password')}),pw),err,h('button',{class:'btn pri',onclick:go,text:t('login')}))));
+  const btn=h('button',{class:'btn pri',type:'submit',text:t('login')});
+  const form=h('form',{method:'post',action:'#',autocomplete:'on'},user,h('label',{class:'f'},h('span',{text:t('password')}),pw),err,btn);
+  form.addEventListener('submit',async e=>{e.preventDefault();err.textContent='';btn.disabled=true;
+    try{const r=await api('POST','/api/login',{password:pw.value});S.csrf=r.csrf;boot()}catch(x){err.textContent=x.message;btn.disabled=false}});
+  root.append(h('div',{class:'loginwrap'},h('div',{class:'login'},h('div',{class:'logo'},h('b',{text:'Shadow'}),' Spoof'),h('div',{class:'card'},form))));
   pw.focus();
 }
 
@@ -3257,11 +3289,11 @@ async function boot(){
 function renderShell(){
   applyLang();
   const root=document.getElementById('app');root.replaceChildren();
-  const tabs=['overview','tunnels','logs','health','diagnose','settings'];
+  const tabs=['overview','tunnels','events','logs','health','diagnose','settings'];
   root.append(
     h('header',{class:'top'},h('div',{class:'logo'},h('b',{text:'Shadow'}),' Spoof'),h('span',{class:'tag',text:S.meta.role||'?'}),h('div',{class:'sp'}),h('button',{class:'btn sm',onclick:()=>{S.lang=S.lang==='fa'?'en':'fa';localStorage.setItem('lang',S.lang);renderShell()},text:S.lang==='fa'?'EN':'FA'})),
     h('div',{class:'wrap',id:'main'}),
-    h('nav',{class:'dock'},tabs.map(v=>h('button',{class:S.view===v?'on':'',onclick:()=>{S.view=v;renderShell()},text:t(v)})))
+    h('nav',{class:'dock'},tabs.map(v=>h('button',{class:S.view===v?'on':'',onclick:()=>{S.view=v;renderShell()},text:t(v==='events'?'ev_tab':v)})))
   );
   stopTimers();showView();
 }
@@ -3271,7 +3303,7 @@ function showView(){
   if(S.view==='health') return viewHealth(m);
   if(S.view==='diagnose') return viewDiagnose(m);
   if(S.view==='settings') return viewSettings(m);
-  const tick=async()=>{ if(S.modal) return; try{S.ov=await api('GET','/api/overview')}catch(e){return} const sy=window.scrollY; (S.view==='tunnels'?viewTunnels:viewOverview)(m); window.scrollTo(0,sy)};
+  const tick=async()=>{ if(S.modal) return; try{S.ov=await api('GET','/api/overview')}catch(e){return} const sy=window.scrollY; (S.view==='tunnels'?viewTunnels:S.view==='events'?viewEvents:viewOverview)(m); window.scrollTo(0,sy)};
   tick();S.timer=setInterval(tick,3000);
 }
 
@@ -3288,14 +3320,15 @@ function viewOverview(m){
       statCard(t('disk'),sy.disk_total?Math.round(100*sy.disk_used/sy.disk_total)+'%':'-',fmtB(sy.disk_used)+' / '+fmtB(sy.disk_total)),
       statCard(t('load'),(Array.isArray(sy.load)&&sy.load.length?sy.load[0].toFixed(2):'-'),fmtD(sy.uptime))),
     h('h2',{text:t('tunnels')}),
-    o.tunnels.length?h('div',{class:'grid'},o.tunnels.map(tc)):h('div',{class:'card',text:t('no_tunnels')}),
-    h('h2',{text:t('events')}),
-    h('div',{class:'card'},evList(o.events))
+    o.tunnels.length?h('div',{class:'grid'},o.tunnels.map(tc)):h('div',{class:'card',text:t('no_tunnels')})
   );
 }
-function evList(evs){
+function viewEvents(m){
+  fill(m,h('h2',{text:t('events')}),h('div',{class:'card'},evList(S.ov.events,100)));
+}
+function evList(evs,max){
   if(!evs||!evs.length) return h('div',{class:'lbl',text:t('none')});
-  return evs.slice().reverse().slice(0,25).map(e=>h('div',{class:'ev '+e.level},h('time',{class:'mono',text:fmtT(e.ts)}),h('span',{class:'tag',text:e.inst}),h('span',{class:'m mono',text:e.msg})));
+  return evs.slice().reverse().slice(0,max||25).map(e=>h('div',{class:'ev '+e.level},h('time',{class:'mono',text:fmtT(e.ts)}),h('span',{class:'tag',text:e.inst}),h('span',{class:'m mono',text:e.msg})));
 }
 function tc(x,full){
   const c=x.config||{},hs=x.history||{},l5=x.log5||{info:0,warn:0,error:0};
@@ -3525,6 +3558,24 @@ function viewDiagnose(m){
 /* ---------- settings ---------- */
 async function viewSettings(m){
   const st=await api('GET','/api/settings').catch(()=>({watchdog:'off'}));
+  // update card
+  const ubuild=h('div',{class:'hint',text:t('running')});
+  const ulog=h('pre',{class:'log ulog'});
+  const ubtn=h('button',{class:'btn pri',text:t('upd_now')});
+  const ucheck=h('button',{class:'btn',text:t('upd_check')});
+  const uref=async(chk)=>{
+    try{
+      const r=await api('GET','/api/update/status'+(chk===false?'?check=0':''));
+      const st=r.running?t('upd_running'):r.error?r.error:r.available?t('upd_avail'):t('upd_latest');
+      ubuild.textContent=t('upd_cur')+': '+(r.current||'?')+(r.latest?'  ·  '+t('upd_new')+': '+r.latest:'')+'  ·  '+st;
+      ulog.textContent=r.log||'';ulog.scrollTop=ulog.scrollHeight;
+      ubtn.disabled=!!r.running;
+      if(r.running){clearInterval(S.timer);S.timer=setInterval(()=>uref(false),3000)} else if(S.timer){clearInterval(S.timer);S.timer=null}
+    }catch(e){ubuild.textContent=t('upd_reconnect');clearInterval(S.timer);S.timer=setInterval(()=>uref(false),4000)}
+  };
+  ubtn.onclick=async()=>{if(!confirm(t('upd_warn')))return;try{await api('POST','/api/update',{});toast(t('upd_started'));uref(false)}catch(e){if(!e.handled)toast(e.message,1)}};
+  ucheck.onclick=()=>uref(true);
+  uref(true);
   // peer server pairing + status + auto-sync
   const pr=await api('GET','/api/peer').catch(()=>({paired:false,peer_url:''}));
   const purl=h('input',{value:pr.peer_url||'',placeholder:'https://<peer-ip>:7788'});
@@ -3546,6 +3597,8 @@ async function viewSettings(m){
   const pdis=h('button',{class:'btn dng',text:t('panel_disable'),onclick:async()=>{if(!confirm(t('panel_dis_warn')))return;try{await api('POST','/api/settings/panel/toggle',{on:false});toast(t('panel_disabled'))}catch(e){if(!e.handled)toast(e.message,1)}}});
   const b=(S.meta.build||{});
   m.replaceChildren(
+    h('div',{class:'card'},h('b',{text:t('upd_title')}),h('div',{class:'hint',text:t('upd_hint')}),ubuild,h('div',{class:'row'},ubtn,ucheck),ulog),
+    h('div',{class:'lbl',text:'\u00a0'}),
     h('div',{class:'card'},h('b',{text:t('peer_cfg')}),h('div',{class:'hint',text:t('peer_hint')}),
       h('label',{class:'f'},h('span',{text:t('peer_url')}),purl),
       h('label',{class:'f'},h('span',{text:t('peer_token')}),ptok),
@@ -3721,6 +3774,8 @@ class Handler(BaseHTTPRequestHandler):
                 return api_peer_get(req)
             if path == "/api/peer/status":
                 return api_peer_status(req)
+            if path == "/api/update/status":
+                return api_update_status(req)
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/logs$", path)
             if m:
                 return api_logs(req, m.group(1))
@@ -3752,6 +3807,8 @@ class Handler(BaseHTTPRequestHandler):
                 return api_panel_toggle(req)
             if path == "/api/peer":
                 return api_peer_set(req)
+            if path == "/api/update":
+                return api_update_start(req)
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/(start|stop|restart)$", path)
             if m:
                 return api_action(req, m.group(1), m.group(2))
