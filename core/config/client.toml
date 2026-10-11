@@ -1,4 +1,5 @@
 # Candy-Spoof – Client Configuration
+# transport = "spoof"   # "spoof" (UDP data + ICMP control, forged source) or "tcp" (standard non-spoofed TCP)
 # ─────────────────────────────────────────────────────────────────────────────
 # IP Addressing
 # ─────────────────────────────────────────────────────────────────────────────

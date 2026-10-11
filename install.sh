@@ -103,6 +103,7 @@ v_iface() {
   [[ ${1-} =~ ^[A-Za-z0-9_.:@-]{1,15}$ ]]
 }
 v_psk() { [[ ${1-} =~ ^[0-9a-fA-F]{32,}$ ]]; }
+v_transport() { [[ ${1-} == spoof || ${1-} == tcp ]]; }
 
 norm_u16()  { if [[ $1 =~ ^0[xX] ]]; then printf '%d' "$1"; else printf '%d' "$((10#$1))"; fi; }
 norm_float(){ if [[ $1 == *.* ]]; then printf '%s' "$1"; else printf '%s.0' "$((10#$1))"; fi; }
@@ -369,7 +370,8 @@ build_and_install() {
 
 # ---------------------------------------------------------- configuration ----
 collect_config() {
-  local o_real o_sp o_pool o_peer o_peersp o_peerpool o_port o_icmp o_socks o_tun o_mtu o_cwnd
+  local o_real o_sp o_pool o_peer o_peersp o_peerpool o_port o_icmp o_socks o_tun o_mtu o_cwnd o_tp
+  o_tp=$(cfg_get transport)
   o_real=$(cfg_get real_ip);        o_sp=$(cfg_get spoofed_ip)
   o_pool=$(cfg_get_list spoofed_ip_pool)
   o_peer=$(cfg_get peer_real_ip);   o_peersp=$(cfg_get peer_spoofed_ip)
@@ -381,27 +383,37 @@ collect_config() {
   local who peer
   if [[ $ROLE == client ]]; then who=client; peer=server; else who=server; peer=client; fi
 
-  {
-    echo
-    echo "Field semantics (src/config.rs):"
-    echo "  - spoofed IP      : source address this node forges on every outgoing packet"
-    echo "  - peer spoofed IP : source address the $peer forges (must match its own setting)"
-    echo "  - spoofed pool    : one address is picked at random each time the service starts"
-    echo "  - peer pool       : extra $peer source addresses to accept (written to allowed_peers);"
-    echo "                      list EVERY pool address the $peer may use, or packets from it are dropped"
-    echo
-  } >&2
+  ask transport "Transport (spoof|tcp)" "${o_tp:-spoof}" v_transport "spoof = UDP data + ICMP control (forged source); tcp = standard non-spoofed TCP"
 
   local real_default=${o_real:-$(detect_ip)}
   ask real_ip        "Real $who IP"                    "$real_default" v_ipv4 "IPv4 address, e.g. 203.0.113.10"
-  ask spoofed_ip     "Spoofed $who IP"                 "$o_sp"         v_ipv4 "IPv4 address"
-  ask spoofed_pool   "Spoofed IP pool (comma-separated, optional)" "$o_pool" v_ipv4_list "comma-separated IPv4 list"
   ask peer_real_ip   "Real peer $peer IP"              "$o_peer"       v_ipv4 "IPv4 address"
-  ask peer_spoofed_ip "Spoofed peer $peer IP"          "$o_peersp"     v_ipv4 "IPv4 address"
-  ask peer_pool      "Peer $peer spoofed IP pool (comma-separated, optional)" "$o_peerpool" v_ipv4_list "comma-separated IPv4 list"
-  ask iface          "Interface"                       "auto" v_iface "interface name, or 'auto' to detect from the real IP"
+
+  if [[ $transport == tcp ]]; then
+    # tcp mode: no raw sockets, no spoofed addresses. Fill the spoof-only
+    # fields with inert defaults so the written config still parses.
+    spoofed_ip=0.0.0.0; peer_spoofed_ip=0.0.0.0; spoofed_pool=""; peer_pool=""
+    iface=""; icmp_id=0
+    info "tcp transport: spoofed IPs / ICMP id / interface are not used and are left blank"
+  else
+    {
+      echo
+      echo "Field semantics (src/config.rs):"
+      echo "  - spoofed IP      : source address this node forges on every outgoing packet"
+      echo "  - peer spoofed IP : source address the $peer forges (must match its own setting)"
+      echo "  - spoofed pool    : one address is picked at random each time the service starts"
+      echo "  - peer pool       : extra $peer source addresses to accept (written to allowed_peers);"
+      echo "                      list EVERY pool address the $peer may use, or packets from it are dropped"
+      echo
+    } >&2
+    ask spoofed_ip     "Spoofed $who IP"                 "$o_sp"         v_ipv4 "IPv4 address"
+    ask spoofed_pool   "Spoofed IP pool (comma-separated, optional)" "$o_pool" v_ipv4_list "comma-separated IPv4 list"
+    ask peer_spoofed_ip "Spoofed peer $peer IP"          "$o_peersp"     v_ipv4 "IPv4 address"
+    ask peer_pool      "Peer $peer spoofed IP pool (comma-separated, optional)" "$o_peerpool" v_ipv4_list "comma-separated IPv4 list"
+    ask iface          "Interface"                       "auto" v_iface "interface name, or 'auto' to detect from the real IP"
+    ask icmp_id        "ICMP ID (0-65535 or 0x....)"     "${o_icmp:-$DEFAULT_ICMP_ID}" v_u16 "must match the $peer (default $DEFAULT_ICMP_ID = 0x4321 on both sides)"
+  fi
   ask data_port      "Data port"                       "${o_port:-51820}" v_port "1-65535 (must match the $peer)"
-  ask icmp_id        "ICMP ID (0-65535 or 0x....)"     "${o_icmp:-$DEFAULT_ICMP_ID}" v_u16 "must match the $peer (default $DEFAULT_ICMP_ID = 0x4321 on both sides)"
   if [[ $ROLE == client ]]; then
     ask socks5_port  "SOCKS5 port"                     "${o_socks:-1080}" v_socks_port "1024-65535 (binds 127.0.0.1)"
   fi
@@ -409,8 +421,10 @@ collect_config() {
   ask mtu            "MTU"                             "${o_mtu:-1380}" v_mtu "512-1400"
   ask initial_cwnd   "Initial CWND"                    "${o_cwnd:-10}" v_cwnd "number of packets, 1-1000"
 
-  # Interface: derive from the real IP; fall back to asking.
-  if [[ $iface == auto ]]; then
+  # Interface: derive from the real IP; fall back to asking. (spoof mode only)
+  if [[ $transport == tcp ]]; then
+    :
+  elif [[ $iface == auto ]]; then
     iface=$(detect_iface "$real_ip" || true)
     if [[ -n $iface ]]; then ok "Interface for $real_ip: $iface"
     else
@@ -465,6 +479,7 @@ write_config() {
   {
     echo "# Managed by the Candy-Spoof installer ($(date -u +%FT%TZ)) - role: $ROLE"
     echo "# Schema: src/config.rs @ $BUILD_REF"
+    printf 'transport = "%s"\n'        "${transport:-spoof}"
     printf 'real_ip = "%s"\n'          "$real_ip"
     printf 'peer_real_ip = "%s"\n'     "$peer_real_ip"
     printf 'spoofed_ip = "%s"\n'       "$spoofed_ip"
@@ -1272,6 +1287,7 @@ def render_config(role, c, note):
     lines = [
         "# Managed by the Candy-Spoof panel/installer - role: %s" % role,
         "# %s" % note,
+        'transport = "%s"' % c.get("transport", "spoof"),
         'real_ip = "%s"' % c["real_ip"],
         'peer_real_ip = "%s"' % c["peer_real_ip"],
         'spoofed_ip = "%s"' % c["spoofed_ip"],
@@ -1414,12 +1430,24 @@ def validate(role, data, self_name, current=None):
             return cur.get(k, default)
         return v
 
-    for k in ("real_ip", "peer_real_ip", "spoofed_ip", "peer_spoofed_ip"):
+    tp = str(pick("transport", "spoof")).strip().lower()
+    if tp not in ("spoof", "tcp"):
+        errs["transport"] = 'must be "spoof" or "tcp"'
+        tp = "spoof"
+    c["transport"] = tp
+
+    # spoofed addresses are required only in spoof mode
+    req_ips = ["real_ip", "peer_real_ip"] + (["spoofed_ip", "peer_spoofed_ip"] if tp == "spoof" else [])
+    for k in req_ips:
         v = pick(k)
         if v is None or not v_ip(v):
             errs[k] = "valid IPv4 address required"
         else:
             c[k] = str(v).strip()
+    if tp == "tcp":
+        for k in ("spoofed_ip", "peer_spoofed_ip"):
+            v = pick(k)
+            c[k] = str(v).strip() if (v and v_ip(v)) else "0.0.0.0"
 
     pool, e = as_ip_list(data["spoofed_ip_pool"] if "spoofed_ip_pool" in data else cur.get("spoofed_ip_pool", []))
     if e:
@@ -1434,7 +1462,7 @@ def validate(role, data, self_name, current=None):
     if n is None:
         errs["data_port"] = "1-65535"
     c["data_port"] = n
-    n = as_int(pick("icmp_id"), 0, 65535)
+    n = as_int(pick("icmp_id", 0 if tp == "tcp" else None), 0, 65535)
     if n is None:
         errs["icmp_id"] = "0-65535 (decimal or 0x...)"
     c["icmp_id"] = n
@@ -1469,15 +1497,18 @@ def validate(role, data, self_name, current=None):
             errs["socks5_port"] = "1024-65535 (binds 127.0.0.1)"
         c["socks5_port"] = n
 
-    iface = str(pick("interface", "auto")).strip() or "auto"
-    if not re.match(r"^[A-Za-z0-9_.:-]{1,15}$", iface):
-        errs["interface"] = "interface name or 'auto'"
-    elif iface == "auto":
-        if "real_ip" in c:
-            iface = detect_iface(c["real_ip"])
-            if not iface:
-                errs["interface"] = "auto-detect failed (no local interface carries %s); choose one" % c["real_ip"]
-    c["interface"] = iface
+    if tp == "tcp":
+        c["interface"] = str(pick("interface", "")).strip()   # ignored in tcp mode
+    else:
+        iface = str(pick("interface", "auto")).strip() or "auto"
+        if not re.match(r"^[A-Za-z0-9_.:-]{1,15}$", iface):
+            errs["interface"] = "interface name or 'auto'"
+        elif iface == "auto":
+            if "real_ip" in c:
+                iface = detect_iface(c["real_ip"])
+                if not iface:
+                    errs["interface"] = "auto-detect failed (no local interface carries %s); choose one" % c["real_ip"]
+        c["interface"] = iface
 
     key = data.get("pre_shared_key")
     if key is None or str(key).strip() == "":
@@ -1513,6 +1544,7 @@ def peer_view(role, cfg):
     opp_pool = ([cfg["peer_spoofed_ip"]] + [a for a in allowed if a != cfg["peer_spoofed_ip"]]) if allowed else []
     return {
         "role": "server" if role == "client" else "client",
+        "transport": cfg.get("transport", "spoof"),
         "real_ip": cfg["peer_real_ip"], "peer_real_ip": cfg["real_ip"],
         "spoofed_ip": cfg["peer_spoofed_ip"], "peer_spoofed_ip": cfg["spoofed_ip"],
         "spoofed_ip_pool": opp_pool, "allowed_peers": cfg.get("spoofed_ip_pool", []),
@@ -2033,7 +2065,7 @@ def api_meta(req):
         k, _, v = line.partition("=")
         info[k] = v
     return {"role": get_role(), "detect_ip": detect_ip(), "ifaces": list_ifaces(), "build": info,
-            "tls": bool(load_panel().get("tls")), "defaults": {"data_port": 51820, "tunnel_count": 4, "mtu": 1380,
+            "tls": bool(load_panel().get("tls")), "defaults": {"transport": "spoof", "data_port": 51820, "tunnel_count": 4, "mtu": 1380,
                                                               "initial_cwnd": 10, "socks5_port": 1080,
                                                               "max_retries": 8, "rto_min_ms": 200,
                                                               "icmp_id": secrets.randbelow(65536)}}
@@ -2466,6 +2498,7 @@ def api_diagnose(req):
     name = str(body.get("name", "main")).strip() or "main"
     inst = _inst_or_404(name)
     cfg = inst.cfg()
+    tcp = str(cfg.get("transport", "spoof")).lower() == "tcp"
 
     F = []
 
@@ -2495,19 +2528,22 @@ def api_diagnose(req):
             add("fail", "peer_real_ip", "real_ip and peer_real_ip are identical",
                 "both ends are set to the same real address",
                 "peer_real_ip must be the OTHER host's real IP")
-        if cfg.get("spoofed_ip") and cfg.get("spoofed_ip") == cfg.get("peer_spoofed_ip"):
+        if not tcp and cfg.get("spoofed_ip") and cfg.get("spoofed_ip") == cfg.get("peer_spoofed_ip"):
             add("fail", "peer_spoofed_ip", "spoofed_ip and peer_spoofed_ip are identical",
                 "each side must forge a different source address",
                 "set peer_spoofed_ip to the source the peer forges (its spoofed_ip)")
         pool = cfg.get("spoofed_ip_pool") or []
-        if pool and cfg.get("spoofed_ip") not in pool:
+        if not tcp and pool and cfg.get("spoofed_ip") not in pool:
             add("warn", "spoofed_ip_pool", "spoofed_ip is not in spoofed_ip_pool",
                 "when a pool is set only pool addresses are used",
                 "add spoofed_ip to the pool, or clear the pool")
     safe(c_consistency)
 
-    # 3 - interface the raw sockets bind to -----------------------------------
+    # 3 - interface the raw sockets bind to (spoof mode only) -----------------
     def c_iface():
+        if tcp:
+            add("ok", "transport", "transport=tcp (standard socket; no raw sockets / spoofing)")
+            return
         iface = cfg.get("interface") or ""
         if not iface:
             add("fail", "interface", "interface is empty",
@@ -2528,6 +2564,8 @@ def api_diagnose(req):
 
     # 4 - reverse-path filtering drops spoofed-source packets ------------------
     def c_rpfilter():
+        if tcp:
+            return
         iface = cfg.get("interface") or "all"
         for scope in dict.fromkeys(["all", iface]):
             v = read_text("/proc/sys/net/ipv4/conf/%s/rp_filter" % scope).strip()
@@ -2588,7 +2626,8 @@ def api_diagnose(req):
                     "the link must be generated on the peer (the opposite role)", "")
                 return
             # Symmetric fields - any difference is definitely wrong.
-            for k in ("data_port", "icmp_id"):
+            sym = ["data_port"] + ([] if tcp else ["icmp_id"])
+            for k in sym:
                 if d.get(k) is not None and str(d.get(k)) != str(cfg.get(k)):
                     add("fail", k, "%s does not match the peer" % k,
                         "peer uses %s, this host has %s" % (d.get(k), cfg.get(k)),
@@ -2603,7 +2642,8 @@ def api_diagnose(req):
                     add("ok", "pre_shared_key", "pre_shared_key matches the peer")
             # Addressing - the link is already oriented for this host, so its
             # values are exactly what this host should have.
-            for k in ("real_ip", "peer_real_ip", "spoofed_ip", "peer_spoofed_ip"):
+            addr = ["real_ip", "peer_real_ip"] + ([] if tcp else ["spoofed_ip", "peer_spoofed_ip"])
+            for k in addr:
                 if d.get(k) and str(d.get(k)) != str(cfg.get(k)):
                     add("fail", k, "%s does not match the peer's link" % k,
                         "peer link expects %s, this host has %s" % (d.get(k), cfg.get(k)),
@@ -2753,7 +2793,7 @@ en: {
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
  events:'Recent events', none:'Nothing yet', details:'Details', start:'Start', stop:'Stop', restart:'Restart', del:'Delete', edit:'Edit', test:'Link test', key:'Key & link',
  create:'Create tunnel', import:'Import link', cancel:'Cancel', save:'Save', close:'Close', confirm_del:'Delete tunnel "%s"? Its service and config are removed.',
- f_name:'Tunnel name', f_real:'Real IP', f_spoof:'Spoofed IP', f_pool:'Spoofed IP pool (comma-separated, optional)', f_peerpool:'Peer spoofed IP pool (optional)',
+ f_name:'Tunnel name', f_transport:'Transport', h_transport:'spoof = UDP+ICMP forged source · tcp = standard non-spoofed TCP', f_real:'Real IP', f_spoof:'Spoofed IP', f_pool:'Spoofed IP pool (comma-separated, optional)', f_peerpool:'Peer spoofed IP pool (optional)',
  h_peerpool:'Every pool address the peer may use, otherwise its packets are dropped (allowed_peers).', f_iface:'Interface', f_port:'Data port', f_icmp:'ICMP ID (0-65535 or 0x..)',
  f_socks:'SOCKS5 port', f_tun:'Tunnel count', f_mtu:'MTU', f_cwnd:'Initial CWND', f_retries:'Max retries', h_retries:'retransmits before giving up (1-100)', f_rto:'Min RTO (ms)', h_rto:'retransmit-timeout floor; raise on lossy/high-latency links (10-60000)', f_key:'Pre-shared key (blank = generate)', gen:'Generate', server:'server', client:'client',
  auto:'auto-detect', saved:'Saved', created:'Tunnel created', link_hint:'Give this link to the other side: Tunnels > Import link.', fp:'Fingerprint', show:'Show',
@@ -2770,7 +2810,7 @@ fa: {
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
  events:'رویدادهای اخیر', none:'هنوز چیزی نیست', details:'جزئیات', start:'شروع', stop:'توقف', restart:'ری‌استارت', del:'حذف', edit:'ویرایش', test:'تست لینک', key:'کلید و لینک',
  create:'ساخت تونل', import:'وارد کردن لینک', cancel:'انصراف', save:'ذخیره', close:'بستن', confirm_del:'تونل «%s» حذف شود؟ سرویس و کانفیگ آن پاک می‌شود.',
- f_name:'نام تونل', f_real:'IP واقعی', f_spoof:'IP جعلی', f_pool:'استخر IP جعلی (با کاما، اختیاری)', f_peerpool:'استخر IP جعلی طرف مقابل (اختیاری)',
+ f_name:'نام تونل', f_transport:'نوع انتقال', h_transport:'spoof = UDP+ICMP با منبع جعلی · tcp = TCP استاندارد بدون جعل', f_real:'IP واقعی', f_spoof:'IP جعلی', f_pool:'استخر IP جعلی (با کاما، اختیاری)', f_peerpool:'استخر IP جعلی طرف مقابل (اختیاری)',
  h_peerpool:'همهٔ IPهایی که طرف مقابل ممکن است استفاده کند؛ وگرنه بسته‌هایش دور ریخته می‌شود (allowed_peers).', f_iface:'اینترفیس', f_port:'پورت دیتا', f_icmp:'ICMP ID ‏(۰ تا ۶۵۵۳۵ یا 0x..)',
  f_socks:'پورت SOCKS5', f_tun:'تعداد تونل', f_mtu:'MTU', f_cwnd:'CWND اولیه', f_retries:'حداکثر تلاش مجدد', h_retries:'تعداد ارسال مجدد پیش از انصراف (۱ تا ۱۰۰)', f_rto:'حداقل RTO (ms)', h_rto:'کف زمان‌بندی ارسال مجدد؛ در شبکه‌های پرافت/پرتأخیر بالاتر بگذارید (۱۰ تا ۶۰۰۰۰)', f_key:'کلید pre-shared (خالی = ساخت خودکار)', gen:'ساخت', server:'سرور', client:'کلاینت',
  auto:'تشخیص خودکار', saved:'ذخیره شد', created:'تونل ساخته شد', link_hint:'این لینک را به طرف مقابل بدهید: تونل‌ها > وارد کردن لینک.', fp:'اثر انگشت', show:'نمایش',
@@ -2935,6 +2975,7 @@ function fieldDefs(role){
   const me=t(role),peer=t(role==='client'?'server':'client');
   return [
    {k:'name',l:t('f_name'),create:true},
+   {k:'transport',l:t('f_transport'),hint:t('h_transport')},
    {k:'real_ip',l:`${t('f_real')} (${me})`},{k:'spoofed_ip',l:`${t('f_spoof')} (${me})`},{k:'spoofed_ip_pool',l:t('f_pool'),list:true},
    {k:'peer_real_ip',l:`${t('f_real')} (${peer})`},{k:'peer_spoofed_ip',l:`${t('f_spoof')} (${peer})`},
    {k:'allowed_peers',l:t('f_peerpool'),list:true,hint:t('h_peerpool')},

@@ -15,10 +15,19 @@ pub struct Config {
     /// The real IPv4 address of the remote peer.
     pub peer_real_ip: Ipv4Addr,
 
-    /// The spoofed source IP this node puts in outgoing packets.
+    /// Transport mode: "spoof" (default: UDP data + ICMP control over raw
+    /// sockets with a forged source IP) or "tcp" (a standard, non-spoofed TCP
+    /// connection between the two real IPs).  The spoof-only fields below are
+    /// ignored in "tcp" mode.
+    #[serde(default = "default_transport")]
+    pub transport: String,
+
+    /// The spoofed source IP this node puts in outgoing packets (spoof mode).
+    #[serde(default = "unspecified_ip")]
     pub spoofed_ip: Ipv4Addr,
 
     /// The spoofed source IP the peer uses (expected in incoming packets).
+    #[serde(default = "unspecified_ip")]
     pub peer_spoofed_ip: Ipv4Addr,
 
     /// Optional pool of spoofed IPs for rotation.  If empty, `spoofed_ip` is
@@ -30,7 +39,8 @@ pub struct Config {
     pub data_port: u16,
 
     /// ICMP echo identifier used to distinguish Candy-Spoof control packets
-    /// from regular ping traffic.
+    /// from regular ping traffic (spoof mode).
+    #[serde(default)]
     pub icmp_id: u16,
 
     /// Whitelist of peer real IPs whose packets are accepted. In addition to
@@ -47,6 +57,8 @@ pub struct Config {
     pub pre_shared_key: String,
 
     /// Network interface name to bind raw sockets to (e.g. "eth0", "ens3").
+    /// Spoof mode only; ignored in "tcp" mode.
+    #[serde(default)]
     pub interface: String,
 
     /// Port for the local SOCKS5 proxy (client only, ignored on server).
@@ -75,6 +87,8 @@ pub struct Config {
     pub rto_min_ms: u64,
 }
 
+fn default_transport() -> String { "spoof".into() }
+fn unspecified_ip() -> Ipv4Addr { Ipv4Addr::UNSPECIFIED }
 fn default_tunnel_count() -> usize { 4 }
 fn default_socks5_port() -> u16 { 1080 }
 fn default_mtu() -> usize { 1380 }
@@ -136,6 +150,12 @@ impl Config {
     pub fn validate(&self, client: bool) -> Result<(), ValidationError> {
         let err = |m: String| Err(ValidationError(m));
 
+        match self.transport.as_str() {
+            "spoof" | "tcp" => {}
+            other => return err(format!(
+                "transport must be \"spoof\" or \"tcp\" (got {:?})", other
+            )),
+        }
         if self.pre_shared_key.trim().is_empty() {
             return err("pre_shared_key must not be empty (both peers must share \
                         the same key)".into());
@@ -146,9 +166,17 @@ impl Config {
         if client && self.socks5_port == 0 {
             return err("socks5_port must be between 1 and 65535 on the client".into());
         }
-        if self.interface.trim().is_empty() {
-            return err("interface must name the network device to bind raw \
-                        sockets to (e.g. \"eth0\")".into());
+        // The raw-socket interface and the spoofed-source addresses only matter
+        // in spoof mode; tcp mode uses an ordinary kernel socket.
+        if self.is_spoof() {
+            if self.interface.trim().is_empty() {
+                return err("interface must name the network device to bind raw \
+                            sockets to (e.g. \"eth0\") in spoof mode".into());
+            }
+            if self.spoofed_ip.is_unspecified() || self.peer_spoofed_ip.is_unspecified() {
+                return err("spoofed_ip and peer_spoofed_ip are required in spoof \
+                            mode".into());
+            }
         }
         if self.tunnel_count == 0 {
             return err("tunnel_count must be at least 1".into());
@@ -188,6 +216,12 @@ impl Config {
         Tuning { max_retries: self.max_retries, rto_min_ms: self.rto_min_ms }
     }
 
+    /// True when the raw-socket, source-spoofing transport is selected (default).
+    pub fn is_spoof(&self) -> bool { self.transport != "tcp" }
+
+    /// True when the standard-socket TCP transport is selected.
+    pub fn is_tcp(&self) -> bool { self.transport == "tcp" }
+
     /// Non-fatal configuration observations, suitable for logging at startup.
     /// These never block startup but help operators spot mistakes and surface
     /// currently-unenforced settings honestly (see the project's known
@@ -207,27 +241,30 @@ impl Config {
             ));
         }
 
-        // `pick_spoofed_ip` uses ONLY the pool when it is non-empty, so a pool
-        // that omits `spoofed_ip` silently stops that address from being used.
-        if !self.spoofed_ip_pool.is_empty() && !self.spoofed_ip_pool.contains(&self.spoofed_ip) {
-            w.push(format!(
-                "spoofed_ip {} is not in spoofed_ip_pool; when a pool is set only \
-                 pool addresses are used",
-                self.spoofed_ip
-            ));
-        }
-
-        // Be honest about fields that are parsed but not wired into the data
-        // path, instead of letting operators assume they take effect. Each
-        // SOCKS5 connection already opens its own independent tunnel, so
-        // tunnel_count has no effect; packet-level duplication is deliberately
-        // not implemented.
-        if self.tunnel_count != 1 {
-            w.push(format!(
-                "tunnel_count = {} has no effect: each connection already uses \
-                 its own tunnel and per-packet redundancy is not implemented",
-                self.tunnel_count
-            ));
+        // The remaining notes are about the spoof data path; they do not apply
+        // to the tcp transport.
+        if self.is_spoof() {
+            // `pick_spoofed_ip` uses ONLY the pool when it is non-empty, so a
+            // pool that omits `spoofed_ip` silently stops that address from
+            // being used.
+            if !self.spoofed_ip_pool.is_empty() && !self.spoofed_ip_pool.contains(&self.spoofed_ip) {
+                w.push(format!(
+                    "spoofed_ip {} is not in spoofed_ip_pool; when a pool is set \
+                     only pool addresses are used",
+                    self.spoofed_ip
+                ));
+            }
+            // Be honest about fields parsed but not wired into the data path.
+            // Each SOCKS5 connection already opens its own independent tunnel,
+            // so tunnel_count has no effect; packet-level duplication is
+            // deliberately not implemented.
+            if self.tunnel_count != 1 {
+                w.push(format!(
+                    "tunnel_count = {} has no effect: each connection already uses \
+                     its own tunnel and per-packet redundancy is not implemented",
+                    self.tunnel_count
+                ));
+            }
         }
 
         w
@@ -294,6 +331,47 @@ initial_cwnd    = 10.0
         assert_eq!(cfg.rto_min_ms, 200);
         assert_eq!(cfg.tuning().max_retries, 8);
         cfg.validate(true).expect("minimal config should be valid");
+    }
+
+    #[test]
+    fn defaults_to_spoof_transport() {
+        let cfg = parse(&valid_toml());
+        assert_eq!(cfg.transport, "spoof");
+        assert!(cfg.is_spoof() && !cfg.is_tcp());
+    }
+
+    #[test]
+    fn tcp_transport_config_is_minimal_and_valid() {
+        // A tcp config may omit interface, spoofed_ip, peer_spoofed_ip, icmp_id.
+        let toml = format!(
+            r#"
+transport       = "tcp"
+real_ip         = "10.0.0.1"
+peer_real_ip    = "203.0.113.1"
+data_port       = 443
+socks5_port     = 1080
+pre_shared_key  = "{}"
+"#,
+            "a".repeat(32)
+        );
+        let cfg = parse(&toml);
+        assert!(cfg.is_tcp());
+        cfg.validate(true).expect("tcp config should be valid without spoof fields");
+        // The spoof-only warnings must not fire in tcp mode.
+        assert!(cfg.warnings().iter().all(|w| !w.contains("tunnel_count")));
+    }
+
+    #[test]
+    fn spoof_mode_still_requires_interface_and_spoofed_ips() {
+        // Dropping interface from a spoof config is rejected.
+        let no_iface = valid_toml().replace("interface       = \"eth0\"", "");
+        assert!(parse(&no_iface).validate(false).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_transport() {
+        let cfg = parse(&format!("{}\ntransport = \"quic\"\n", valid_toml()));
+        assert!(cfg.validate(false).is_err());
     }
 
     #[test]

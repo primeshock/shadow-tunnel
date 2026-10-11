@@ -55,6 +55,15 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // TCP transport: a standard, non-spoofed socket path (no raw sockets).
+    if cfg.is_tcp() {
+        log::info!(
+            "Candy-Spoof client starting | transport=tcp | real={} peer={}:{}",
+            cfg.real_ip, cfg.peer_real_ip, cfg.data_port
+        );
+        return candy_spoof::tcp::run_tcp_client(cfg).await;
+    }
+
     log::info!(
         "Candy-Spoof client starting | real={} spoof={} peer={} iface={}",
         cfg.real_ip,

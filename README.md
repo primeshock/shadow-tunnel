@@ -100,6 +100,18 @@ ssh -L 7777:127.0.0.1:7777 root@<your-server>
    other side's link — it checks the whole path and names the exact setting that
    is wrong (ports, ICMP id, key, spoofed-IP pairing, `rp_filter`, interface…).
 
+## Transport modes
+
+Each tunnel picks a `transport` (installer prompt, or the panel's Tunnels → Edit):
+
+- **`spoof`** (default) — UDP data + ICMP control over raw sockets with a forged
+  source IP (needs `CAP_NET_RAW`; Linux only). The original behaviour.
+- **`tcp`** — an ordinary, **non-spoofed** kernel TCP connection between the two
+  real IPs. No raw sockets or spoofing; use it for reliable server-to-server
+  tunneling, or where raw/spoofed packets are filtered. The session is
+  authenticated with the pre-shared key; `spoofed_ip`/`icmp_id`/`interface` are
+  ignored. Both ends must use the same `transport`.
+
 See **[PANEL.md](PANEL.md)** for the complete reference.
 
 ## Build from a different source
