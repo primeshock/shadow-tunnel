@@ -3364,6 +3364,13 @@ html{background:#06070f}
 html[data-theme=light] #bg::after{background-image:linear-gradient(rgba(30,40,80,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(30,40,80,.022) 1px,transparent 1px)}
 .rem{display:flex;align-items:center;gap:9px;margin:12px 0 4px;font-size:13px;color:var(--mut);cursor:pointer}
 .login .rem input{width:18px;height:18px;padding:0;margin:0;accent-color:#a855f7}
+
+/* ===== v8: blurrier, less see-through liquid glass ===== */
+:root{--g1:rgba(34,40,72,.62);--g2:rgba(20,24,46,.50);--m1:rgba(30,36,66,.90);--m2:rgba(18,22,44,.88);--dock:rgba(14,16,34,.66)}
+:root[data-theme=light]{--g1:rgba(240,243,249,.82);--g2:rgba(231,235,244,.66);--m1:rgba(237,240,247,.98);--m2:rgba(229,233,243,.97);--dock:rgba(234,237,245,.90)}
+.card{backdrop-filter:blur(30px) saturate(170%);-webkit-backdrop-filter:blur(30px) saturate(170%)}
+.modal{backdrop-filter:blur(36px) saturate(170%);-webkit-backdrop-filter:blur(36px) saturate(170%)}
+nav.dock,header.top{backdrop-filter:blur(30px) saturate(170%);-webkit-backdrop-filter:blur(30px) saturate(170%)}
 </style>
 </head>
 <body>
@@ -3496,9 +3503,15 @@ async function boot(){
 function placeDock(nav){
   if(!nav) return;
   const ind=nav.querySelector('.dind'),on=nav.querySelector('button.on'); if(!ind||!on) return;
-  const L=on.offsetLeft,W=on.offsetWidth,old=window.__dnav;
-  if(old){ind.style.left=old.l+'px';ind.style.width=old.w+'px';void ind.offsetWidth;requestAnimationFrame(()=>{ind.style.left=L+'px';ind.style.width=W+'px'})}
-  else{ind.style.transition='none';ind.style.left=L+'px';ind.style.width=W+'px';void ind.offsetWidth;ind.style.transition=''}
+  const old=window.__dnav;
+  // start the new indicator exactly where the old one was (no transition), THEN move it
+  ind.style.transition='none';
+  if(old){ind.style.left=old.l+'px';ind.style.width=old.w+'px'}
+  const L=on.offsetLeft,W=on.offsetWidth;
+  if(!old){ind.style.left=L+'px';ind.style.width=W+'px'}
+  void ind.offsetWidth;
+  ind.style.transition='';
+  if(old) requestAnimationFrame(()=>{ind.style.left=L+'px';ind.style.width=W+'px'});
   window.__dnav={l:L,w:W};
 }
 addEventListener('resize',()=>{const n=document.querySelector('nav.dock');if(n){window.__dnav=null;placeDock(n)}});
