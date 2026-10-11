@@ -864,9 +864,15 @@ cmd_socks_port() {
 }
 
 ensure_cert() {
-  [[ -f $ETC/panel.crt && -f $ETC/panel.key ]] && return 0
   command -v openssl >/dev/null || die "openssl is required to create a TLS certificate"
+  if [[ -f $ETC/panel.crt && -f $ETC/panel.key ]]; then
+    openssl x509 -in "$ETC/panel.crt" -noout -text 2>/dev/null | grep -q "Subject Alternative Name" && return 0
+  fi
+  local san="IP:127.0.0.1" ip
+  for ip in $(hostname -I 2>/dev/null); do [[ $ip =~ ^[0-9.]+$ ]] && san+=",IP:$ip"; done
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+    -subj "/CN=shadow-spoof" -addext "subjectAltName=$san" -keyout "$ETC/panel.key" -out "$ETC/panel.crt" >/dev/null 2>&1 \
+  || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
     -subj "/CN=shadow-spoof" -keyout "$ETC/panel.key" -out "$ETC/panel.crt" >/dev/null 2>&1
   chmod 0600 "$ETC/panel.key"; chmod 0644 "$ETC/panel.crt"
 }
@@ -2139,13 +2145,14 @@ def _save_sessions():
         sys.stderr.write("could not persist sessions: %s\n" % e)
 
 
-def new_session(ip):
+def new_session(ip, remember=False):
     tok, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
     with SESS_LOCK:
         now = time.time()
         for k in [k for k, v in SESSIONS.items() if v["exp"] < now]:
             del SESSIONS[k]
-        SESSIONS[_skey(tok)] = {"csrf": csrf, "exp": now + 86400, "idle": now + 43200, "ip": ip}
+        ttl, idle_ttl = (30 * 86400, 30 * 86400) if remember else (86400, 43200)
+        SESSIONS[_skey(tok)] = {"csrf": csrf, "exp": now + ttl, "idle": now + idle_ttl, "idle_ttl": idle_ttl, "ip": ip}
         _save_sessions()
     return tok, csrf
 
@@ -2158,7 +2165,7 @@ def get_session(tok):
         if not s or s["exp"] < now or s["idle"] < now:
             SESSIONS.pop(k, None)
             return None
-        s["idle"] = now + 43200
+        s["idle"] = now + s.get("idle_ttl", 43200)
         return s
 
 
@@ -3345,6 +3352,18 @@ nav.dock button.on{background:none;box-shadow:none;color:#fff}
 #main{animation:vin .34s cubic-bezier(.2,.8,.2,1) both}
 @keyframes vin{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 @media(prefers-reduced-motion:reduce){.dind{transition:none}#main{animation:none}}
+
+/* ===== v7: slightly brighter dark theme, fainter light-theme grid, remember checkbox ===== */
+html{background:#06070f}
+#bg{background:radial-gradient(130% 100% at 0% 0%,#0b1030 0%,#06070f 58%)}
+#bg i{opacity:.30}
+#bg .b1{width:50vmax;height:50vmax}
+#bg .b2{width:44vmax;height:44vmax}
+#bg .b3{width:48vmax;height:48vmax}
+#bg .b4{width:36vmax;height:36vmax;opacity:.22}
+html[data-theme=light] #bg::after{background-image:linear-gradient(rgba(30,40,80,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(30,40,80,.022) 1px,transparent 1px)}
+.rem{display:flex;align-items:center;gap:9px;margin:12px 0 4px;font-size:13px;color:var(--mut);cursor:pointer}
+.login .rem input{width:18px;height:18px;padding:0;margin:0;accent-color:#a855f7}
 </style>
 </head>
 <body>
@@ -3357,7 +3376,7 @@ const UIV='__UIV__';
 /* ---------- i18n ---------- */
 const TR = {
 en: {
- ev_tab:'Events', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
+ ev_tab:'Events', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
  diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load / uptime', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX',
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
@@ -3375,7 +3394,7 @@ en: {
  note_key:'The pre-shared key authenticates every packet (HMAC). Both sides must use the identical key.', srv_test_hint:'Listens for client packets for 10 s. Press Run here, then run the test on the client at the same time.', no_tunnels:'No tunnels yet.', warnings:'Warnings'
 },
 fa: {
- ev_tab:'رویدادها', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
+ ev_tab:'رویدادها', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
  diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار / آپ‌تایم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال',
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
@@ -3456,10 +3475,12 @@ function renderLogin(){
   const user=h('input',{type:'text',name:'username',autocomplete:'username',value:'admin',class:'sr',tabindex:'-1','aria-hidden':'true'});
   const pw=h('input',{type:'password',name:'password',id:'pw',autocomplete:'current-password',placeholder:t('password'),required:true});
   const err=h('div',{class:'err'});
+  const chk=h('input',{type:'checkbox',checked:true,id:'rem'});
+  const rem=h('label',{class:'rem'},chk,h('span',{text:t('remember')}));
   const btn=h('button',{class:'btn pri',type:'submit',text:t('login')});
-  const form=h('form',{method:'post',action:'#',autocomplete:'on'},user,h('label',{class:'f'},h('span',{text:t('password')}),pw),err,btn);
+  const form=h('form',{method:'post',action:'#',autocomplete:'on'},user,h('label',{class:'f'},h('span',{text:t('password')}),pw),rem,err,btn);
   form.addEventListener('submit',async e=>{e.preventDefault();err.textContent='';btn.disabled=true;
-    try{const r=await api('POST','/api/login',{password:pw.value});S.csrf=r.csrf;boot()}catch(x){err.textContent=x.message;btn.disabled=false}});
+    try{const r=await api('POST','/api/login',{password:pw.value,remember:chk.checked});S.csrf=r.csrf;boot()}catch(x){err.textContent=x.message;btn.disabled=false}});
   root.append(h('div',{class:'loginwrap'},h('div',{class:'login'},h('div',{class:'logo'},h('b',{text:'Shadow'}),' Spoof'),h('div',{class:'card'},form))));
   pw.focus();
 }
@@ -3978,9 +3999,10 @@ class Handler(BaseHTTPRequestHandler):
         pw = str(req.json.get("password", ""))
         if check_pw(pw, load_panel().get("pw", {})):
             FAILS.pop(ip, None)
-            tok, csrf = new_session(ip)
-            cookie = "cs_session=%s; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400%s" % (
-                tok, "; Secure" if getattr(self.server, "tls", False) else "")
+            remember = bool(req.json.get("remember"))
+            tok, csrf = new_session(ip, remember)
+            cookie = "cs_session=%s; HttpOnly; SameSite=Strict; Path=/; Max-Age=%d%s" % (
+                tok, 30 * 86400 if remember else 86400, "; Secure" if getattr(self.server, "tls", False) else "")
             self._json(200, {"ok": True, "csrf": csrf}, [("Set-Cookie", cookie)])
         else:
             note_fail(ip)
@@ -4470,9 +4492,17 @@ link_prefill() { # let the operator paste the setup link produced by the other s
 }
 
 ensure_panel_cert() {
-  [[ -f $ETC_DIR/panel.crt && -f $ETC_DIR/panel.key ]] && return 0
   command -v openssl >/dev/null || die "openssl is required for HTTPS (install it or choose HTTP)"
+  if [[ -f $ETC_DIR/panel.crt && -f $ETC_DIR/panel.key ]]; then
+    # Older certs had no subjectAltName; browsers reject those for an IP even when trusted.
+    openssl x509 -in "$ETC_DIR/panel.crt" -noout -text 2>/dev/null | grep -q "Subject Alternative Name" && return 0
+    warn "Regenerating the panel certificate (the old one had no subjectAltName)"; PANEL_CHANGED=1
+  fi
+  local san="IP:127.0.0.1" ip
+  for ip in $(hostname -I 2>/dev/null); do [[ $ip =~ ^[0-9.]+$ ]] && san+=",IP:$ip"; done
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+    -subj "/CN=shadow-spoof" -addext "subjectAltName=$san" -keyout "$ETC_DIR/panel.key" -out "$ETC_DIR/panel.crt" >/dev/null 2>&1 \
+  || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
     -subj "/CN=shadow-spoof" -keyout "$ETC_DIR/panel.key" -out "$ETC_DIR/panel.crt" >/dev/null 2>&1
   chmod 0600 "$ETC_DIR/panel.key"; chmod 0644 "$ETC_DIR/panel.crt"
 }
