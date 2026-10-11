@@ -3082,9 +3082,18 @@ UPDATE_UNIT = "shadow-spoof-update"
 REPO_API = "https://api.github.com/repos/primeshock/shadow-tunnel/commits/master"
 
 
+def _update_state():
+    rc, out, _ = run([SYSTEMCTL, "show", UPDATE_UNIT + ".service", "-p", "ActiveState,Result,ExecMainStatus,LoadState"])
+    d = {}
+    for line in (out or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k] = v
+    return d
+
+
 def _update_running():
-    rc, out, _ = run([SYSTEMCTL, "is-active", UPDATE_UNIT + ".service"])
-    return (out or "").strip() in ("active", "activating")
+    return _update_state().get("ActiveState") in ("active", "activating")
 
 
 def api_update_status(req):
@@ -3101,23 +3110,38 @@ def api_update_status(req):
                 latest = json.loads(resp.read().decode()).get("sha", "")
         except Exception as e:
             err = "could not reach GitHub: %s" % e
-    log = read_text(UPDATE_LOG).splitlines()[-60:]
+    st = _update_state()
+    log = read_text(UPDATE_LOG).splitlines()[-80:]
+    failed = st.get("ActiveState") == "failed"
     return {"current": cur[:12], "latest": latest[:12], "error": err,
             "available": bool(latest and (not cur or (not latest.startswith(cur[:12]) and not cur.endswith(latest)))),
-            "running": _update_running(), "log": "\n".join(log)}
+            "running": st.get("ActiveState") in ("active", "activating"),
+            "failed": failed, "exit": st.get("ExecMainStatus", ""), "log": "\n".join(log)}
 
 
 def api_update_start(req):
+    import shutil
     if _update_running():
         raise ApiError(409, "an update is already running")
     if not os.access(CTL, os.X_OK):
         raise ApiError(500, "%s not found - re-run the installer" % CTL)
-    # A transient unit outlives the panel restart that the installer performs.
-    rc, out, err = run(["systemd-run", "--unit=" + UPDATE_UNIT, "--collect", "--quiet",
+    if not shutil.which("systemd-run"):
+        raise ApiError(500, "systemd-run is not available on this host; update from a shell: shadowtun update")
+    run([SYSTEMCTL, "reset-failed", UPDATE_UNIT + ".service"])   # clear a previous failed run
+    # A transient unit outlives the panel restart that the installer performs. The
+    # environment is explicit because a transient unit does not inherit a login shell's.
+    rc, out, err = run(["systemd-run", "--unit=" + UPDATE_UNIT, "--quiet",
+                        "--setenv=HOME=/root", "--setenv=TERM=dumb", "--setenv=LANG=C.UTF-8",
+                        "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                         "-p", "StandardOutput=file:" + UPDATE_LOG,
                         CTL, "update", "-y"], timeout=15)
     if rc:
-        raise ApiError(500, (err or out or "systemd-run failed").strip()[:300])
+        raise ApiError(500, "systemd-run failed: %s" % (err or out or "no output").strip()[:300])
+    time.sleep(1.5)
+    st = _update_state()
+    if st.get("ActiveState") == "failed":
+        tail = "\n".join(read_text(UPDATE_LOG).splitlines()[-8:])
+        raise ApiError(500, "the update process exited immediately (exit %s). %s" % (st.get("ExecMainStatus", "?"), tail[-400:]))
     return {"ok": True}
 
 
@@ -3161,16 +3185,16 @@ INDEX_HTML = r'''<!doctype html>
 <title>Shadow Spoof</title>
 <link rel="icon" href="data:,">
 <style nonce="__NONCE__">
-:root{--bg:#0a0d14;--bg2:#0f1420;--card:#141a28;--card2:#182032;--line:#243049;--tx:#eef1f8;--mut:#8f9ab2;--acc:#ff6fae;--acc2:#6fb7ff;--ok:#3ddc97;--warn:#f5b54a;--bad:#ff5d6c;--r:16px;--grad:linear-gradient(135deg,#ff6fae,#b06bff 60%,#6fb7ff);--shadow:0 10px 30px -12px #000a;--ring:0 0 0 3px #ff6fae33}
+:root{--bg:#0a0d14;--bg2:#0f1420;--card:#141a28;--card2:#182032;--line:#243049;--tx:#eef1f8;--mut:#8f9ab2;--acc:#3b82f6;--acc2:#6fb7ff;--ok:#3ddc97;--warn:#f5b54a;--bad:#ff5d6c;--r:16px;--grad:linear-gradient(135deg,#3b82f6,#60a5fa 60%,#6fb7ff);--shadow:0 10px 30px -12px #000a;--ring:0 0 0 3px #3b82f633}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Vazirmatn,Tahoma,sans-serif;-webkit-text-size-adjust:100%}
 html{background:#06061a}body{background:transparent}
 #bg{position:fixed;inset:-80px;z-index:-1;overflow:hidden;pointer-events:none;background:radial-gradient(120% 90% at 50% 0%,#0a0a24 0%,#04040f 72%);transform:translate3d(calc(var(--mx,0)*22px),calc(var(--my,0)*22px),0);transition:transform 1.6s cubic-bezier(.2,.7,.2,1)}
 #bg i{position:absolute;display:block;filter:blur(90px);opacity:.20;will-change:transform,border-radius}
-#bg .b1{width:64vmax;height:64vmax;left:-18vmax;top:-22vmax;background:#c026d3;animation:liq1 46s ease-in-out infinite}
+#bg .b1{width:64vmax;height:64vmax;left:-18vmax;top:-22vmax;background:#1e40af;animation:liq1 46s ease-in-out infinite}
 #bg .b2{width:58vmax;height:58vmax;right:-20vmax;top:-12vmax;background:#2563eb;animation:liq2 54s ease-in-out infinite}
-#bg .b3{width:60vmax;height:60vmax;left:8vmax;bottom:-30vmax;background:#7c3aed;animation:liq3 60s ease-in-out infinite}
-#bg .b4{width:44vmax;height:44vmax;right:-8vmax;bottom:-16vmax;background:#db2777;opacity:.14;animation:liq4 50s ease-in-out infinite}
+#bg .b3{width:60vmax;height:60vmax;left:8vmax;bottom:-30vmax;background:#4338ca;animation:liq3 60s ease-in-out infinite}
+#bg .b4{width:44vmax;height:44vmax;right:-8vmax;bottom:-16vmax;background:#1d4ed8;opacity:.14;animation:liq4 50s ease-in-out infinite}
 @keyframes liq1{0%,100%{transform:translate(0,0) rotate(0) scale(1);border-radius:42% 58% 61% 39%/45% 38% 62% 55%}33%{transform:translate(16vmax,8vmax) rotate(120deg) scale(1.12);border-radius:58% 42% 38% 62%/55% 62% 38% 45%}66%{transform:translate(5vmax,22vmax) rotate(240deg) scale(.94);border-radius:38% 62% 55% 45%/62% 40% 60% 38%}}
 @keyframes liq2{0%,100%{transform:translate(0,0) rotate(0) scale(1);border-radius:55% 45% 40% 60%/50% 58% 42% 50%}40%{transform:translate(-14vmax,14vmax) rotate(-140deg) scale(1.1);border-radius:40% 60% 58% 42%/60% 40% 60% 40%}70%{transform:translate(-4vmax,26vmax) rotate(-250deg) scale(.95);border-radius:60% 40% 45% 55%/42% 55% 45% 58%}}
 @keyframes liq3{0%,100%{transform:translate(0,0) rotate(0) scale(1);border-radius:48% 52% 56% 44%/58% 42% 58% 42%}35%{transform:translate(20vmax,-10vmax) rotate(110deg) scale(1.1);border-radius:60% 40% 42% 58%/44% 58% 42% 56%}70%{transform:translate(-8vmax,-18vmax) rotate(230deg) scale(.96);border-radius:42% 58% 60% 40%/56% 44% 56% 44%}}
@@ -3192,7 +3216,7 @@ nav.dock button.on{background:var(--grad);color:#fff;box-shadow:0 6px 18px -6px 
 h2{font-size:15px;margin:22px 0 10px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.6px}
 .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
 .card{position:relative;background:linear-gradient(180deg,#1b2336cc,#131a28cc);border:1px solid #ffffff14;border-radius:var(--r);padding:16px;box-shadow:var(--shadow),inset 0 1px 0 #ffffff1f;backdrop-filter:blur(8px) saturate(140%);-webkit-backdrop-filter:blur(8px) saturate(140%)}
-.grid .card:hover{transform:translateY(-2px);border-color:#ffffff2e;box-shadow:var(--shadow),inset 0 1px 0 #ffffff26,0 0 0 1px #ff6fae22}
+.grid .card:hover{transform:translateY(-2px);border-color:#ffffff2e;box-shadow:var(--shadow),inset 0 1px 0 #ffffff26,0 0 0 1px #3b82f622}
 .big{font-size:28px;font-weight:800;letter-spacing:-.5px;background:linear-gradient(180deg,#fff,#b9c2d8);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.lbl{color:var(--mut);font-size:12px}
 .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .kv{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;margin:10px 0}
@@ -3289,9 +3313,9 @@ pre.log{background:var(--logbg)}
 .fsec:first-child{margin-top:4px;border-top:0;padding-top:0}
 
 /* ===== v4: calmer glow, dashboard-style backdrop, clean light theme ===== */
-.btn.pri{box-shadow:0 2px 8px -3px rgba(176,107,255,.45)}
+.btn.pri{box-shadow:0 2px 8px -3px rgba(59,130,246,.45)}
 .btn.pri:hover{filter:brightness(1.06)}
-nav.dock button.on{box-shadow:0 2px 8px -3px rgba(176,107,255,.5)}
+nav.dock button.on{box-shadow:0 2px 8px -3px rgba(59,130,246,.5)}
 .grid .card:hover{transform:none;border-color:rgba(255,255,255,.26);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.24)}
 .card{box-shadow:0 6px 18px -12px rgba(0,0,0,.7),inset 0 1px 0 rgba(255,255,255,.18)}
 .card::before{background:linear-gradient(125deg,rgba(255,255,255,.07),rgba(255,255,255,0) 38%)}
@@ -3322,7 +3346,7 @@ html[data-theme=light] .pill.dim{color:#2563eb;background:rgba(37,99,235,.07);bo
 html[data-theme=light] .big{background:none;-webkit-text-fill-color:var(--tx);color:var(--tx)}
 
 /* ===== v6: no mouse reaction, thinner/darker dark theme, soft light theme, dock slide ===== */
-:root{--grad:linear-gradient(135deg,#ff6fae,#a855f7);--grad2:linear-gradient(135deg,#3b82f6,#7dd3fc)}
+:root{--grad:linear-gradient(135deg,#3b82f6,#3b82f6);--grad2:linear-gradient(135deg,#3b82f6,#7dd3fc)}
 #bg{transform:none!important;transition:none!important}
 html{background:#03040a}
 #bg{background:radial-gradient(130% 100% at 0% 0%,#070b22 0%,#03040a 56%)}
@@ -3363,7 +3387,7 @@ html{background:#06070f}
 #bg .b4{width:36vmax;height:36vmax;opacity:.22}
 html[data-theme=light] #bg::after{background-image:linear-gradient(rgba(30,40,80,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(30,40,80,.022) 1px,transparent 1px)}
 .rem{display:flex;align-items:center;gap:9px;margin:12px 0 4px;font-size:13px;color:var(--mut);cursor:pointer}
-.login .rem input{width:18px;height:18px;padding:0;margin:0;accent-color:#a855f7}
+.login .rem input{width:18px;height:18px;padding:0;margin:0;accent-color:var(--acc)}
 
 /* ===== v8: blurrier, less see-through liquid glass ===== */
 :root{--g1:rgba(34,40,72,.62);--g2:rgba(20,24,46,.50);--m1:rgba(30,36,66,.90);--m2:rgba(18,22,44,.88);--dock:rgba(14,16,34,.66)}
@@ -3397,8 +3421,14 @@ html.compact .kv{gap:3px 12px;margin:6px 0}
 .uichecks{display:flex;flex-wrap:wrap;gap:6px 22px;margin:14px 0 12px}
 .uichecks .rem{margin:0}
 .val{color:var(--mut);font-size:12px;margin-inline-start:8px}
-input[type=range]{padding:0;height:22px;border:0;background:transparent;accent-color:#a855f7;box-shadow:none}
-input[type=checkbox]{width:18px;height:18px;padding:0;margin:0;accent-color:#a855f7}
+input[type=range]{padding:0;height:22px;border:0;background:transparent;accent-color:var(--acc);box-shadow:none}
+input[type=checkbox]{width:18px;height:18px;padding:0;margin:0;accent-color:var(--acc)}
+
+/* ===== v10: everything accent-coloured follows the palette (default: blue) ===== */
+:root{--ring:0 0 0 3px color-mix(in srgb,var(--acc) 30%,transparent)}
+.btn.pri{box-shadow:0 2px 8px -3px color-mix(in srgb,var(--acc) 55%,transparent)}
+nav.dock button.on{box-shadow:none}
+input[type=range],input[type=checkbox],.login .rem input{accent-color:var(--acc)}
 </style>
 </head>
 <body>
@@ -3412,7 +3442,8 @@ const UI_DEF={theme:'dark',pal:'default',blur:30,glass:100,bg:100,anim:true,spee
 let UI=Object.assign({},UI_DEF);
 try{const j=JSON.parse(localStorage.getItem('ui')||'null');if(j&&typeof j==='object')Object.assign(UI,j);else{const th=localStorage.getItem('theme');if(th==='light'||th==='dark')UI.theme=th}}catch(e){}
 const PAL={
-  default:{g:['#ff6fae','#a855f7'],g2:['#3b82f6','#7dd3fc'],c:['#1d2a8a','#3a1d7a','#2b1160','#5a1226']},
+  default:{g:['#2563eb','#38bdf8'],g2:['#3b82f6','#7dd3fc'],c:['#1d2a8a','#1e3a8a','#0b4f8a','#312e81']},
+  pink:{g:['#ff6fae','#a855f7'],g2:['#3b82f6','#7dd3fc'],c:['#1d2a8a','#3a1d7a','#2b1160','#5a1226']},
   ocean:{g:['#38bdf8','#6366f1'],g2:['#06b6d4','#67e8f9'],c:['#0b4f8a','#1d4ed8','#0e7490','#134e4a']},
   emerald:{g:['#34d399','#22c55e'],g2:['#10b981','#6ee7b7'],c:['#065f46','#14532d','#134e4a','#1e3a8a']},
   sunset:{g:['#fb923c','#f43f5e'],g2:['#f97316','#fcd34d'],c:['#7c2d12','#9f1239','#581c87','#78350f']},
@@ -3427,6 +3458,7 @@ function applyUI(){
   const pal=PAL[UI.pal]||PAL.default;
   st.setProperty('--grad','linear-gradient(135deg,'+pal.g[0]+','+pal.g[1]+')');
   st.setProperty('--grad2','linear-gradient(135deg,'+pal.g2[0]+','+pal.g2[1]+')');
+  st.setProperty('--acc',pal.g[0]);
   pal.c.forEach((c,i)=>st.setProperty('--c'+(i+1),c));
   st.setProperty('--ub',UI.blur+'px');
   const gl=GLASS[th],f=UI.glass/100,rg=a=>'rgba('+a[0]+','+a[1]+','+a[2]+','+Math.max(.12,Math.min(.98,a[3]*f)).toFixed(3)+')';
@@ -3443,7 +3475,7 @@ try{matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{i
 /* ---------- i18n ---------- */
 const TR = {
 en: {
- ev_tab:'Events', ui_title:'Appearance & UI', ui_hint:'Visual preferences for this browser only (saved locally). Changes apply instantly.', ui_theme:'Theme', ui_pal:'Colour palette', ui_blur:'Glass blur', ui_glass:'Glass opacity', ui_bg:'Background colour strength', ui_radius:'Corner roundness', ui_speed:'Background motion speed', ui_anim:'Animate background', ui_grid:'Show grid', ui_compact:'Compact cards', ui_reset:'Reset to defaults', th_dark:'Dark', th_light:'Light', th_auto:'Auto (system)', pal_default:'Pink / Purple', pal_ocean:'Ocean', pal_emerald:'Emerald', pal_sunset:'Sunset', pal_mono:'Mono', sp_slow:'Slow', sp_norm:'Normal', sp_fast:'Fast', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
+ ev_tab:'Events', upd_failed:'update failed - see the log below', ui_title:'Appearance & UI', ui_hint:'Visual preferences for this browser only (saved locally). Changes apply instantly.', ui_theme:'Theme', ui_pal:'Colour palette', ui_blur:'Glass blur', ui_glass:'Glass opacity', ui_bg:'Background colour strength', ui_radius:'Corner roundness', ui_speed:'Background motion speed', ui_anim:'Animate background', ui_grid:'Show grid', ui_compact:'Compact cards', ui_reset:'Reset to defaults', th_dark:'Dark', th_light:'Light', th_auto:'Auto (system)', pal_default:'Blue', pal_pink:'Pink / Purple', pal_ocean:'Ocean', pal_emerald:'Emerald', pal_sunset:'Sunset', pal_mono:'Mono', sp_slow:'Slow', sp_norm:'Normal', sp_fast:'Fast', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
  diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load / uptime', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX',
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
@@ -3461,7 +3493,7 @@ en: {
  note_key:'The pre-shared key authenticates every packet (HMAC). Both sides must use the identical key.', srv_test_hint:'Listens for client packets for 10 s. Press Run here, then run the test on the client at the same time.', no_tunnels:'No tunnels yet.', warnings:'Warnings'
 },
 fa: {
- ev_tab:'رویدادها', ui_title:'ظاهر و رابط کاربری', ui_hint:'تنظیمات ظاهری فقط برای همین مرورگر (به‌صورت محلی ذخیره می‌شود). تغییرات فوراً اعمال می‌شود.', ui_theme:'تم', ui_pal:'پالت رنگ', ui_blur:'بلور شیشه', ui_glass:'شفافیت شیشه', ui_bg:'شدت رنگ بک‌گراند', ui_radius:'گردی گوشه‌ها', ui_speed:'سرعت حرکت بک‌گراند', ui_anim:'بک‌گراند متحرک', ui_grid:'نمایش شبکه', ui_compact:'کارت‌های فشرده', ui_reset:'بازگشت به پیش‌فرض', th_dark:'تیره', th_light:'روشن', th_auto:'خودکار (سیستم)', pal_default:'صورتی / بنفش', pal_ocean:'اقیانوسی', pal_emerald:'زمردی', pal_sunset:'غروب', pal_mono:'تک‌رنگ', sp_slow:'آهسته', sp_norm:'معمولی', sp_fast:'سریع', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
+ ev_tab:'رویدادها', upd_failed:'آپدیت ناموفق بود - لاگ را ببین', ui_title:'ظاهر و رابط کاربری', ui_hint:'تنظیمات ظاهری فقط برای همین مرورگر (به‌صورت محلی ذخیره می‌شود). تغییرات فوراً اعمال می‌شود.', ui_theme:'تم', ui_pal:'پالت رنگ', ui_blur:'بلور شیشه', ui_glass:'شفافیت شیشه', ui_bg:'شدت رنگ بک‌گراند', ui_radius:'گردی گوشه‌ها', ui_speed:'سرعت حرکت بک‌گراند', ui_anim:'بک‌گراند متحرک', ui_grid:'نمایش شبکه', ui_compact:'کارت‌های فشرده', ui_reset:'بازگشت به پیش‌فرض', th_dark:'تیره', th_light:'روشن', th_auto:'خودکار (سیستم)', pal_default:'آبی', pal_pink:'صورتی / بنفش', pal_ocean:'اقیانوسی', pal_emerald:'زمردی', pal_sunset:'غروب', pal_mono:'تک‌رنگ', sp_slow:'آهسته', sp_norm:'معمولی', sp_fast:'سریع', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
  diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار / آپ‌تایم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال',
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
@@ -3895,7 +3927,7 @@ function uiCard(){
     h('div',{class:'hint',text:t('ui_hint')}),
     h('div',{class:'uigrid'},
       sel('theme',t('ui_theme'),[['dark',t('th_dark')],['light',t('th_light')],['auto',t('th_auto')]]),
-      sel('pal',t('ui_pal'),[['default',t('pal_default')],['ocean',t('pal_ocean')],['emerald',t('pal_emerald')],['sunset',t('pal_sunset')],['mono',t('pal_mono')]]),
+      sel('pal',t('ui_pal'),[['default',t('pal_default')],['pink',t('pal_pink')],['ocean',t('pal_ocean')],['emerald',t('pal_emerald')],['sunset',t('pal_sunset')],['mono',t('pal_mono')]]),
       rng('blur',t('ui_blur'),0,60,2,'px'),
       rng('glass',t('ui_glass'),40,140,5,'%'),
       rng('bg',t('ui_bg'),0,150,5,'%'),
@@ -3917,14 +3949,14 @@ async function viewSettings(m){
   const uref=async(chk)=>{
     try{
       const r=await api('GET','/api/update/status'+(chk===false?'?check=0':''));
-      const st=r.running?t('upd_running'):r.error?r.error:r.available?t('upd_avail'):t('upd_latest');
+      const st=r.running?t('upd_running'):r.failed?(t('upd_failed')+' (exit '+(r.exit||'?')+')'):r.error?r.error:r.available?t('upd_avail'):t('upd_latest');
       ubuild.textContent=t('upd_cur')+': '+(r.current||'?')+(r.latest?'  ·  '+t('upd_new')+': '+r.latest:'')+'  ·  '+st;
       ulog.textContent=r.log||'';ulog.scrollTop=ulog.scrollHeight;
-      ubtn.disabled=!r.available||!!r.running;
+      ubtn.disabled=(!r.available&&!r.failed)||!!r.running;
       if(r.running){clearInterval(S.timer);S.timer=setInterval(()=>uref(false),3000)} else if(S.timer){clearInterval(S.timer);S.timer=null}
     }catch(e){ubuild.textContent=t('upd_reconnect');clearInterval(S.timer);S.timer=setInterval(()=>uref(false),4000)}
   };
-  ubtn.onclick=async()=>{if(!confirm(t('upd_warn')))return;try{await api('POST','/api/update',{});toast(t('upd_started'));uref(false)}catch(e){if(!e.handled)toast(e.message,1)}};
+  ubtn.onclick=async()=>{if(!confirm(t('upd_warn')))return;try{await api('POST','/api/update',{});toast(t('upd_started'));clearInterval(S.timer);S.timer=setInterval(()=>uref(false),3000);uref(false)}catch(e){if(!e.handled)toast(e.message,1)}};
   ucheck.onclick=()=>uref(true);
   uref(true);
   // peer server pairing + status + auto-sync
