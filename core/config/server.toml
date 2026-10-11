@@ -1,4 +1,4 @@
-# Candy-Spoof – Server Configuration
+# Shadow Spoof – Server Configuration
 # transport = "spoof"   # "spoof" (UDP data + ICMP control, forged source) or "tcp" (standard non-spoofed TCP)
 # ─────────────────────────────────────────────────────────────────────────────
 # IP Addressing

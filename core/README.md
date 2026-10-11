@@ -1,9 +1,9 @@
-# Candy-Spoof
+# Shadow Spoof
 
 > **⚠️ EDUCATIONAL PURPOSES ONLY**
 > This software is provided for educational, research, and authorized security testing purposes only. Users are responsible for ensuring compliance with all applicable laws and regulations in their jurisdiction. Unauthorized use of IP spoofing may be illegal and unethical. The authors assume no liability for misuse of this software.
 
-**Candy-Spoof** is a bidirectional IP spoofing tunnel designed for use in heavily censored networks. Both the client and server forge their source IP addresses, making traffic analysis and blocking significantly harder.
+**Shadow Spoof** is a bidirectional IP spoofing tunnel designed for use in heavily censored networks. Both the client and server forge their source IP addresses, making traffic analysis and blocking significantly harder.
 
 ## Features
 
@@ -94,7 +94,7 @@ Refer to `config/client.toml` and `config/server.toml` for complete configuratio
      │  TCP (SOCKS5 CONNECT)
      ▼
 [SOCKS5 Proxy – 127.0.0.1:1080]
-     │  Candy-Spoof data (ARQ + CC)
+     │  Shadow Spoof data (ARQ + CC)
      ▼
 [Raw UDP – src=spoofed_client_ip  dst=real_server_ip]
 ─── censored network ──────────────────────────────────

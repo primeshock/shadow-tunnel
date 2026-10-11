@@ -6,7 +6,7 @@
 //!   via a `SOCK_RAW | IPPROTO_RAW` socket with `IP_HDRINCL`.
 //! - [`RawReceiver`] – receives raw IP packets from a `SOCK_RAW | IPPROTO_UDP`
 //!   or `SOCK_RAW | IPPROTO_ICMP` socket and demultiplexes them into
-//!   `CandyPacket`s.
+//!   `ShadowPacket`s.
 //!
 //! Both types are bridge objects between the blocking raw-socket world and the
 //! async Tokio world.  Each spawns background `std::thread`s that communicate
@@ -26,7 +26,7 @@ use pnet_packet::udp::MutableUdpPacket;
 use pnet_packet::Packet;
 use tokio::sync::mpsc;
 
-use crate::packet::CandyPacket;
+use crate::packet::ShadowPacket;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -73,8 +73,8 @@ pub enum OutPacket {
 pub struct InPacket {
     /// True source IP (from the IP header).
     pub src_ip: Ipv4Addr,
-    /// Parsed Candy-Spoof application packet.
-    pub pkt:    CandyPacket,
+    /// Parsed Shadow Spoof application packet.
+    pub pkt:    ShadowPacket,
 }
 
 // ── RawSender ────────────────────────────────────────────────────────────────
@@ -352,7 +352,7 @@ fn udp_recv_loop(
             continue;
         }
         let payload = bytes::Bytes::copy_from_slice(&udp_data[UDP_HDR_LEN..]);
-        match CandyPacket::decode_authenticated(payload, key) {
+        match ShadowPacket::decode_authenticated(payload, key) {
             Ok(pkt) => {
                 let _ = tx.blocking_send(InPacket { src_ip, pkt });
             }
@@ -404,7 +404,7 @@ fn icmp_recv_loop(
         }
 
         let payload = bytes::Bytes::copy_from_slice(&icmp_data[ICMP_ECHO_HDR_LEN..]);
-        match CandyPacket::decode_authenticated(payload, key) {
+        match ShadowPacket::decode_authenticated(payload, key) {
             Ok(pkt) => {
                 let _ = tx.blocking_send(InPacket { src_ip, pkt });
             }

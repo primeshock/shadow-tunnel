@@ -1,6 +1,6 @@
-# Candy-Spoof Web Panel
+# Shadow Spoof Web Panel
 
-A self-contained web panel, live monitor, and CLI for operating a Candy-Spoof
+A self-contained web panel, live monitor, and CLI for operating a Shadow Spoof
 tunnel node. It is written in the Python **standard library only** (no pip
 dependencies), shipped and installed by [`install.sh`](install.sh), and runs as
 a hardened systemd service.
@@ -24,7 +24,7 @@ binary parses, so what you see is what the service actually does.
   - [Diagnose — the tunnel doctor](#diagnose--the-tunnel-doctor)
   - [Settings](#settings)
 - [Configuration reference](#configuration-reference)
-- [`candyctl` command-line](#candyctl-command-line)
+- [`shadowctl` command-line](#shadowctl-command-line)
 - [HTTP API](#http-api)
 - [Troubleshooting a tunnel](#troubleshooting-a-tunnel)
 - [Internationalisation (EN / FA RTL)](#internationalisation-en--fa-rtl)
@@ -35,19 +35,19 @@ binary parses, so what you see is what the service actually does.
 
 | Piece | What it is | Runs as |
 |---|---|---|
-| `candy-spoof-client` / `candy-spoof-server` | the Rust tunnel binary (built from the `Candy-Spoof` repo) | `candy-spoof` user, `CAP_NET_RAW` |
-| `candy-panel.py panel` | the web panel (this document) | **root**, hardened by systemd |
-| `candy-panel.py monitor` | background sampler that writes metrics/history/events | `candy-spoof` user |
-| `candyctl` | the operator CLI | root (via `sudo`) |
+| `shadow-spoof-client` / `shadow-spoof-server` | the Rust tunnel binary (built from the `Shadow Spoof` repo) | `shadow-spoof` user, `CAP_NET_RAW` |
+| `shadow-panel.py panel` | the web panel (this document) | **root**, hardened by systemd |
+| `shadow-panel.py monitor` | background sampler that writes metrics/history/events | `shadow-spoof` user |
+| `shadowctl` | the operator CLI | root (via `sudo`) |
 
-The panel, monitor, and CLI are all the same `candy-panel.py` file invoked with
-different sub-commands. The panel talks to systemd through `candyctl`/`systemctl`
-and reads `/etc/candy-spoof/*.toml`, `/proc`, `ss`, and journald.
+The panel, monitor, and CLI are all the same `shadow-panel.py` file invoked with
+different sub-commands. The panel talks to systemd through `shadowctl`/`systemctl`
+and reads `/etc/shadow-spoof/*.toml`, `/proc`, `ss`, and journald.
 
 A node is exactly one **role** — `client` **or** `server` — chosen at install
 time. One config file + one process = one **tunnel instance**. The main instance
 is `main`; extra instances created from the panel live in
-`/etc/candy-spoof/tunnels/<name>.toml` and run as `candy-spoof-<role>@<name>`.
+`/etc/shadow-spoof/tunnels/<name>.toml` and run as `shadow-spoof-<role>@<name>`.
 
 ---
 
@@ -58,7 +58,7 @@ After install, the final report prints the URL and the one-time password.
 
 ```bash
 sudo ./install.sh                 # interactive; enables the panel by default
-candyctl panel info               # print the panel URL any time
+shadowctl panel info               # print the panel URL any time
 ```
 
 Defaults: it listens on **`127.0.0.1:7777`** over HTTP. Because it binds to
@@ -72,11 +72,11 @@ ssh -L 7777:127.0.0.1:7777 root@<your-server>
 Change where it listens (see also the **Settings** tab):
 
 ```bash
-candyctl panel port 8443
-candyctl panel bind 10.0.0.5      # bind a specific address
-candyctl panel tls on             # serve HTTPS with a self-signed cert
-candyctl panel passwd             # set a new password (prompted)
-candyctl panel restart
+shadowctl panel port 8443
+shadowctl panel bind 10.0.0.5      # bind a specific address
+shadowctl panel tls on             # serve HTTPS with a self-signed cert
+shadowctl panel passwd             # set a new password (prompted)
+shadowctl panel restart
 ```
 
 ---
@@ -84,14 +84,14 @@ candyctl panel restart
 ## Security model
 
 - **Password**: stored only as a PBKDF2-HMAC-SHA256 hash (200k iterations,
-  random salt) in `/etc/candy-spoof/panel.json` (mode `0600`). Minimum 10 chars.
+  random salt) in `/etc/shadow-spoof/panel.json` (mode `0600`). Minimum 10 chars.
 - **Sessions**: an opaque `cs_session` cookie, `HttpOnly`, `SameSite=Strict`,
   `Secure` when TLS is on; 24 h lifetime, 12 h idle timeout. Mutating requests
   carry a CSRF token issued at login.
 - **Brute-force**: failed logins are rate-limited per client IP.
 - **Loopback by default** + optional TLS; intended to be reached over SSH.
 - **Secrets**: the pre-shared key is shown in the UI only after re-entering the
-  panel password, and is redacted in `candyctl config` output.
+  panel password, and is redacted in `shadowctl config` output.
 
 > The panel runs as root (it manages systemd units and raw-socket services), so
 > treat access to it as root access. Keep it on loopback + SSH, or behind TLS.
@@ -115,7 +115,7 @@ gracefully instead of blanking.
 Create, edit, start/stop/restart, and delete tunnel instances.
 
 - **+ Create tunnel** — add a second (or third…) tunnel instance alongside `main`.
-- **Import link** — paste a `candyspoof://…` setup link from the other side to
+- **Import link** — paste a `shadowspoof://…` setup link from the other side to
   pre-fill every matching field (see [Diagnose](#diagnose--the-tunnel-doctor)).
 - **Edit** — the full config form (addresses, pools, interface, ports, ICMP id,
   MTU, CWND, the robustness knobs, and the pre-shared key). Saving is
@@ -161,7 +161,7 @@ that the pre-shared key authenticates every packet.
 6. **Reachability** — can this host reach `peer_real_ip` at all (ICMP).
 
 **Peer cross-check (the decisive one):** paste the **other** host's
-`candyspoof://…` setup link. Because a link is generated *for* the opposite side,
+`shadowspoof://…` setup link. Because a link is generated *for* the opposite side,
 its fields are exactly what this host should have — so the doctor compares them
 field by field and tells you precisely what's wrong, e.g.:
 
@@ -188,8 +188,8 @@ Watchdog (periodic restart timer), change panel password, and node info
 
 ## Configuration reference
 
-All fields live in `/etc/candy-spoof/config.toml` (and
-`/etc/candy-spoof/tunnels/<name>.toml` for extra instances). The panel validates
+All fields live in `/etc/shadow-spoof/config.toml` (and
+`/etc/shadow-spoof/tunnels/<name>.toml` for extra instances). The panel validates
 these and the Rust binary enforces them.
 
 | Field | Meaning | Notes |
@@ -225,23 +225,23 @@ these and the Rust binary enforces them.
 
 ---
 
-## `candyctl` command-line
+## `shadowctl` command-line
 
 ```
-candyctl [-t NAME] <command>
+shadowctl [-t NAME] <command>
 
   status                  services, watchdog, panel and (redacted) config
   check                   validate the config with the binary (--check-config); exit 1 if rejected
   tunnels                 list tunnels on this host
   start | stop | restart  all tunnels (or one with -t NAME)
-  logs [journalctl args]  e.g. candyctl logs -f
+  logs [journalctl args]  e.g. shadowctl logs -f
   monitor                 live dashboard (CPU/RAM/connections/traffic/events)
   monitor logs [LEVEL]    live colourised logs
   test [--host H --port P --secs N]
                           end-to-end tunnel test: handshake, real data, packet capture
   config                  print the config (pre_shared_key redacted)
   config edit             edit in $EDITOR; validated, applied with automatic rollback
-  set key=value ...       change fields, e.g. candyctl set icmp_id=17185 mtu=1300
+  set key=value ...       change fields, e.g. shadowctl set icmp_id=17185 mtu=1300
   token                   print the pre-shared key
   link                    print the setup link for the other side
   watchdog <off|30m|1h|6h|12h|24h>
@@ -250,7 +250,7 @@ candyctl [-t NAME] <command>
   panel [info|passwd|passwd-set|port N|bind IP|tls on|off|start|stop|restart]
 ```
 
-`candyctl check` is the quickest way to confirm a config will actually be
+`shadowctl check` is the quickest way to confirm a config will actually be
 accepted by the binary before (re)starting the service.
 
 ---
@@ -276,7 +276,7 @@ Mutating requests carry the CSRF token from `/api/session`.
 | POST | `/api/tunnels/<name>/{start,stop,restart}` | service control |
 | POST | `/api/tunnels/<name>/secret` | reveal the key (re-auth) |
 | POST | `/api/tunnels/<name>/test` | end-to-end tunnel test |
-| POST | `/api/link/parse` | decode a `candyspoof://` link into fields |
+| POST | `/api/link/parse` | decode a `shadowspoof://` link into fields |
 | POST | `/api/diagnose` | **tunnel doctor** (optional `{link}` for peer cross-check) |
 | POST | `/api/settings/watchdog` · `/api/settings/password` | settings |
 
@@ -298,7 +298,7 @@ all of these and names the field:
    won't start if it doesn't exist. Use the device that owns `real_ip`.
 4. **Firewall** — inbound `UDP/<data_port>` and ICMP echo from the peer must be
    allowed.
-5. **Service "up" but not working** — `candyctl check` confirms the config
+5. **Service "up" but not working** — `shadowctl check` confirms the config
    parses; the Logs tab shows `tunnel N established` on success. Process-liveness
    alone is not success.
 

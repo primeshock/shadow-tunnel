@@ -1,4 +1,4 @@
-//! Candy-Spoof **server** binary.
+//! Shadow Spoof **server** binary.
 //!
 //! Listens for incoming tunnel connections from clients and forwards each
 //! SOCKS5 CONNECT session to the requested TCP destination.
@@ -15,12 +15,12 @@ use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use candy_spoof::config::Config;
-use candy_spoof::raw_socket::{RawReceiver, RawSender};
-use candy_spoof::tunnel::{PeerAddr, TunnelManager};
+use shadow_spoof::config::Config;
+use shadow_spoof::raw_socket::{RawReceiver, RawSender};
+use shadow_spoof::tunnel::{PeerAddr, TunnelManager};
 
 #[derive(Parser, Debug)]
-#[command(name = "server", about = "Candy-Spoof server (tunnel endpoint)")]
+#[command(name = "server", about = "Shadow Spoof server (tunnel endpoint)")]
 struct Args {
     /// Path to the TOML configuration file.
     #[arg(short, long, default_value = "config/server.toml")]
@@ -56,14 +56,14 @@ async fn main() -> Result<()> {
     // TCP transport: a standard, non-spoofed socket path (no raw sockets).
     if cfg.is_tcp() {
         log::info!(
-            "Candy-Spoof server starting | transport=tcp | listen 0.0.0.0:{}",
+            "Shadow Spoof server starting | transport=tcp | listen 0.0.0.0:{}",
             cfg.data_port
         );
-        return candy_spoof::tcp::run_tcp_server(cfg).await;
+        return shadow_spoof::tcp::run_tcp_server(cfg).await;
     }
 
     log::info!(
-        "Candy-Spoof server starting | real={} spoof={} peer={} iface={}",
+        "Shadow Spoof server starting | real={} spoof={} peer={} iface={}",
         cfg.real_ip,
         cfg.spoofed_ip,
         cfg.peer_real_ip,
@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     let mut allowed = cfg.allowed_peers.clone();
     allowed.push(cfg.peer_real_ip);
     allowed.push(cfg.peer_spoofed_ip);
-    let key = candy_spoof::packet::derive_key(&cfg.pre_shared_key);
+    let key = shadow_spoof::packet::derive_key(&cfg.pre_shared_key);
     let mut receiver =
         RawReceiver::spawn(cfg.data_port, cfg.icmp_id, allowed, &cfg.interface, key)?;
 
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
 /// Accept a SYN, wait for the first DATA packet containing the CONNECT
 /// destination, open a TCP connection to that destination, and relay data.
 async fn handle_new_tunnel(
-    syn:     candy_spoof::packet::CandyPacket,
+    syn:     shadow_spoof::packet::ShadowPacket,
     src_ip:  std::net::Ipv4Addr,
     manager: TunnelManager,
     cfg:     Arc<Config>,

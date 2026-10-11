@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Candy-Spoof installer + runtime management layer
+# Shadow Spoof installer + runtime management layer
 #
 # Everything below is derived from the repository source at the pinned commit
 # (src/config.rs, src/bin/client.rs, src/bin/server.rs, src/raw_socket.rs,
@@ -13,47 +13,47 @@
 #                   127.0.0.1:<socks5_port> (client only), no privileged port
 #   logging       : env_logger (RUST_LOG honoured, default "info")
 #
-# Also installs: candy-spoof-monitor (metrics + log sampler), an optional web panel
-# (monitor, create/edit tunnels, tests) and `candyctl` (see: candyctl help).
+# Also installs: shadow-spoof-monitor (metrics + log sampler), an optional web panel
+# (monitor, create/edit tunnels, tests) and `shadowctl` (see: shadowctl help).
 #
 # Usage:
 #   sudo ./install.sh                       interactive
 #   sudo ./install.sh --role client|server
-#   sudo CANDY_NONINTERACTIVE=1 CANDY_REAL_IP=... ./install.sh --role server
+#   sudo SHADOW_NONINTERACTIVE=1 SHADOW_REAL_IP=... ./install.sh --role server
 #
 # Environment overrides:
-#   CANDY_REF           git ref/commit to build (default: pinned commit below)
-#   CANDY_REPO_URL      git remote
-#   CANDY_SRC_DIR       build from an existing local checkout instead of cloning
-#   CANDY_<FIELD>       preset any prompt value (REAL_IP, SPOOFED_IP, ...)
+#   SHADOW_REF           git ref/commit to build (default: pinned commit below)
+#   SHADOW_REPO_URL      git remote
+#   SHADOW_SRC_DIR       build from an existing local checkout instead of cloning
+#   SHADOW_<FIELD>       preset any prompt value (REAL_IP, SPOOFED_IP, ...)
 # =============================================================================
 set -Eeuo pipefail
 umask 077
 
-readonly SVC_USER=candy-spoof
-readonly ETC_DIR=${CANDY_ETC_DIR:-/etc/candy-spoof}
+readonly SVC_USER=shadow-spoof
+readonly ETC_DIR=${SHADOW_ETC_DIR:-/etc/shadow-spoof}
 readonly CONF=$ETC_DIR/config.toml
 readonly PSK_FILE=$ETC_DIR/psk
 readonly ROLE_FILE=$ETC_DIR/role
 readonly BUILD_INFO=$ETC_DIR/build-info
-readonly STATE_DIR=${CANDY_STATE_DIR:-/var/lib/candy-spoof}
+readonly STATE_DIR=${SHADOW_STATE_DIR:-/var/lib/shadow-spoof}
 readonly SRC_DIR=$STATE_DIR/src
-readonly UNIT_DIR=${CANDY_UNIT_DIR:-/etc/systemd/system}
+readonly UNIT_DIR=${SHADOW_UNIT_DIR:-/etc/systemd/system}
 readonly BIN_DIR=/usr/local/bin
-readonly CANDYCTL=$BIN_DIR/candyctl
-readonly CANDYSHADOW=$BIN_DIR/candyshadow
-readonly LIB_DIR=${CANDY_LIB_DIR:-/usr/local/lib/candy-spoof}
-readonly PANEL_PY=$LIB_DIR/candy-panel.py
+readonly SHADOWCTL=$BIN_DIR/shadowctl
+readonly SHADOWSPOOF=$BIN_DIR/shadowspoof
+readonly LIB_DIR=${SHADOW_LIB_DIR:-/usr/local/lib/shadow-spoof}
+readonly PANEL_PY=$LIB_DIR/shadow-panel.py
 readonly PANEL_JSON=$ETC_DIR/panel.json
 readonly TUNNELS_DIR=$ETC_DIR/tunnels
 readonly DEFAULT_ICMP_ID=17185   # 0x4321 - identical default on client and server
 readonly DEFAULT_REF=master
 readonly MIN_RUSTC=1.85.0
 
-REPO_URL=${CANDY_REPO_URL:-https://github.com/primeshock/shadow-tunnel.git}
-REPO_REF=${CANDY_REF:-$DEFAULT_REF}
-NONINTERACTIVE=${CANDY_NONINTERACTIVE:-0}
-ROLE=${CANDY_ROLE:-}
+REPO_URL=${SHADOW_REPO_URL:-https://github.com/primeshock/shadow-tunnel.git}
+REPO_REF=${SHADOW_REF:-$DEFAULT_REF}
+NONINTERACTIVE=${SHADOW_NONINTERACTIVE:-0}
+ROLE=${SHADOW_ROLE:-}
 TTY_IN=/dev/stdin
 BUILD_REF=unknown
 NEW_KEY=0
@@ -129,9 +129,9 @@ to_toml_list() { # csv -> ["a", "b"]
 
 # ------------------------------------------------------------------- prompts --
 # ask VAR "Label" "default" validator "hint"
-# A CANDY_<VAR> environment variable presets the answer.
+# A SHADOW_<VAR> environment variable presets the answer.
 ask() {
-  local var=$1 label=$2 def=${3-} validator=$4 hint=${5-} preset="CANDY_${1^^}" val prompt
+  local var=$1 label=$2 def=${3-} validator=$4 hint=${5-} preset="SHADOW_${1^^}" val prompt
   if [[ -n ${!preset-} ]]; then
     val=${!preset}
     "$validator" "$val" || die "Invalid $preset='$val' ${hint:+($hint)}"
@@ -192,11 +192,11 @@ key_fingerprint() { printf '%s' "$1" | sha256sum | cut -c1-8; }
 
 read_secret() { # read_secret VAR "Label"
   local var=$1 label=$2 a
-  if [[ -n ${CANDY_PRE_SHARED_KEY-} ]]; then
-    v_psk "$CANDY_PRE_SHARED_KEY" || die "CANDY_PRE_SHARED_KEY must be hex, >= 32 chars"
-    printf -v "$var" '%s' "$CANDY_PRE_SHARED_KEY"; return 0
+  if [[ -n ${SHADOW_PRE_SHARED_KEY-} ]]; then
+    v_psk "$SHADOW_PRE_SHARED_KEY" || die "SHADOW_PRE_SHARED_KEY must be hex, >= 32 chars"
+    printf -v "$var" '%s' "$SHADOW_PRE_SHARED_KEY"; return 0
   fi
-  [[ $NONINTERACTIVE == 1 ]] && die "set CANDY_PRE_SHARED_KEY (hex, >= 32 chars)"
+  [[ $NONINTERACTIVE == 1 ]] && die "set SHADOW_PRE_SHARED_KEY (hex, >= 32 chars)"
   while :; do
     printf '%s: ' "$label" >&2
     IFS= read -rs a <"$TTY_IN" || die "input closed"; printf '\n' >&2
@@ -231,7 +231,7 @@ require_env() {
   [[ $(uname -s) == Linux ]] || die "Linux only (raw sockets)"
   case $(uname -m) in x86_64|aarch64|arm64) :;; *) warn "untested architecture: $(uname -m)";; esac
   if command -v flock >/dev/null; then
-    mkdir -p /run/lock; exec 9>/run/lock/candy-spoof-install.lock
+    mkdir -p /run/lock; exec 9>/run/lock/shadow-spoof-install.lock
     flock -n 9 || die "another installer instance is running"
   fi
 }
@@ -239,7 +239,7 @@ setup_tty() {
   if [[ $NONINTERACTIVE == 1 ]]; then return 0; fi
   if [[ -t 0 ]]; then TTY_IN=/dev/stdin
   elif { : </dev/tty; } 2>/dev/null; then TTY_IN=/dev/tty
-  else die "no terminal available; use CANDY_NONINTERACTIVE=1 with CANDY_* variables"; fi
+  else die "no terminal available; use SHADOW_NONINTERACTIVE=1 with SHADOW_* variables"; fi
 }
 
 choose_role() {
@@ -250,7 +250,7 @@ choose_role() {
     else
       local sel def=""
       [[ $existing == client ]] && def=1; [[ $existing == server ]] && def=2
-      printf '\nCandy-Spoof installer\n  1) Client\n  2) Server\n' >&2
+      printf '\nShadow Spoof installer\n  1) Client\n  2) Server\n' >&2
       while :; do
         printf 'Select role%s: ' "${def:+ [$def]}" >&2
         IFS= read -r sel <"$TTY_IN" || die "input closed"; sel=${sel:-$def}
@@ -260,7 +260,7 @@ choose_role() {
   fi
   if [[ -n $existing && $existing != "$ROLE" ]]; then
     die "this host is already installed as '$existing'. Remove it first:
-      systemctl disable --now candy-spoof-$existing.service candy-spoof-watchdog.timer
+      systemctl disable --now shadow-spoof-$existing.service shadow-spoof-watchdog.timer
       rm -rf $ETC_DIR   (and the unit files in $UNIT_DIR)"
   fi
   info "Role: $ROLE"
@@ -297,6 +297,12 @@ ensure_user() {
   install -d -m 0755 -o root -g root "$STATE_DIR"
   install -d -m 0750 -o root -g "$SVC_USER" "$TUNNELS_DIR"
   install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$STATE_DIR/monitor"
+  # After a migration the files carry the old group; re-apply ownership so the
+  # new service user can read them.
+  chown -R root:"$SVC_USER" "$ETC_DIR" 2>/dev/null || true
+  [[ -f $PSK_FILE ]] && chown root:root "$PSK_FILE" 2>/dev/null || true
+  chmod 0640 "$ETC_DIR"/config.toml 2>/dev/null || true
+  [[ -f $PSK_FILE ]] && chmod 0600 "$PSK_FILE" 2>/dev/null || true
 }
 
 ver_ge() { [[ $(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1) == "$2" ]]; } # $1 >= $2
@@ -321,14 +327,14 @@ ensure_toolchain() {
 
 fetch_source() {
   # Prefer a Rust core bundled next to this installer (e.g. ./core) unless the
-  # operator pointed CANDY_SRC_DIR somewhere else or asked for a specific ref.
-  if [[ -z ${CANDY_SRC_DIR-} && -z ${CANDY_REF-} ]]; then
+  # operator pointed SHADOW_SRC_DIR somewhere else or asked for a specific ref.
+  if [[ -z ${SHADOW_SRC_DIR-} && -z ${SHADOW_REF-} ]]; then
     local here; here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-    [[ -f $here/core/Cargo.toml ]] && { CANDY_SRC_DIR=$here/core; info "Using bundled source at $CANDY_SRC_DIR"; }
+    [[ -f $here/core/Cargo.toml ]] && { SHADOW_SRC_DIR=$here/core; info "Using bundled source at $SHADOW_SRC_DIR"; }
   fi
-  if [[ -n ${CANDY_SRC_DIR-} ]]; then
-    [[ -f $CANDY_SRC_DIR/Cargo.toml ]] || die "CANDY_SRC_DIR has no Cargo.toml"
-    SRC=$CANDY_SRC_DIR; BUILD_REF="local:$(cd "$SRC" && git rev-parse HEAD 2>/dev/null || echo unversioned)"
+  if [[ -n ${SHADOW_SRC_DIR-} ]]; then
+    [[ -f $SHADOW_SRC_DIR/Cargo.toml ]] || die "SHADOW_SRC_DIR has no Cargo.toml"
+    SRC=$SHADOW_SRC_DIR; BUILD_REF="local:$(cd "$SRC" && git rev-parse HEAD 2>/dev/null || echo unversioned)"
     return 0
   fi
   SRC=$SRC_DIR
@@ -339,7 +345,7 @@ fetch_source() {
     rm -rf "$SRC"; git clone --quiet "$REPO_URL" "$SRC"
   fi
   git -C "$SRC" checkout --quiet --detach "$REPO_REF" \
-    || die "cannot check out '$REPO_REF' (set CANDY_REF to a valid commit)"
+    || die "cannot check out '$REPO_REF' (set SHADOW_REF to a valid commit)"
   BUILD_REF=$(git -C "$SRC" rev-parse HEAD)
   if [[ $REPO_REF =~ ^[0-9a-f]{40}$ && $BUILD_REF != "$REPO_REF" ]]; then die "commit mismatch"; fi
   [[ $REPO_REF =~ ^[0-9a-f]{40}$ ]] || warn "building unpinned ref '$REPO_REF' -> $BUILD_REF"
@@ -356,7 +362,7 @@ build_and_install() {
   ( cd "$SRC" && cargo build --release --bins )
   local b src dst changed=0
   for b in client server; do
-    src=$CARGO_TARGET_DIR/release/$b; dst=$BIN_DIR/candy-spoof-$b
+    src=$CARGO_TARGET_DIR/release/$b; dst=$BIN_DIR/shadow-spoof-$b
     [[ -x $src ]] || die "build did not produce $src"
     if ! cmp -s "$src" "$dst" 2>/dev/null; then
       install -m 0755 -o root -g root "$src" "$dst.new" && mv -f "$dst.new" "$dst"; changed=1
@@ -365,7 +371,7 @@ build_and_install() {
   BINARY_CHANGED=$changed
   printf 'commit=%s\nbuilt=%s\nrole=%s\n' "$BUILD_REF" "$(date -u +%FT%TZ)" "$ROLE" >"$BUILD_INFO"
   chmod 0644 "$BUILD_INFO"
-  ok "Installed $BIN_DIR/candy-spoof-{client,server}"
+  ok "Installed $BIN_DIR/shadow-spoof-{client,server}"
 }
 
 # ---------------------------------------------------------- configuration ----
@@ -431,7 +437,7 @@ collect_config() {
       warn "No local interface carries $real_ip (NAT / floating IP?). Available:"
       ip -o link show | awk -F': ' '{print "    " $2}' >&2
       local manual=""
-      if [[ $NONINTERACTIVE == 1 ]]; then die "interface detection failed; set CANDY_IFACE"; fi
+      if [[ $NONINTERACTIVE == 1 ]]; then die "interface detection failed; set SHADOW_IFACE"; fi
       while :; do
         printf 'Interface name: ' >&2; IFS= read -r manual <"$TTY_IN" || die "input closed"
         [[ -n $manual ]] && iface_exists "${manual%%@*}" && { iface=${manual%%@*}; break; }
@@ -452,17 +458,17 @@ collect_config() {
 handle_psk() {
   local existing=""
   [[ -r $PSK_FILE ]] && existing=$(<"$PSK_FILE")
-  if [[ -n ${CANDY_PRE_SHARED_KEY-} && ${CANDY_PRE_SHARED_KEY-} != "$existing" ]]; then existing=""; fi
+  if [[ -n ${SHADOW_PRE_SHARED_KEY-} && ${SHADOW_PRE_SHARED_KEY-} != "$existing" ]]; then existing=""; fi
   if [[ -n $existing ]] && v_psk "$existing"; then
     if [[ $NONINTERACTIVE == 1 ]]; then
-      if [[ -n ${CANDY_PRE_SHARED_KEY-} && $CANDY_PRE_SHARED_KEY != "$existing" ]]; then existing=""; fi
+      if [[ -n ${SHADOW_PRE_SHARED_KEY-} && $SHADOW_PRE_SHARED_KEY != "$existing" ]]; then existing=""; fi
     elif ask_yn "Keep the existing pre-shared key?" y; then :; else existing=""; fi
   else existing=""; fi
 
   if [[ -n $existing ]]; then PSK=$existing; NEW_KEY=0; return 0; fi
 
   if [[ $ROLE == client ]]; then
-    PSK=${CANDY_PRE_SHARED_KEY:-$(gen_psk)}
+    PSK=${SHADOW_PRE_SHARED_KEY:-$(gen_psk)}
     v_psk "$PSK" || die "invalid pre-shared key"
     NEW_KEY=1
   else
@@ -477,7 +483,7 @@ write_config() {
   local tmp b
   tmp=$(mktemp "$ETC_DIR/.config.XXXXXX")
   {
-    echo "# Managed by the Candy-Spoof installer ($(date -u +%FT%TZ)) - role: $ROLE"
+    echo "# Managed by the Shadow Spoof installer ($(date -u +%FT%TZ)) - role: $ROLE"
     echo "# Schema: src/config.rs @ $BUILD_REF"
     printf 'transport = "%s"\n'        "${transport:-spoof}"
     printf 'real_ip = "%s"\n'          "$real_ip"
@@ -513,7 +519,7 @@ configure() {
   if [[ -f $CONF ]]; then
     info "Existing configuration found at $CONF"
     local keep=1
-    if [[ $NONINTERACTIVE == 1 ]]; then [[ ${CANDY_RECONFIGURE:-0} == 1 ]] && keep=0
+    if [[ $NONINTERACTIVE == 1 ]]; then [[ ${SHADOW_RECONFIGURE:-0} == 1 ]] && keep=0
     elif ! ask_yn "Keep it (no prompts)?" y; then keep=0; fi
     if (( keep )); then
       if [[ ! -s $PSK_FILE ]]; then
@@ -536,7 +542,7 @@ emit_unit() { # emit_unit <description> <config path> <syslog identifier>
   cat <<UNIT
 [Unit]
 Description=$1
-Documentation=https://github.com/AmiRCandy/Candy-Spoof
+Documentation=https://github.com/AmiRCandy/Shadow Spoof
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=0
@@ -545,8 +551,8 @@ StartLimitIntervalSec=0
 Type=simple
 User=$SVC_USER
 Group=$SVC_USER
-ExecStart=$BIN_DIR/candy-spoof-$ROLE --config $2
-# Crash recovery. (Periodic restarts are handled separately by candy-spoof-watchdog.timer.)
+ExecStart=$BIN_DIR/shadow-spoof-$ROLE --config $2
+# Crash recovery. (Periodic restarts are handled separately by shadow-spoof-watchdog.timer.)
 Restart=on-failure
 RestartSec=5
 SyslogIdentifier=$3
@@ -554,9 +560,10 @@ StandardOutput=journal
 StandardError=journal
 LimitNOFILE=65536
 
-# Only privilege the source needs: SOCK_RAW sockets (src/raw_socket.rs).
-CapabilityBoundingSet=CAP_NET_RAW
-AmbientCapabilities=CAP_NET_RAW
+# Privileges: SOCK_RAW for the spoof transport (src/raw_socket.rs), and
+# NET_BIND_SERVICE so the tcp transport can bind a low data_port (e.g. 443).
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 
 # Sandboxing
@@ -590,15 +597,15 @@ UNIT
 }
 
 write_service_unit() {
-  local unit=$UNIT_DIR/candy-spoof-$ROLE.service tmpl=$UNIT_DIR/candy-spoof-$ROLE@.service
-  emit_unit "Candy-Spoof $ROLE" "$CONF" "candy-spoof-$ROLE" >"$unit.new"
-  # Template used by tunnels created from the panel / candyctl: candy-spoof-<role>@<name>.service
-  emit_unit "Candy-Spoof $ROLE tunnel %i" "$TUNNELS_DIR/%i.toml" "candy-spoof-$ROLE-%i" >"$tmpl.new"
+  local unit=$UNIT_DIR/shadow-spoof-$ROLE.service tmpl=$UNIT_DIR/shadow-spoof-$ROLE@.service
+  emit_unit "Shadow Spoof $ROLE" "$CONF" "shadow-spoof-$ROLE" >"$unit.new"
+  # Template used by tunnels created from the panel / shadowctl: shadow-spoof-<role>@<name>.service
+  emit_unit "Shadow Spoof $ROLE tunnel %i" "$TUNNELS_DIR/%i.toml" "shadow-spoof-$ROLE-%i" >"$tmpl.new"
   chmod 0644 "$unit.new" "$tmpl.new"; mv -f "$unit.new" "$unit"; mv -f "$tmpl.new" "$tmpl"
 
-  local rs=${CANDY_RESTART_SEC:-5} d
-  [[ $rs =~ ^[0-9]+$ ]] && (( rs >= 1 && rs <= 3600 )) || die "CANDY_RESTART_SEC must be 1-3600"
-  for d in "candy-spoof-$ROLE.service.d" "candy-spoof-$ROLE@.service.d"; do
+  local rs=${SHADOW_RESTART_SEC:-5} d
+  [[ $rs =~ ^[0-9]+$ ]] && (( rs >= 1 && rs <= 3600 )) || die "SHADOW_RESTART_SEC must be 1-3600"
+  for d in "shadow-spoof-$ROLE.service.d" "shadow-spoof-$ROLE@.service.d"; do
     install -d -m 0755 "$UNIT_DIR/$d"
     if [[ ! -f $UNIT_DIR/$d/10-restart.conf ]]; then
       printf '[Service]\nRestartSec=%s\n' "$rs" >"$UNIT_DIR/$d/10-restart.conf"; chmod 0644 "$UNIT_DIR/$d/10-restart.conf"
@@ -606,32 +613,32 @@ write_service_unit() {
   done
 }
 
-install_candyctl() {
-  cat >"$CANDYCTL.new" <<'CANDYCTL_EOF'
+install_shadowctl() {
+  cat >"$SHADOWCTL.new" <<'SHADOWCTL_EOF'
 #!/usr/bin/env bash
-# candyctl - runtime management for Candy-Spoof (installed by install.sh)
+# shadowctl - runtime management for Shadow Spoof (installed by install.sh)
 set -Eeuo pipefail
 umask 077
 
-ETC=${CANDY_ETC_DIR:-/etc/candy-spoof}
+ETC=${SHADOW_ETC_DIR:-/etc/shadow-spoof}
 CONF=$ETC/config.toml
 PSK_FILE=$ETC/psk
 ROLE_FILE=$ETC/role
 BUILD_INFO=$ETC/build-info
-UNIT_DIR=${CANDY_UNIT_DIR:-/etc/systemd/system}
-LIB=/usr/local/lib/candy-spoof
-PYSCRIPT=$LIB/candy-panel.py
+UNIT_DIR=${SHADOW_UNIT_DIR:-/etc/systemd/system}
+LIB=/usr/local/lib/shadow-spoof
+PYSCRIPT=$LIB/shadow-panel.py
 
-die() { printf 'candyctl: %s\n' "$*" >&2; exit 1; }
+die() { printf 'shadowctl: %s\n' "$*" >&2; exit 1; }
 
 usage() {
 cat <<EOF
-Usage: candyctl [-t NAME] <command>
+Usage: shadowctl [-t NAME] <command>
 
   status                 services, watchdog, panel and (redacted) configuration
   tunnels                list tunnels on this host
   start | stop | restart all tunnels (or one with -t NAME)
-  logs [journalctl args] e.g.  candyctl logs -f
+  logs [journalctl args] e.g.  shadowctl logs -f
   monitor                live dashboard (CPU/RAM/connections/traffic/events)
   monitor logs [LEVEL]   live colourised logs (LEVEL: debug|info|warn|error)
   test [--host H --port P --secs N]
@@ -639,10 +646,10 @@ Usage: candyctl [-t NAME] <command>
   check                  validate the configuration with the binary (--check-config); exit 1 if rejected
   diagnose [--link L]    full tunnel-path doctor; pass the peer's setup link for a two-sided check
   update                 update to the latest release (rebuild), keeping your configuration
-  backup [FILE]          write a .tar.gz of /etc/candy-spoof (config + keys)
+  backup [FILE]          write a .tar.gz of /etc/shadow-spoof (config + keys)
   config                 print the configuration (pre_shared_key redacted)
   config edit            edit in \$EDITOR; validated, applied with automatic rollback
-  set key=value ...      change fields, e.g.  candyctl set icmp_id=17185 mtu=1300
+  set key=value ...      change fields, e.g.  shadowctl set icmp_id=17185 mtu=1300
   token                  print the pre-shared key
   link                   print the setup link for the other side
   watchdog <off|30m|1h|6h|12h|24h>   periodic restart via systemd timer
@@ -669,13 +676,13 @@ if [[ $EUID -ne 0 ]]; then
   die "must run as root"
 fi
 
-[[ -r $ROLE_FILE ]] || die "Candy-Spoof is not installed (missing $ROLE_FILE)"
+[[ -r $ROLE_FILE ]] || die "Shadow Spoof is not installed (missing $ROLE_FILE)"
 ROLE=$(<"$ROLE_FILE")
 SYSTEMCTL=$(command -v systemctl)
 PY=(python3 "$PYSCRIPT")
 
 inst_names() { echo main; local f; for f in "$ETC"/tunnels/*.toml; do [[ -e $f ]] && basename "$f" .toml; done; return 0; }
-unit_of() { if [[ $1 == main ]]; then echo "candy-spoof-$ROLE.service"; else echo "candy-spoof-$ROLE@$1.service"; fi; }
+unit_of() { if [[ $1 == main ]]; then echo "shadow-spoof-$ROLE.service"; else echo "shadow-spoof-$ROLE@$1.service"; fi; }
 conf_of() { if [[ $1 == main ]]; then echo "$CONF"; else echo "$ETC/tunnels/$1.toml"; fi; }
 check_target() { [[ -z $TARGET ]] && return 0; inst_names | grep -qx -- "$TARGET" || die "no such tunnel '$TARGET' (have: $(inst_names | tr '\n' ' '))"; }
 one() { check_target; echo "${TARGET:-main}"; }          # single target, default main
@@ -713,13 +720,13 @@ cmd_status() {
   local wd=off; [[ -r $ETC/watchdog ]] && wd=$(<"$ETC/watchdog")
   printf '\nWatchdog  : %s' "$wd"
   if [[ $wd != off ]]; then
-    local nxt; nxt=$($SYSTEMCTL list-timers candy-spoof-watchdog.timer --no-legend 2>/dev/null | awk '{print $1" "$2" "$3" "$4}')
+    local nxt; nxt=$($SYSTEMCTL list-timers shadow-spoof-watchdog.timer --no-legend 2>/dev/null | awk '{print $1" "$2" "$3" "$4}')
     [[ -n $nxt ]] && printf '   (next: %s)' "$nxt"
   fi
   printf '\n'
   local x
   for x in monitor panel; do
-    $SYSTEMCTL cat "candy-spoof-$x.service" >/dev/null 2>&1 && printf '%-10s: %s\n' "${x^}" "$($SYSTEMCTL is-active "candy-spoof-$x.service" 2>/dev/null || true)"
+    $SYSTEMCTL cat "shadow-spoof-$x.service" >/dev/null 2>&1 && printf '%-10s: %s\n' "${x^}" "$($SYSTEMCTL is-active "shadow-spoof-$x.service" 2>/dev/null || true)"
   done
   [[ -r $BUILD_INFO ]] && printf 'Build     : %s\n' "$(sed -n 's/^commit=//p' "$BUILD_INFO")"
   return $rc
@@ -738,27 +745,27 @@ cmd_tunnels() {
 
 cmd_logs() {
   if [[ -n $TARGET ]]; then check_target; exec journalctl -u "$(unit_of "$TARGET")" -n 200 --no-pager "$@"; fi
-  exec journalctl -u "candy-spoof-$ROLE.service" -u "candy-spoof-$ROLE@*.service" -n 200 --no-pager "$@"
+  exec journalctl -u "shadow-spoof-$ROLE.service" -u "shadow-spoof-$ROLE@*.service" -n 200 --no-pager "$@"
 }
 
 cmd_token() { local n; n=$(one); if [[ $n == main && -r $PSK_FILE ]]; then cat "$PSK_FILE"; else cfg_get "$n" pre_shared_key; fi; }
 
 write_watchdog_service() {
-  cat >"$UNIT_DIR/candy-spoof-watchdog.service" <<UNIT
+  cat >"$UNIT_DIR/shadow-spoof-watchdog.service" <<UNIT
 [Unit]
-Description=Candy-Spoof periodic restart (watchdog)
-Documentation=man:candyctl(8)
+Description=Shadow Spoof periodic restart (watchdog)
+Documentation=man:shadowctl(8)
 
 [Service]
 Type=oneshot
 # try-restart: does nothing for tunnels the operator deliberately stopped.
-ExecStart=$SYSTEMCTL try-restart candy-spoof-$ROLE.service
-ExecStart=-$SYSTEMCTL try-restart candy-spoof-$ROLE@*.service
+ExecStart=$SYSTEMCTL try-restart shadow-spoof-$ROLE.service
+ExecStart=-$SYSTEMCTL try-restart shadow-spoof-$ROLE@*.service
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 UNIT
-  chmod 0644 "$UNIT_DIR/candy-spoof-watchdog.service"
+  chmod 0644 "$UNIT_DIR/shadow-spoof-watchdog.service"
 }
 
 cmd_watchdog() {
@@ -772,40 +779,40 @@ cmd_watchdog() {
   esac
   write_watchdog_service
   if [[ -z $spec ]]; then
-    $SYSTEMCTL disable --now candy-spoof-watchdog.timer >/dev/null 2>&1 || true
-    rm -f "$UNIT_DIR/candy-spoof-watchdog.timer"
+    $SYSTEMCTL disable --now shadow-spoof-watchdog.timer >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/shadow-spoof-watchdog.timer"
     $SYSTEMCTL daemon-reload
     echo off >"$ETC/watchdog"; chmod 0644 "$ETC/watchdog"
     echo "Watchdog disabled (crash recovery via Restart=on-failure is unaffected)."
     return 0
   fi
-  cat >"$UNIT_DIR/candy-spoof-watchdog.timer" <<UNIT
+  cat >"$UNIT_DIR/shadow-spoof-watchdog.timer" <<UNIT
 [Unit]
-Description=Candy-Spoof periodic restart timer ($v)
-Documentation=man:candyctl(8)
+Description=Shadow Spoof periodic restart timer ($v)
+Documentation=man:shadowctl(8)
 
 [Timer]
 OnBootSec=$spec
 OnUnitActiveSec=$spec
 AccuracySec=10s
-Unit=candy-spoof-watchdog.service
+Unit=shadow-spoof-watchdog.service
 
 [Install]
 WantedBy=timers.target
 UNIT
-  chmod 0644 "$UNIT_DIR/candy-spoof-watchdog.timer"
+  chmod 0644 "$UNIT_DIR/shadow-spoof-watchdog.timer"
   $SYSTEMCTL daemon-reload
-  $SYSTEMCTL enable candy-spoof-watchdog.timer >/dev/null 2>&1
-  $SYSTEMCTL restart candy-spoof-watchdog.timer
+  $SYSTEMCTL enable shadow-spoof-watchdog.timer >/dev/null 2>&1
+  $SYSTEMCTL restart shadow-spoof-watchdog.timer
   echo "$v" >"$ETC/watchdog"; chmod 0644 "$ETC/watchdog"
   echo "Watchdog set to every $v."
-  $SYSTEMCTL list-timers candy-spoof-watchdog.timer --no-legend 2>/dev/null | sed 's/^/  /' || true
+  $SYSTEMCTL list-timers shadow-spoof-watchdog.timer --no-legend 2>/dev/null | sed 's/^/  /' || true
 }
 
 cmd_restart_sec() {
   local n=${1-} d
   [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= 3600 )) || die "restart-sec must be an integer 1-3600"
-  for d in "candy-spoof-$ROLE.service.d" "candy-spoof-$ROLE@.service.d"; do
+  for d in "shadow-spoof-$ROLE.service.d" "shadow-spoof-$ROLE@.service.d"; do
     mkdir -p "$UNIT_DIR/$d"
     printf '[Service]\nRestartSec=%s\n' "$n" >"$UNIT_DIR/$d/10-restart.conf"; chmod 0644 "$UNIT_DIR/$d/10-restart.conf"
   done
@@ -844,7 +851,7 @@ cmd_socks_port() {
     echo "Confirmed: 127.0.0.1:$port is listening."
   else
     mv -f "$bak" "$cf"; $SYSTEMCTL restart "$unit" || true
-    die "service did not start listening on $port; reverted to $cur. See: candyctl logs"
+    die "service did not start listening on $port; reverted to $cur. See: shadowctl logs"
   fi
 }
 
@@ -852,7 +859,7 @@ ensure_cert() {
   [[ -f $ETC/panel.crt && -f $ETC/panel.key ]] && return 0
   command -v openssl >/dev/null || die "openssl is required to create a TLS certificate"
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
-    -subj "/CN=candy-spoof" -keyout "$ETC/panel.key" -out "$ETC/panel.crt" >/dev/null 2>&1
+    -subj "/CN=shadow-spoof" -keyout "$ETC/panel.key" -out "$ETC/panel.crt" >/dev/null 2>&1
   chmod 0600 "$ETC/panel.key"; chmod 0644 "$ETC/panel.crt"
 }
 
@@ -861,7 +868,7 @@ cmd_panel() {
   local sub=${1-info}
   case $sub in
     info)
-      printf 'URL    : %s\nService: %s\n' "$("${PY[@]}" admin info)" "$($SYSTEMCTL is-active candy-spoof-panel.service 2>/dev/null || true)" ;;
+      printf 'URL    : %s\nService: %s\n' "$("${PY[@]}" admin info)" "$($SYSTEMCTL is-active shadow-spoof-panel.service 2>/dev/null || true)" ;;
     passwd)
       local pw; pw=$("${PY[@]}" admin passwd-random)
       printf 'New panel password (shown once): %s\n' "$pw" ;;
@@ -870,22 +877,22 @@ cmd_panel() {
       read -rsp "New password (10+ chars): " a; echo; read -rsp "Repeat: " b; echo
       [[ $a == "$b" ]] || die "passwords differ"
       printf '%s\n' "$a" | "${PY[@]}" admin passwd && echo "Password updated." ;;
-    port)  "${PY[@]}" admin set port "${2-}"; $SYSTEMCTL restart candy-spoof-panel.service; cmd_panel info ;;
-    bind)  "${PY[@]}" admin set bind "${2-}"; $SYSTEMCTL restart candy-spoof-panel.service; cmd_panel info ;;
+    port)  "${PY[@]}" admin set port "${2-}"; $SYSTEMCTL restart shadow-spoof-panel.service; cmd_panel info ;;
+    bind)  "${PY[@]}" admin set bind "${2-}"; $SYSTEMCTL restart shadow-spoof-panel.service; cmd_panel info ;;
     tls)
       case ${2-} in
         on)  ensure_cert; "${PY[@]}" admin set tls 1 ;;
         off) "${PY[@]}" admin set tls 0 ;;
-        *)   die "usage: candyctl panel tls on|off" ;;
+        *)   die "usage: shadowctl panel tls on|off" ;;
       esac
-      $SYSTEMCTL restart candy-spoof-panel.service; cmd_panel info ;;
-    start|stop|restart) $SYSTEMCTL "$sub" candy-spoof-panel.service && echo "panel $sub" ;;
-    *) die "usage: candyctl panel [info|passwd|passwd-set|port N|bind IP|tls on|off|start|stop|restart]" ;;
+      $SYSTEMCTL restart shadow-spoof-panel.service; cmd_panel info ;;
+    start|stop|restart) $SYSTEMCTL "$sub" shadow-spoof-panel.service && echo "panel $sub" ;;
+    *) die "usage: shadowctl panel [info|passwd|passwd-set|port N|bind IP|tls on|off|start|stop|restart]" ;;
   esac
 }
 
 cmd_check() { # validate each target's config with the binary's --check-config
-  local bin=/usr/local/bin/candy-spoof-$ROLE n c out rc fail=0
+  local bin=/usr/local/bin/shadow-spoof-$ROLE n c out rc fail=0
   [[ -x $bin ]] || die "binary $bin not found (re-run install.sh)"
   for n in $(targets); do
     c=$(conf_of "$n")
@@ -903,7 +910,7 @@ cmd_check() { # validate each target's config with the binary's --check-config
 }
 
 cmd_backup() { # tar.gz of the whole config dir (config + keys + panel + tunnels)
-  local out=${1:-/root/candy-spoof-backup-$(date +%F-%H%M%S).tar.gz}
+  local out=${1:-/root/shadow-spoof-backup-$(date +%F-%H%M%S).tar.gz}
   [[ -d $ETC ]] || die "nothing to back up ($ETC missing)"
   tar czf "$out" -C "$(dirname "$ETC")" "$(basename "$ETC")" || die "backup failed"
   chmod 0600 "$out" 2>/dev/null || true
@@ -911,7 +918,7 @@ cmd_backup() { # tar.gz of the whole config dir (config + keys + panel + tunnels
 }
 
 cmd_update() { # rebuild + reinstall from the latest release, keeping the config
-  local url=${CANDY_INSTALL_URL:-https://raw.githubusercontent.com/primeshock/shadow-tunnel/master/install.sh}
+  local url=${SHADOW_INSTALL_URL:-https://raw.githubusercontent.com/primeshock/shadow-tunnel/master/install.sh}
   if [[ ${1-} != -y ]]; then
     printf 'Update rebuilds the binary and reinstalls the panel/CLI, keeping %s. Continue? [y/N] ' "$ETC" >&2
     local a=""; read -r a </dev/tty 2>/dev/null || true
@@ -919,7 +926,7 @@ cmd_update() { # rebuild + reinstall from the latest release, keeping the config
   fi
   command -v curl >/dev/null || die "curl is required"
   echo "Backing up first: $(cmd_backup)" >&2
-  curl -fsSL "$url" | CANDY_NONINTERACTIVE=1 CANDY_RECONFIGURE=0 CANDY_ROLE="$ROLE" bash
+  curl -fsSL "$url" | SHADOW_NONINTERACTIVE=1 SHADOW_RECONFIGURE=0 SHADOW_ROLE="$ROLE" bash
 }
 
 cmd=$1; shift
@@ -947,32 +954,32 @@ case $cmd in
   panel)       cmd_panel "$@" ;;
   *)           usage >&2; exit 2 ;;
 esac
-CANDYCTL_EOF
-  chmod 0755 "$CANDYCTL.new"; chown root:root "$CANDYCTL.new"; mv -f "$CANDYCTL.new" "$CANDYCTL"
-  ok "Installed $CANDYCTL"
+SHADOWCTL_EOF
+  chmod 0755 "$SHADOWCTL.new"; chown root:root "$SHADOWCTL.new"; mv -f "$SHADOWCTL.new" "$SHADOWCTL"
+  ok "Installed $SHADOWCTL"
 }
 
-install_candyshadow() {
-  cat >"$CANDYSHADOW.new" <<'CANDYSHADOW_EOF'
+install_shadowspoof() {
+  cat >"$SHADOWSPOOF.new" <<'SHADOWSPOOF_EOF'
 #!/usr/bin/env bash
-# candyshadow - friendly interactive menu over candyctl (installed by install.sh)
+# shadowspoof - friendly interactive menu over shadowctl (installed by install.sh)
 set -Euo pipefail
 
-ETC=${CANDY_ETC_DIR:-/etc/candy-spoof}
+ETC=${SHADOW_ETC_DIR:-/etc/shadow-spoof}
 ROLE_FILE=$ETC/role
 TUNNELS=$ETC/tunnels
-CTL=${CANDY_CTL:-/usr/local/bin/candyctl}
+CTL=${SHADOW_CTL:-/usr/local/bin/shadowctl}
 PANEL_JSON=$ETC/panel.json
 
 if [[ $EUID -ne 0 ]]; then
   command -v sudo >/dev/null && exec sudo -- "$0" "$@"
-  echo "candyshadow: must run as root" >&2; exit 1
+  echo "shadowspoof: must run as root" >&2; exit 1
 fi
-[[ -r $ROLE_FILE ]] || { echo "candyshadow: not installed (missing $ROLE_FILE)"; exit 1; }
+[[ -r $ROLE_FILE ]] || { echo "shadowspoof: not installed (missing $ROLE_FILE)"; exit 1; }
 ROLE=$(<"$ROLE_FILE")
 
 if [[ -t 0 ]]; then TTY=/dev/stdin; elif { : </dev/tty; } 2>/dev/null; then TTY=/dev/tty
-else echo "candyshadow needs a terminal; use 'candyctl' directly for scripting" >&2; exit 1; fi
+else echo "shadowspoof needs a terminal; use 'shadowctl' directly for scripting" >&2; exit 1; fi
 
 c_b=$'\e[36m'; c_g=$'\e[32m'; c_y=$'\e[33m'; c_d=$'\e[2m'; c_0=$'\e[0m'
 [[ -t 1 ]] || { c_b=; c_g=; c_y=; c_d=; c_0=; }
@@ -980,10 +987,10 @@ c_b=$'\e[36m'; c_g=$'\e[32m'; c_y=$'\e[33m'; c_d=$'\e[2m'; c_0=$'\e[0m'
 ask()   { local p=$1 v=""; printf '%s' "$p" >&2; read -r v <"$TTY" || true; printf '%s' "$v"; }
 pause() { printf '\n%sEnter to continue%s ' "$c_d" "$c_0" >&2; read -r _ <"$TTY" || true; }
 names() { echo main; local f; for f in "$TUNNELS"/*.toml; do [[ -e $f ]] && basename "$f" .toml; done; return 0; }
-active(){ systemctl is-active "candy-spoof-$ROLE${1:+@$1}.service" 2>/dev/null || true; }
-unit_of(){ [[ $1 == main ]] && echo "candy-spoof-$ROLE.service" || echo "candy-spoof-$ROLE@$1.service"; }
+active(){ systemctl is-active "shadow-spoof-$ROLE${1:+@$1}.service" 2>/dev/null || true; }
+unit_of(){ [[ $1 == main ]] && echo "shadow-spoof-$ROLE.service" || echo "shadow-spoof-$ROLE@$1.service"; }
 
-panel_url() { command -v python3 >/dev/null && python3 /usr/local/lib/candy-spoof/candy-panel.py admin info 2>/dev/null || true; }
+panel_url() { command -v python3 >/dev/null && python3 /usr/local/lib/shadow-spoof/shadow-panel.py admin info 2>/dev/null || true; }
 
 FIELDS_COMMON=(real_ip peer_real_ip spoofed_ip peer_spoofed_ip spoofed_ip_pool allowed_peers \
                data_port icmp_id mtu initial_cwnd max_retries rto_min_ms interface pre_shared_key)
@@ -1098,7 +1105,7 @@ main_menu() {
     case "$(ask '> ')" in
       1) manage_tunnels ;;
       2) "$CTL" panel info 2>/dev/null; echo; echo "Reach it over SSH:  ssh -L 7777:127.0.0.1:7777 root@<server>"; pause ;;
-      3) "$CTL" diagnose; local l; l=$(ask "paste the peer's candyspoof:// link for a 2-sided check (or Enter to skip): "); [[ -n $l ]] && "$CTL" diagnose --link "$l"; pause ;;
+      3) "$CTL" diagnose; local l; l=$(ask "paste the peer's shadowspoof:// link for a 2-sided check (or Enter to skip): "); [[ -n $l ]] && "$CTL" diagnose --link "$l"; pause ;;
       4) command -v python3 >/dev/null && "$CTL" status; "$CTL" check || true; pause ;;
       5) "$CTL" logs -f ;;
       6) echo "pre-shared key:"; "$CTL" token; echo; echo "setup link for the other side:"; "$CTL" link; pause ;;
@@ -1111,23 +1118,23 @@ main_menu() {
 }
 
 main_menu
-CANDYSHADOW_EOF
-  chmod 0755 "$CANDYSHADOW.new"; chown root:root "$CANDYSHADOW.new"; mv -f "$CANDYSHADOW.new" "$CANDYSHADOW"
-  ok "Installed $CANDYSHADOW"
+SHADOWSPOOF_EOF
+  chmod 0755 "$SHADOWSPOOF.new"; chown root:root "$SHADOWSPOOF.new"; mv -f "$SHADOWSPOOF.new" "$SHADOWSPOOF"
+  ok "Installed $SHADOWSPOOF"
 }
 
 install_panel_files() {
   install -d -m 0755 -o root -g root "$LIB_DIR"
-  cat >"$PANEL_PY.new" <<'CANDY_PANEL_PY_EOF'
+  cat >"$PANEL_PY.new" <<'SHADOW_PANEL_PY_EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Candy-Spoof web panel, monitor and CLI helpers (Python standard library only).
+"""Shadow Spoof web panel, monitor and CLI helpers (Python standard library only).
 
-  candy-panel.py panel          web panel (runs as root, hardened by systemd)
-  candy-panel.py monitor        metrics + log sampler (runs as the candy-spoof user)
-  candy-panel.py monitor-view   live terminal dashboard           (candyctl monitor)
-  candy-panel.py log-view [lvl] colourised live log follow        (candyctl monitor logs)
-  candy-panel.py admin ...      panel.json maintenance            (candyctl panel ...)
+  shadow-panel.py panel          web panel (runs as root, hardened by systemd)
+  shadow-panel.py monitor        metrics + log sampler (runs as the shadow-spoof user)
+  shadow-panel.py monitor-view   live terminal dashboard           (shadowctl monitor)
+  shadow-panel.py log-view [lvl] colourised live log follow        (shadowctl monitor logs)
+  shadow-panel.py admin ...      panel.json maintenance            (shadowctl panel ...)
 
 Facts about the upstream binary this relies on (from its source):
   * one config file + one process = one "tunnel instance"; role is client OR server
@@ -1165,16 +1172,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 # --------------------------------------------------------------------- paths --
-ETC = os.environ.get("CANDY_ETC_DIR", "/etc/candy-spoof")
-STATE = os.environ.get("CANDY_STATE_DIR", "/var/lib/candy-spoof")
-RUN = os.environ.get("CANDY_RUN_DIR", "/run/candy-spoof")
-UNIT_DIR = os.environ.get("CANDY_UNIT_DIR", "/etc/systemd/system")
-SYSTEMCTL = os.environ.get("CANDY_SYSTEMCTL", "systemctl")
-JOURNALCTL = os.environ.get("CANDY_JOURNALCTL", "journalctl")
-SS = os.environ.get("CANDY_SS", "ss")
-IPCMD = os.environ.get("CANDY_IP", "ip")
-CTL = os.environ.get("CANDY_CTL", "/usr/local/bin/candyctl")
-SVC_USER = "candy-spoof"
+ETC = os.environ.get("SHADOW_ETC_DIR", "/etc/shadow-spoof")
+STATE = os.environ.get("SHADOW_STATE_DIR", "/var/lib/shadow-spoof")
+RUN = os.environ.get("SHADOW_RUN_DIR", "/run/shadow-spoof")
+UNIT_DIR = os.environ.get("SHADOW_UNIT_DIR", "/etc/systemd/system")
+SYSTEMCTL = os.environ.get("SHADOW_SYSTEMCTL", "systemctl")
+JOURNALCTL = os.environ.get("SHADOW_JOURNALCTL", "journalctl")
+SS = os.environ.get("SHADOW_SS", "ss")
+IPCMD = os.environ.get("SHADOW_IP", "ip")
+CTL = os.environ.get("SHADOW_CTL", "/usr/local/bin/shadowctl")
+SVC_USER = "shadow-spoof"
 
 CONF_MAIN = os.path.join(ETC, "config.toml")
 TUNNELS = os.path.join(ETC, "tunnels")
@@ -1250,7 +1257,7 @@ def get_role():
 
 # ---------------------------------------------------------------------- toml --
 def parse_toml(text):
-    """Flat key = value parser sufficient for Candy-Spoof's config (src/config.rs)."""
+    """Flat key = value parser sufficient for Shadow Spoof's config (src/config.rs)."""
     d = {}
     for line in text.splitlines():
         s = line.strip()
@@ -1285,7 +1292,7 @@ def toml_list(items):
 
 def render_config(role, c, note):
     lines = [
-        "# Managed by the Candy-Spoof panel/installer - role: %s" % role,
+        "# Managed by the Shadow Spoof panel/installer - role: %s" % role,
         "# %s" % note,
         'transport = "%s"' % c.get("transport", "spoof"),
         'real_ip = "%s"' % c["real_ip"],
@@ -1313,7 +1320,7 @@ def render_config(role, c, note):
 class Inst(object):
     def __init__(self, name, role, path):
         self.name, self.role, self.path = name, role, path
-        self.unit = ("candy-spoof-%s.service" % role) if name == "main" else ("candy-spoof-%s@%s.service" % (role, name))
+        self.unit = ("shadow-spoof-%s.service" % role) if name == "main" else ("shadow-spoof-%s@%s.service" % (role, name))
 
     def cfg(self):
         return parse_toml(read_text(self.path))
@@ -1559,14 +1566,18 @@ def make_link(name, role, cfg):
     d["v"] = 1
     d["name"] = name
     raw = json.dumps(d, separators=(",", ":")).encode()
-    return "candyspoof://" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    return "shadowspoof://" + base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
 def parse_link(link):
     s = link.strip()
-    if not s.startswith("candyspoof://"):
-        raise ValueError("not a candyspoof:// link")
-    b = s[len("candyspoof://"):]
+    # Accept the new scheme and the legacy one (links from a candy-spoof install).
+    for scheme in ("shadowspoof://", "candyspoof://"):
+        if s.startswith(scheme):
+            b = s[len(scheme):]
+            break
+    else:
+        raise ValueError("not a shadowspoof:// link")
     b += "=" * (-len(b) % 4)
     d = json.loads(base64.urlsafe_b64decode(b.encode()))
     if d.get("v") != 1 or d.get("role") not in ("client", "server"):
@@ -1630,7 +1641,7 @@ KINDS = [
     ("arq_drop", re.compile(r"exceeded max retries")),
     ("raw_error", re.compile(r"raw-send error|recvfrom")),
     ("session_error", re.compile(r"session error|handle_incoming|tick:")),
-    ("start", re.compile(r"Candy-Spoof (client|server) starting")),
+    ("start", re.compile(r"Shadow Spoof (client|server) starting")),
     ("listening", re.compile(r"SOCKS5 proxy listening")),
 ]
 LEVEL_ORDER = {"TRACE": 0, "DEBUG": 1, "INFO": 2, "WARN": 3, "ERROR": 4}
@@ -1671,7 +1682,7 @@ def journal_entry(line):
 
 
 def unit_to_name(unit):
-    m = re.match(r"^candy-spoof-(?:client|server)(?:@(.+))?\.service$", unit or "")
+    m = re.match(r"^shadow-spoof-(?:client|server)(?:@(.+))?\.service$", unit or "")
     if not m:
         return None
     return m.group(1) or "main"
@@ -1832,7 +1843,7 @@ class Monitor(object):
     # -- journal
     def read_journal(self, role):
         args = [JOURNALCTL, "--no-pager", "-q", "-o", "json", "--cursor-file", CURSOR_FILE,
-                "-u", "candy-spoof-%s.service" % role, "-u", "candy-spoof-%s@*.service" % role]
+                "-u", "shadow-spoof-%s.service" % role, "-u", "shadow-spoof-%s@*.service" % role]
         if not os.path.exists(CURSOR_FILE):
             args += ["--since", "-2min"]
         rc, out, _ = run(args, timeout=25)
@@ -2091,7 +2102,7 @@ def api_create(req):
         raise ApiError(400, "invalid name", {"errors": {"name": "a-z 0-9 and '-', max 24 chars, not 'main'"}})
     if os.path.exists(os.path.join(TUNNELS, name + ".toml")):
         raise ApiError(409, "a tunnel with this name already exists", {"errors": {"name": "already exists"}})
-    if not os.path.exists(os.path.join(UNIT_DIR, "candy-spoof-%s@.service" % role)):
+    if not os.path.exists(os.path.join(UNIT_DIR, "shadow-spoof-%s@.service" % role)):
         raise ApiError(409, "template unit missing - re-run install.sh to upgrade")
     clean, errs = validate(role, d, name)
     if errs:
@@ -2116,7 +2127,7 @@ def check_config_file(role, path):
     when the installed binary predates --check-config (so we never block on an
     older build).  This catches drift between the panel validator and the Rust
     parser before the service is (re)started."""
-    binp = "/usr/local/bin/candy-spoof-%s" % role
+    binp = "/usr/local/bin/shadow-spoof-%s" % role
     if not os.access(binp, os.X_OK):
         return True, ""
     rc, out, err = run([binp, "--config", path, "--check-config"], timeout=10)
@@ -2224,7 +2235,7 @@ MAGIC = b"\xca\xfe\x5f\x00"
 
 
 def sniff(cfg, seconds, stop=None):
-    """Passively count Candy-Spoof packets arriving at this host (raw sockets, needs root)."""
+    """Passively count Shadow Spoof packets arriving at this host (raw sockets, needs root)."""
     import select
     allowed = set([cfg.get("peer_real_ip"), cfg.get("peer_spoofed_ip")] + list(cfg.get("allowed_peers") or []))
     icmp_id, port = cfg.get("icmp_id"), cfg.get("data_port")
@@ -2282,12 +2293,12 @@ def sniff_steps(cfg, sn, peer_word):
                       "detail": "Check: peer service running, firewall allows UDP/%s + ICMP echo, rp_filter, and that the "
                                 "peer's spoofed/real IPs match this config." % cfg.get("data_port")})
     for src, n in sn["blocked"].items():
-        steps.append({"ok": False, "title": "Candy-Spoof packets from %s are being dropped" % src,
+        steps.append({"ok": False, "title": "Shadow Spoof packets from %s are being dropped" % src,
                       "detail": "%d packets with the right port/ID arrived from %s, which is not in the allowed list. "
                                 "Add it to 'peer spoofed IP pool' (allowed_peers) or fix peer_spoofed_ip." % (n, src)})
     for pid, n in sn["other_id"].items():
         steps.append({"ok": False, "title": "ICMP ID mismatch",
-                      "detail": "the peer sends Candy-Spoof packets with ICMP ID %d (%d seen) but this config expects %s" % (pid, n, cfg.get("icmp_id"))})
+                      "detail": "the peer sends Shadow Spoof packets with ICMP ID %d (%d seen) but this config expects %s" % (pid, n, cfg.get("icmp_id"))})
     return steps
 
 
@@ -2321,7 +2332,7 @@ def socks_probe(sport, host, port, http):
     sock = s
     if port == 443:
         sock = ssl.create_default_context().wrap_socket(s, server_hostname=host)
-    sock.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: candy-spoof-test\r\nConnection: close\r\n\r\n" % host).encode())
+    sock.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: shadow-spoof-test\r\nConnection: close\r\n\r\n" % host).encode())
     t1 = time.time()
     first = sock.recv(4096)
     ttfb = (time.time() - t1) * 1000
@@ -2400,7 +2411,7 @@ def run_test(inst, host="example.com", port=80, secs=10):
     steps.append({"ok": acc > 0, "title": "Tunnels accepted in the last 10 minutes",
                   "detail": "%d accepted, %d forwarded to a target%s" % (acc, fwd, "" if acc else " (none yet)")})
     steps.append({"ok": None, "title": "Listening for %ds" % secs,
-                  "detail": "Run the test on the CLIENT now (candyctl test) so packets flow while this captures."})
+                  "detail": "Run the test on the CLIENT now (shadowctl test) so packets flow while this captures."})
     sn = sniff(cfg, secs)
     steps += sniff_steps(cfg, sn, "client")
     good = "error" not in sn and (sum(sn["icmp"].values()) + sum(sn["udp"].values()) > 0)
@@ -2430,14 +2441,14 @@ def api_health(req):
     if not role:
         add("fail", "Not installed", "run install.sh")
         return {"checks": checks}
-    binp = "/usr/local/bin/candy-spoof-%s" % role
+    binp = "/usr/local/bin/shadow-spoof-%s" % role
     add("ok" if os.access(binp, os.X_OK) else "fail", "Binary %s" % binp)
-    add("ok" if os.path.exists(os.path.join(UNIT_DIR, "candy-spoof-%s@.service" % role)) else "warn",
+    add("ok" if os.path.exists(os.path.join(UNIT_DIR, "shadow-spoof-%s@.service" % role)) else "warn",
         "Template unit for panel-created tunnels", "re-run install.sh to add it")
-    rc, out, _ = run([SYSTEMCTL, "show", "-p", "AmbientCapabilities,User", "candy-spoof-%s.service" % role])
+    rc, out, _ = run([SYSTEMCTL, "show", "-p", "AmbientCapabilities,User", "shadow-spoof-%s.service" % role])
     add("ok" if "cap_net_raw" in out.lower() else "warn", "Service has CAP_NET_RAW (needed for raw sockets)")
-    mon = systemd_show(["candy-spoof-monitor.service"]).get("candy-spoof-monitor.service", {})
-    add("ok" if mon.get("ActiveState") == "active" else "warn", "Monitor service", "systemctl start candy-spoof-monitor")
+    mon = systemd_show(["shadow-spoof-monitor.service"]).get("shadow-spoof-monitor.service", {})
+    add("ok" if mon.get("ActiveState") == "active" else "warn", "Monitor service", "systemctl start shadow-spoof-monitor")
     for name in ("all", "default"):
         v = read_text("/proc/sys/net/ipv4/conf/%s/rp_filter" % name).strip()
         if v == "1":
@@ -2577,16 +2588,17 @@ def api_diagnose(req):
 
     # 5 - capability + service state ------------------------------------------
     def c_service():
-        rc, out, _ = run([SYSTEMCTL, "show", "-p", "AmbientCapabilities", inst.unit])
-        if "cap_net_raw" not in (out or "").lower():
-            add("fail", "", "service is missing CAP_NET_RAW",
-                "raw sockets cannot be opened without it", "re-run install.sh to repair the unit")
+        if not tcp:
+            rc, out, _ = run([SYSTEMCTL, "show", "-p", "AmbientCapabilities", inst.unit])
+            if "cap_net_raw" not in (out or "").lower():
+                add("fail", "", "service is missing CAP_NET_RAW",
+                    "raw sockets cannot be opened without it", "re-run install.sh to repair the unit")
         st = unit_status(inst, systemd_show([inst.unit]))
         if st.get("active") == "active":
             add("ok", "", "service is active")
         else:
             add("fail", "", "service is %s" % st.get("active", "unknown"),
-                "the process is not running", "candyctl start, then candyctl logs -f")
+                "the process is not running", "shadowctl start, then shadowctl logs -f")
         if role == "client" and st.get("active") == "active":
             p = cfg.get("socks5_port", 0)
             if port_listening(p, True):
@@ -2594,7 +2606,7 @@ def api_diagnose(req):
             else:
                 add("fail", "socks5_port", "SOCKS5 is not listening on 127.0.0.1:%s" % p,
                     "the client proxy never bound - initialisation did not complete",
-                    "check candyctl logs; another process may hold the port")
+                    "check shadowctl logs; another process may hold the port")
     safe(c_service)
 
     # 6 - can we even reach the peer's real IP? -------------------------------
@@ -2619,7 +2631,7 @@ def api_diagnose(req):
                 d = parse_link(link)
             except Exception as e:
                 add("fail", "", "could not read the pasted link", str(e),
-                    "paste the candyspoof:// link generated on the OTHER host")
+                    "paste the shadowspoof:// link generated on the OTHER host")
                 return
             if d.get("role") != role:
                 add("fail", "", "this link is for a %s host, but this host is a %s" % (d.get("role"), role),
@@ -2698,7 +2710,7 @@ INDEX_HTML = r'''<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<title>Candy-Spoof</title>
+<title>Shadow Spoof</title>
 <link rel="icon" href="data:,">
 <style nonce="__NONCE__">
 :root{--bg:#0a0d14;--bg2:#0f1420;--card:#141a28;--card2:#182032;--line:#243049;--tx:#eef1f8;--mut:#8f9ab2;--acc:#ff6fae;--acc2:#6fb7ff;--ok:#3ddc97;--warn:#f5b54a;--bad:#ff5d6c;--r:16px;--grad:linear-gradient(135deg,#ff6fae,#b06bff 60%,#6fb7ff);--shadow:0 10px 30px -12px #000a;--ring:0 0 0 3px #ff6fae33}
@@ -2797,7 +2809,7 @@ en: {
  h_peerpool:'Every pool address the peer may use, otherwise its packets are dropped (allowed_peers).', f_iface:'Interface', f_port:'Data port', f_icmp:'ICMP ID (0-65535 or 0x..)',
  f_socks:'SOCKS5 port', f_tun:'Tunnel count', f_mtu:'MTU', f_cwnd:'Initial CWND', f_retries:'Max retries', h_retries:'retransmits before giving up (1-100)', f_rto:'Min RTO (ms)', h_rto:'retransmit-timeout floor; raise on lossy/high-latency links (10-60000)', f_key:'Pre-shared key (blank = generate)', gen:'Generate', server:'server', client:'client',
  auto:'auto-detect', saved:'Saved', created:'Tunnel created', link_hint:'Give this link to the other side: Tunnels > Import link.', fp:'Fingerprint', show:'Show',
- paste_link:'Paste a candyspoof:// link', apply:'Apply', pw_confirm:'Enter the panel password to reveal the key', reveal:'Reveal',
+ paste_link:'Paste a shadowspoof:// link', apply:'Apply', pw_confirm:'Enter the panel password to reveal the key', reveal:'Reveal',
  level:'Level', search:'Search', lines:'Lines', auto_refresh:'Auto-refresh', run:'Run check', host:'Host', port:'Port', running:'Running...', avg:'Average', handshake_ok:'handshakes OK',
  wd:'Periodic restart (watchdog)', wd_hint:'Independent of crash recovery (Restart=on-failure).', chg_pw:'Change password', old_pw:'Current password', new_pw:'New password (10+ chars)',
  lang:'Language', copied:'Copied', copy:'Copy', not_listening:'SOCKS5 not listening', last_est:'Last handshake', ago:'ago', never:'never', build:'Build', role:'Role',
@@ -2814,7 +2826,7 @@ fa: {
  h_peerpool:'همهٔ IPهایی که طرف مقابل ممکن است استفاده کند؛ وگرنه بسته‌هایش دور ریخته می‌شود (allowed_peers).', f_iface:'اینترفیس', f_port:'پورت دیتا', f_icmp:'ICMP ID ‏(۰ تا ۶۵۵۳۵ یا 0x..)',
  f_socks:'پورت SOCKS5', f_tun:'تعداد تونل', f_mtu:'MTU', f_cwnd:'CWND اولیه', f_retries:'حداکثر تلاش مجدد', h_retries:'تعداد ارسال مجدد پیش از انصراف (۱ تا ۱۰۰)', f_rto:'حداقل RTO (ms)', h_rto:'کف زمان‌بندی ارسال مجدد؛ در شبکه‌های پرافت/پرتأخیر بالاتر بگذارید (۱۰ تا ۶۰۰۰۰)', f_key:'کلید pre-shared (خالی = ساخت خودکار)', gen:'ساخت', server:'سرور', client:'کلاینت',
  auto:'تشخیص خودکار', saved:'ذخیره شد', created:'تونل ساخته شد', link_hint:'این لینک را به طرف مقابل بدهید: تونل‌ها > وارد کردن لینک.', fp:'اثر انگشت', show:'نمایش',
- paste_link:'لینک candyspoof:// را بچسبانید', apply:'اعمال', pw_confirm:'برای نمایش کلید، رمز پنل را وارد کنید', reveal:'نمایش',
+ paste_link:'لینک shadowspoof:// را بچسبانید', apply:'اعمال', pw_confirm:'برای نمایش کلید، رمز پنل را وارد کنید', reveal:'نمایش',
  level:'سطح', search:'جستجو', lines:'تعداد خط', auto_refresh:'به‌روزرسانی خودکار', run:'اجرای بررسی', host:'هاست', port:'پورت', running:'در حال اجرا...', avg:'میانگین', handshake_ok:'هندشیک موفق',
  wd:'ری‌استارت دوره‌ای (watchdog)', wd_hint:'مستقل از بازیابی خطا (Restart=on-failure).', chg_pw:'تغییر رمز', old_pw:'رمز فعلی', new_pw:'رمز جدید (حداقل ۱۰ کاراکتر)',
  lang:'زبان', copied:'کپی شد', copy:'کپی', not_listening:'SOCKS5 در حال شنیدن نیست', last_est:'آخرین هندشیک', ago:'پیش', never:'هرگز', build:'نسخه', role:'نقش',
@@ -2880,7 +2892,7 @@ function renderLogin(){
   const err=h('div',{class:'err'});
   const go=async()=>{try{const r=await api('POST','/api/login',{password:pw.value});S.csrf=r.csrf;boot()}catch(e){err.textContent=e.message}};
   pw.addEventListener('keydown',e=>{if(e.key==='Enter')go()});
-  root.append(h('div',{class:'login'},h('div',{class:'logo',text:''},h('b',{text:'Candy'}),'-Spoof'),h('div',{class:'card'},h('label',{class:'f'},h('span',{text:t('password')}),pw),err,h('button',{class:'btn pri',onclick:go,text:t('login')}))));
+  root.append(h('div',{class:'login'},h('div',{class:'logo',text:''},h('b',{text:'Shadow'}),' Spoof'),h('div',{class:'card'},h('label',{class:'f'},h('span',{text:t('password')}),pw),err,h('button',{class:'btn pri',onclick:go,text:t('login')}))));
   pw.focus();
 }
 
@@ -2897,7 +2909,7 @@ function renderShell(){
   const root=document.getElementById('app');root.replaceChildren();
   const tabs=['overview','tunnels','logs','health','diagnose','settings'];
   root.append(
-    h('header',{class:'top'},h('div',{class:'logo'},h('b',{text:'Candy'}),'-Spoof'),h('span',{class:'tag',text:S.meta.role||'?'}),h('div',{class:'sp'}),h('button',{class:'btn sm',onclick:()=>{S.lang=S.lang==='fa'?'en':'fa';localStorage.setItem('lang',S.lang);renderShell()},text:S.lang==='fa'?'EN':'FA'})),
+    h('header',{class:'top'},h('div',{class:'logo'},h('b',{text:'Shadow'}),' Spoof'),h('span',{class:'tag',text:S.meta.role||'?'}),h('div',{class:'sp'}),h('button',{class:'btn sm',onclick:()=>{S.lang=S.lang==='fa'?'en':'fa';localStorage.setItem('lang',S.lang);renderShell()},text:S.lang==='fa'?'EN':'FA'})),
     h('div',{class:'wrap',id:'main'}),
     h('nav',{class:'dock'},tabs.map(v=>h('button',{class:S.view===v?'on':'',onclick:()=>{S.view=v;renderShell()},text:t(v)})))
   );
@@ -3022,7 +3034,7 @@ function formModal(mode,x,prefill){
   openModal([h('h3',{text:mode==='edit'?`${t('edit')}: ${x.name}`:t('create')}),h('div',{class:'two'},rows),globalErr,h('div',{class:'row'},save,h('button',{class:'btn',onclick:closeModal,text:t('cancel')}))]);
 }
 function importModal(){
-  const ta=h('input',{class:'mono',placeholder:'candyspoof://...'}),err=h('div',{class:'err'});
+  const ta=h('input',{class:'mono',placeholder:'shadowspoof://...'}),err=h('div',{class:'err'});
   const go=async()=>{try{const r=await api('POST','/api/link/parse',{link:ta.value});closeModal();formModal('create',null,r.fields)}catch(e){if(!e.handled)err.textContent=e.message}};
   openModal([h('h3',{text:t('import')}),h('label',{class:'f'},h('span',{text:t('paste_link')}),ta),err,h('div',{class:'row'},h('button',{class:'btn pri',onclick:go,text:t('apply')}),h('button',{class:'btn',onclick:closeModal,text:t('cancel')}))]);
 }
@@ -3098,7 +3110,7 @@ function viewHealth(m){
 /* ---------- diagnose (tunnel doctor) ---------- */
 function viewDiagnose(m){
   const sev={ok:'\u2713',warn:'!',fail:'\u2715',info:'i'};
-  const link=h('input',{class:'mono',placeholder:'candyspoof://\u2026',autocapitalize:'off',autocomplete:'off',spellcheck:'false'});
+  const link=h('input',{class:'mono',placeholder:'shadowspoof://\u2026',autocapitalize:'off',autocomplete:'off',spellcheck:'false'});
   const out=h('div',{class:'card'});
   const run=async()=>{
     out.replaceChildren(h('div',{class:'lbl',text:t('running')}));
@@ -3160,7 +3172,7 @@ class Req(object):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CandyPanel"
+    server_version = "ShadowPanel"
     sys_version = ""
     timeout = 30
     protocol_version = "HTTP/1.1"
@@ -3350,7 +3362,7 @@ class Server(ThreadingHTTPServer):
 def cmd_panel():
     cfg = load_panel()
     if not cfg.get("pw"):
-        sys.exit("panel: no password configured (run: candyctl panel passwd)")
+        sys.exit("panel: no password configured (run: shadowctl panel passwd)")
     bind, port = cfg.get("bind", "127.0.0.1"), int(cfg.get("port", 7777))
     srv = Server((bind, port), Handler)
     srv.tls = False
@@ -3390,10 +3402,10 @@ def cmd_monitor_view():
             st = load_state()
             out = []
             if not st or time.time() - st.get("ts", 0) > 30:
-                out.append(C["r"] + "monitor service is not running (systemctl start candy-spoof-monitor)" + C["0"])
+                out.append(C["r"] + "monitor service is not running (systemctl start shadow-spoof-monitor)" + C["0"])
             else:
                 s = st["system"]
-                out.append("%sCandy-Spoof monitor%s  role=%s  cpu %.0f%%  mem %s/%s  load %s  up %s" % (
+                out.append("%sShadow Spoof monitor%s  role=%s  cpu %.0f%%  mem %s/%s  load %s  up %s" % (
                     C["b"], C["0"], st["role"], s["cpu"], human(s["mem_used"]), human(s["mem_total"]),
                     " ".join("%.2f" % x for x in s["load"]), dur(s["uptime"])))
                 out.append("")
@@ -3427,7 +3439,7 @@ def cmd_log_view(minlevel):
     minl = LEVEL_ORDER.get((minlevel or "info").upper(), 2)
     col = {"ERROR": "\033[31m", "WARN": "\033[33m", "INFO": "\033[0m", "DEBUG": "\033[2m", "TRACE": "\033[2m"}
     p = subprocess.Popen([JOURNALCTL, "-f", "-n", "50", "--no-pager", "-q", "-o", "json",
-                          "-u", "candy-spoof-%s.service" % role, "-u", "candy-spoof-%s@*.service" % role],
+                          "-u", "shadow-spoof-%s.service" % role, "-u", "shadow-spoof-%s@*.service" % role],
                          stdout=subprocess.PIPE, text=True)
     try:
         for line in p.stdout:
@@ -3456,7 +3468,7 @@ def panel_url(cfg):
 
 
 def cmd_admin(argv):
-    ap = argparse.ArgumentParser(prog="candy-panel admin")
+    ap = argparse.ArgumentParser(prog="shadow-panel admin")
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("init")
     a.add_argument("--bind", default="127.0.0.1")
@@ -3515,7 +3527,7 @@ def _pick_inst(name):
 
 
 def cmd_test(argv):
-    ap = argparse.ArgumentParser(prog="candyctl test")
+    ap = argparse.ArgumentParser(prog="shadowctl test")
     ap.add_argument("-t", "--tunnel", default="")
     ap.add_argument("--host", default="example.com")
     ap.add_argument("--port", type=int, default=80)
@@ -3523,7 +3535,7 @@ def cmd_test(argv):
     a = ap.parse_args(argv)
     inst = _pick_inst(a.tunnel)
     if inst.role == "server":
-        print("Server test: capturing for %ds. Run 'candyctl test' on the CLIENT now.\n" % a.secs)
+        print("Server test: capturing for %ds. Run 'shadowctl test' on the CLIENT now.\n" % a.secs)
     else:
         print("Testing tunnel '%s' via %s:%d (takes ~20 s)...\n" % (inst.name, a.host, a.port))
     r = run_test(inst, a.host, a.port, a.secs)
@@ -3538,7 +3550,7 @@ def cmd_test(argv):
 
 
 def cmd_cfg(argv):
-    ap = argparse.ArgumentParser(prog="candyctl set")
+    ap = argparse.ArgumentParser(prog="shadowctl set")
     ap.add_argument("action", choices=["set", "edit", "show"])
     ap.add_argument("-t", "--tunnel", default="")
     ap.add_argument("pairs", nargs="*")
@@ -3562,11 +3574,11 @@ def cmd_cfg(argv):
                 data[k] = v.strip().strip('"')
             if not data:
                 sys.exit("nothing to set")
-            active, warn = apply_edit(inst, data, "edited with candyctl")
+            active, warn = apply_edit(inst, data, "edited with shadowctl")
         else:
             editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or next(
                 (e for e in ("nano", "vi") if subprocess.call(["which", e], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0), "vi")
-            fd, tmp = tempfile.mkstemp(prefix="candy-edit-", suffix=".toml")
+            fd, tmp = tempfile.mkstemp(prefix="shadow-edit-", suffix=".toml")
             os.close(fd)
             try:
                 with open(tmp, "w") as f:
@@ -3583,7 +3595,7 @@ def cmd_cfg(argv):
                     if input("\n[Enter] edit again, [q] discard: ").strip().lower() == "q":
                         print("discarded")
                         return
-                active, warn = apply_edit(inst, data, "edited with candyctl")
+                active, warn = apply_edit(inst, data, "edited with shadowctl")
             finally:
                 try:
                     os.unlink(tmp)
@@ -3619,7 +3631,7 @@ def cmd_link(argv):
 
 
 def cmd_diagnose(argv):
-    ap = argparse.ArgumentParser(prog="candyctl diagnose")
+    ap = argparse.ArgumentParser(prog="shadowctl diagnose")
     ap.add_argument("-t", "--tunnel", default="main")
     ap.add_argument("--link", default="")
     args = ap.parse_args(argv)
@@ -3680,7 +3692,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-CANDY_PANEL_PY_EOF
+SHADOW_PANEL_PY_EOF
   chmod 0755 "$PANEL_PY.new"; chown root:root "$PANEL_PY.new"
   if ! cmp -s "$PANEL_PY.new" "$PANEL_PY" 2>/dev/null; then PANEL_CHANGED=1; fi
   mv -f "$PANEL_PY.new" "$PANEL_PY"
@@ -3691,7 +3703,7 @@ link_prefill() { # let the operator paste the setup link produced by the other s
   [[ $NONINTERACTIVE == 1 ]] && return 0
   local link out k v
   echo >&2
-  printf 'Paste the candyspoof:// setup link from the other side (Enter = type values manually): ' >&2
+  printf 'Paste the shadowspoof:// setup link from the other side (Enter = type values manually): ' >&2
   IFS= read -r link <"$TTY_IN" || return 0
   link=${link//[[:space:]]/}
   [[ -z $link ]] && return 0
@@ -3702,10 +3714,10 @@ link_prefill() { # let the operator paste the setup link produced by the other s
   while IFS=$'\t' read -r k v; do
     case $k in
       real_ip|peer_real_ip|spoofed_ip|peer_spoofed_ip|data_port|icmp_id|tunnel_count|mtu|initial_cwnd)
-        printf -v "CANDY_${k^^}" '%s' "$v"; export "CANDY_${k^^}" ;;
-      pre_shared_key) CANDY_PRE_SHARED_KEY=$v; export CANDY_PRE_SHARED_KEY ;;
-      spoofed_pool)   CANDY_SPOOFED_POOL=$v; export CANDY_SPOOFED_POOL ;;
-      peer_pool)      CANDY_PEER_POOL=$v; export CANDY_PEER_POOL ;;
+        printf -v "SHADOW_${k^^}" '%s' "$v"; export "SHADOW_${k^^}" ;;
+      pre_shared_key) SHADOW_PRE_SHARED_KEY=$v; export SHADOW_PRE_SHARED_KEY ;;
+      spoofed_pool)   SHADOW_SPOOFED_POOL=$v; export SHADOW_SPOOFED_POOL ;;
+      peer_pool)      SHADOW_PEER_POOL=$v; export SHADOW_PEER_POOL ;;
     esac
   done <<<"$out"
   ok "Loaded the link - you will only be asked for values that are local to this host."
@@ -3715,7 +3727,7 @@ ensure_panel_cert() {
   [[ -f $ETC_DIR/panel.crt && -f $ETC_DIR/panel.key ]] && return 0
   command -v openssl >/dev/null || die "openssl is required for HTTPS (install it or choose HTTP)"
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
-    -subj "/CN=candy-spoof" -keyout "$ETC_DIR/panel.key" -out "$ETC_DIR/panel.crt" >/dev/null 2>&1
+    -subj "/CN=shadow-spoof" -keyout "$ETC_DIR/panel.key" -out "$ETC_DIR/panel.crt" >/dev/null 2>&1
   chmod 0600 "$ETC_DIR/panel.key"; chmod 0644 "$ETC_DIR/panel.crt"
 }
 
@@ -3723,11 +3735,11 @@ ask_panel() {
   PANEL_ENABLE=1
   if [[ -f $PANEL_JSON ]]; then
     PANEL_KEEP=1
-    if [[ $NONINTERACTIVE == 1 ]]; then [[ ${CANDY_PANEL_RECONFIGURE:-0} == 1 ]] && PANEL_KEEP=0
+    if [[ $NONINTERACTIVE == 1 ]]; then [[ ${SHADOW_PANEL_RECONFIGURE:-0} == 1 ]] && PANEL_KEEP=0
     elif ! ask_yn "Web panel is already configured. Keep its settings?" y; then PANEL_KEEP=0; fi
     (( PANEL_KEEP )) && return 0
   fi
-  if [[ ${CANDY_PANEL-} == 0 ]]; then PANEL_ENABLE=0; return 0; fi
+  if [[ ${SHADOW_PANEL-} == 0 ]]; then PANEL_ENABLE=0; return 0; fi
   if [[ $NONINTERACTIVE != 1 ]]; then
     echo >&2
     ask_yn "Install the web panel (monitor tunnels, create/edit tunnels, run tests)?" y || { PANEL_ENABLE=0; return 0; }
@@ -3737,7 +3749,7 @@ ask_panel() {
   ask panel_port "Panel port" "7777" v_port "1-65535"
   PANEL_BIND=$panel_bind; PANEL_PORT=$((10#$panel_port)); PANEL_TLS=0
   if [[ $PANEL_BIND != 127.* ]]; then
-    if [[ -n ${CANDY_PANEL_TLS-} ]]; then [[ $CANDY_PANEL_TLS == 1 ]] && PANEL_TLS=1
+    if [[ -n ${SHADOW_PANEL_TLS-} ]]; then [[ $SHADOW_PANEL_TLS == 1 ]] && PANEL_TLS=1
     elif ask_yn "Serve the panel over HTTPS with a self-signed certificate?" y; then PANEL_TLS=1; fi
     warn "The panel is reachable from the network: open TCP/$PANEL_PORT only to addresses you trust."
   fi
@@ -3745,10 +3757,10 @@ ask_panel() {
 
 write_aux_units() {
   local py; py=$(command -v python3)
-  cat >"$UNIT_DIR/candy-spoof-monitor.service" <<UNIT
+  cat >"$UNIT_DIR/shadow-spoof-monitor.service" <<UNIT
 [Unit]
-Description=Candy-Spoof monitor (metrics and log sampler)
-After=candy-spoof-$ROLE.service
+Description=Shadow Spoof monitor (metrics and log sampler)
+After=shadow-spoof-$ROLE.service
 
 [Service]
 Type=simple
@@ -3759,7 +3771,7 @@ ExecStart=$py $PANEL_PY monitor
 Restart=always
 RestartSec=3
 Environment=PYTHONDONTWRITEBYTECODE=1
-RuntimeDirectory=candy-spoof
+RuntimeDirectory=shadow-spoof
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
 ReadWritePaths=$STATE_DIR/monitor
@@ -3786,11 +3798,11 @@ UMask=0022
 [Install]
 WantedBy=multi-user.target
 UNIT
-  cat >"$UNIT_DIR/candy-spoof-panel.service" <<UNIT
+  cat >"$UNIT_DIR/shadow-spoof-panel.service" <<UNIT
 [Unit]
-Description=Candy-Spoof web panel
+Description=Shadow Spoof web panel
 Wants=network-online.target
-After=network-online.target candy-spoof-monitor.service
+After=network-online.target shadow-spoof-monitor.service
 
 [Service]
 Type=simple
@@ -3821,41 +3833,41 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 UNIT
-  chmod 0644 "$UNIT_DIR/candy-spoof-monitor.service" "$UNIT_DIR/candy-spoof-panel.service"
+  chmod 0644 "$UNIT_DIR/shadow-spoof-monitor.service" "$UNIT_DIR/shadow-spoof-panel.service"
 }
 
 setup_panel() {
   write_aux_units
   systemctl daemon-reload
-  # monitor: always (feeds `candyctl monitor` and the panel)
-  systemctl enable candy-spoof-monitor.service >/dev/null 2>&1
-  if systemctl is-active --quiet candy-spoof-monitor.service; then
-    (( PANEL_CHANGED )) && systemctl restart candy-spoof-monitor.service
-  else systemctl start candy-spoof-monitor.service; fi
-  ok "Monitor service running (candyctl monitor)"
+  # monitor: always (feeds `shadowctl monitor` and the panel)
+  systemctl enable shadow-spoof-monitor.service >/dev/null 2>&1
+  if systemctl is-active --quiet shadow-spoof-monitor.service; then
+    (( PANEL_CHANGED )) && systemctl restart shadow-spoof-monitor.service
+  else systemctl start shadow-spoof-monitor.service; fi
+  ok "Monitor service running (shadowctl monitor)"
   if (( ! PANEL_ENABLE )); then return 0; fi
 
   if (( ! PANEL_KEEP )); then
     "${PY3[@]}" admin init --bind "$PANEL_BIND" --port "$PANEL_PORT" --tls "$PANEL_TLS"
-    if [[ -n ${CANDY_PANEL_PASSWORD-} ]]; then
-      printf '%s\n' "$CANDY_PANEL_PASSWORD" | "${PY3[@]}" admin passwd || die "CANDY_PANEL_PASSWORD must be at least 10 characters"
-      PANEL_PW_SHOWN=$CANDY_PANEL_PASSWORD
+    if [[ -n ${SHADOW_PANEL_PASSWORD-} ]]; then
+      printf '%s\n' "$SHADOW_PANEL_PASSWORD" | "${PY3[@]}" admin passwd || die "SHADOW_PANEL_PASSWORD must be at least 10 characters"
+      PANEL_PW_SHOWN=$SHADOW_PANEL_PASSWORD
     else
       PANEL_PW_SHOWN=$("${PY3[@]}" admin passwd-random)
     fi
   fi
   if grep -q '"tls": true' "$PANEL_JSON"; then ensure_panel_cert; fi
-  systemctl enable candy-spoof-panel.service >/dev/null 2>&1
-  if systemctl is-active --quiet candy-spoof-panel.service; then
-    if (( PANEL_CHANGED || ! PANEL_KEEP )); then systemctl restart candy-spoof-panel.service; fi
-  else systemctl start candy-spoof-panel.service; fi
+  systemctl enable shadow-spoof-panel.service >/dev/null 2>&1
+  if systemctl is-active --quiet shadow-spoof-panel.service; then
+    if (( PANEL_CHANGED || ! PANEL_KEEP )); then systemctl restart shadow-spoof-panel.service; fi
+  else systemctl start shadow-spoof-panel.service; fi
   sleep 1
-  systemctl is-active --quiet candy-spoof-panel.service || { journalctl -u candy-spoof-panel.service -n 20 --no-pager >&2 || true; die "panel failed to start"; }
+  systemctl is-active --quiet shadow-spoof-panel.service || { journalctl -u shadow-spoof-panel.service -n 20 --no-pager >&2 || true; die "panel failed to start"; }
   ok "Web panel running at $("${PY3[@]}" admin info)"
 }
 
 setup_watchdog() {
-  local want=${CANDY_WATCHDOG-}
+  local want=${SHADOW_WATCHDOG-}
   if [[ -z $want ]]; then
     if [[ -r $ETC_DIR/watchdog ]]; then want=$(<"$ETC_DIR/watchdog")
     elif [[ $NONINTERACTIVE == 1 ]]; then want=off
@@ -3868,12 +3880,12 @@ setup_watchdog() {
       done
     fi
   fi
-  "$CANDYCTL" watchdog "$want" >/dev/null
+  "$SHADOWCTL" watchdog "$want" >/dev/null
   ok "Watchdog: $want"
 }
 
 verify_config() { # validate $CONF with the built binary before (re)starting the service
-  local bin=$BIN_DIR/candy-spoof-$ROLE out rc
+  local bin=$BIN_DIR/shadow-spoof-$ROLE out rc
   [[ -x $bin ]] || return 0
   out=$("$bin" --config "$CONF" --check-config 2>&1); rc=$?
   case $rc in
@@ -3887,7 +3899,7 @@ verify_config() { # validate $CONF with the built binary before (re)starting the
 }
 
 start_service() {
-  local unit=candy-spoof-$ROLE.service
+  local unit=shadow-spoof-$ROLE.service
   verify_config
   systemctl daemon-reload
   systemctl enable "$unit" >/dev/null 2>&1
@@ -3914,13 +3926,13 @@ start_service() {
 summary() {
   echo >&2
   ok "Installation complete ($ROLE @ ${BUILD_REF:0:12})"
-  echo "  candyctl status | tunnels | test | monitor | logs | config edit | set k=v | watchdog <v>" >&2
+  echo "  shadowctl status | tunnels | test | monitor | logs | config edit | set k=v | watchdog <v>" >&2
   if [[ $ROLE == client ]]; then
-    echo "  candyctl socks-port <PORT>   change the local SOCKS5 port" >&2
-    echo "  Test the tunnel end to end:  candyctl test" >&2
+    echo "  shadowctl socks-port <PORT>   change the local SOCKS5 port" >&2
+    echo "  Test the tunnel end to end:  shadowctl test" >&2
   else
     echo "  Make sure the firewall passes inbound UDP/$(cfg_get data_port) and ICMP echo from the client." >&2
-    echo "  Then run  candyctl test  on the server AND on the client at the same time." >&2
+    echo "  Then run  shadowctl test  on the server AND on the client at the same time." >&2
   fi
   warn "pre_shared_key is validated but not yet enforced on the wire (packets are not authenticated); interface is now bound via SO_BINDTODEVICE."
 }
@@ -3933,7 +3945,7 @@ final_report() { # printed last, to the terminal only (never to logs)
   {
     echo
     echo "=================================================================="
-    echo " PRE-SHARED KEY  (show again any time:  candyctl token)"
+    echo " PRE-SHARED KEY  (show again any time:  shadowctl token)"
     echo
     echo "   $key"
     echo
@@ -3950,7 +3962,7 @@ final_report() { # printed last, to the terminal only (never to logs)
       echo
       echo " WEB PANEL: $("${PY3[@]}" admin info)"
       if [[ -n $PANEL_PW_SHOWN ]]; then echo "   password: $PANEL_PW_SHOWN   (shown once)"
-      else echo "   password: unchanged  (reset with: candyctl panel passwd)"; fi
+      else echo "   password: unchanged  (reset with: shadowctl panel passwd)"; fi
       if [[ $("${PY3[@]}" admin info) == *//127.0.0.1:* ]]; then
         echo "   local only - from your PC:  ssh -L 7777:127.0.0.1:$(sed -n 's/.*"port": *\([0-9]*\).*/\1/p' "$PANEL_JSON") root@<this-server>"
       fi
@@ -3960,11 +3972,31 @@ final_report() { # printed last, to the terminal only (never to logs)
   } >"$out"
 }
 
+migrate_legacy() { # move a pre-rename candy-spoof install to the shadow-spoof layout
+  local old_etc=/etc/candy-spoof old_state=/var/lib/candy-spoof old_lib=/usr/local/lib/candy-spoof
+  [[ -d $old_etc && ! -e $ETC_DIR ]] || return 0
+  warn "Legacy 'candy-spoof' install found - migrating to 'shadow-spoof' (config, keys and tunnels are preserved)"
+  local u
+  for u in $(systemctl list-unit-files --no-legend 'candy-spoof-*' 2>/dev/null | awk '{print $1}'); do
+    systemctl disable --now "$u" >/dev/null 2>&1 || true
+  done
+  rm -f  /etc/systemd/system/candy-spoof-*.service /etc/systemd/system/candy-spoof-*.timer 2>/dev/null || true
+  rm -rf /etc/systemd/system/candy-spoof-*.service.d 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  mkdir -p "$(dirname "$ETC_DIR")"; mv "$old_etc" "$ETC_DIR"
+  if [[ -d $old_state ]]; then rm -rf "$STATE_DIR"; mkdir -p "$(dirname "$STATE_DIR")"; mv "$old_state" "$STATE_DIR"; fi
+  rm -f  /usr/local/bin/candy-spoof-client /usr/local/bin/candy-spoof-server \
+         /usr/local/bin/candyctl /usr/local/bin/candyshadow 2>/dev/null || true
+  rm -rf "$old_lib" 2>/dev/null || true
+  ok "Migrated $old_etc -> $ETC_DIR"
+}
+
 main() {
   parse_args "$@"
   require_root "$@"
   require_env
   setup_tty
+  migrate_legacy
   choose_role
   install_deps
   ensure_user
@@ -3973,8 +4005,8 @@ main() {
   ask_panel
   configure
   write_service_unit
-  install_candyctl
-  install_candyshadow
+  install_shadowctl
+  install_shadowspoof
   setup_watchdog
   start_service
   setup_panel

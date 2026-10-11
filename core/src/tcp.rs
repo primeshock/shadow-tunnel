@@ -7,7 +7,7 @@
 //! Because TCP already provides reliable, ordered, flow-controlled delivery,
 //! this path does **not** use the ARQ / congestion-control / heartbeat
 //! machinery of the spoof transport.  It authenticates the session *setup* with
-//! the pre-shared key (HMAC, reusing the authenticated [`CandyPacket`] frame)
+//! the pre-shared key (HMAC, reusing the authenticated [`ShadowPacket`] frame)
 //! and then splices bytes in both directions.
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::Config;
-use crate::packet::CandyPacket;
+use crate::packet::ShadowPacket;
 
 const MAX_FRAME: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -50,14 +50,14 @@ async fn read_frame(s: &mut TcpStream) -> Result<Bytes> {
 
 /// Send one authenticated control message carrying `text`.
 async fn send_ctrl(s: &mut TcpStream, key: &[u8], text: &str) -> Result<()> {
-    let pkt = CandyPacket::new_data(0, 0, 0, 0, Bytes::copy_from_slice(text.as_bytes()));
+    let pkt = ShadowPacket::new_data(0, 0, 0, 0, Bytes::copy_from_slice(text.as_bytes()));
     write_frame(s, &pkt.encode_authenticated(key)).await
 }
 
 /// Receive and authenticate one control message, returning its text.
 async fn recv_ctrl(s: &mut TcpStream, key: &[u8]) -> Result<String> {
     let frame = read_frame(s).await?;
-    let pkt = CandyPacket::decode_authenticated(frame, key)
+    let pkt = ShadowPacket::decode_authenticated(frame, key)
         .context("authentication failed (wrong pre_shared_key?)")?;
     Ok(String::from_utf8_lossy(&pkt.payload).into_owned())
 }

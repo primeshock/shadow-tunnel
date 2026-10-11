@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use crate::arq::{SrArq, MAX_WINDOW};
 use crate::congestion::CongestionControl;
 use crate::config::{Config, Tuning};
-use crate::packet::{CandyPacket, PacketKind};
+use crate::packet::{ShadowPacket, PacketKind};
 use crate::raw_socket::{OutPacket, RawSender};
 
 const HEARTBEAT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -100,7 +100,7 @@ impl Tunnel {
         self.arq.update_rto(self.cc.rtt.rto);
     }
 
-    fn apply_syn_ack(&mut self, syn_ack: &CandyPacket) -> bool {
+    fn apply_syn_ack(&mut self, syn_ack: &ShadowPacket) -> bool {
         if self.state != TunnelState::SynSent {
             return false;
         }
@@ -111,11 +111,11 @@ impl Tunnel {
         true
     }
 
-    fn make_data_packet(&mut self, payload: Bytes) -> CandyPacket {
+    fn make_data_packet(&mut self, payload: Bytes) -> ShadowPacket {
         const UNASSIGNED_SEQ: u32 = u32::MAX;
         let ack    = self.arq.recv_base();
         let window = (MAX_WINDOW.saturating_sub(self.arq.in_flight())) as u16;
-        let mut pkt = CandyPacket::new_data(self.id, UNASSIGNED_SEQ, ack, window, payload);
+        let mut pkt = ShadowPacket::new_data(self.id, UNASSIGNED_SEQ, ack, window, payload);
         let _seq = self.arq.enqueue(&mut pkt); // assigns sequence and buffers retransmit copy
         pkt
     }
@@ -205,7 +205,7 @@ impl TunnelManager {
         self.spawn_send_task(id, net_rx, window_notify);
 
         // Send the initial SYN on the control channel.
-        let syn = CandyPacket::new_syn(id, syn_seq);
+        let syn = ShadowPacket::new_syn(id, syn_seq);
         self.tx_control(syn).await?;
 
         log::info!("tunnel {} opened (SYN sent)", id);
@@ -219,7 +219,7 @@ impl TunnelManager {
     /// Returns the same triple as `open_tunnel`.
     pub async fn accept_syn(
         &self,
-        syn:    CandyPacket,
+        syn:    ShadowPacket,
         src_ip: Ipv4Addr,
     ) -> Result<(u32, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>)> {
         let id = syn.tunnel_id;
@@ -249,7 +249,7 @@ impl TunnelManager {
 
         self.spawn_send_task(id, net_rx, window_notify);
 
-        let syn_ack = CandyPacket::new_syn_ack(id, syn.seq, our_seq);
+        let syn_ack = ShadowPacket::new_syn_ack(id, syn.seq, our_seq);
         self.tx_control(syn_ack).await?;
 
         log::info!("tunnel {} accepted from {}", id, src_ip);
@@ -264,7 +264,7 @@ impl TunnelManager {
         }
         self.0.established_notifiers.remove(&id);
 
-        let fin = CandyPacket::new_fin(id);
+        let fin = ShadowPacket::new_fin(id);
         let _ = self.tx_control(fin).await;
     }
 
@@ -277,8 +277,8 @@ impl TunnelManager {
     pub async fn handle_incoming(
         &self,
         src_ip: Ipv4Addr,
-        pkt:    CandyPacket,
-    ) -> Result<Option<(CandyPacket, Ipv4Addr)>> {
+        pkt:    ShadowPacket,
+    ) -> Result<Option<(ShadowPacket, Ipv4Addr)>> {
         // SYN packets are not handled internally – hand them back to the caller.
         if pkt.kind == PacketKind::Syn {
             return Ok(Some((pkt, src_ip)));
@@ -305,7 +305,7 @@ impl TunnelManager {
                     let tid    = t.id;
                     let notify = t.established_notify.clone();
                     let wnotify = t.window_notify.clone();
-                    let ack = CandyPacket::new_ack(tid, pkt.seq.wrapping_add(1), MAX_WINDOW as u16);
+                    let ack = ShadowPacket::new_ack(tid, pkt.seq.wrapping_add(1), MAX_WINDOW as u16);
                     drop(t);
                     // Wake the task waiting for establishment.  Use
                     // `notify_one`, not `notify_waiters`: the SYN-ACK can be
@@ -358,9 +358,9 @@ impl TunnelManager {
                     }
                 }
 
-                self.tx_control(CandyPacket::new_ack(tid, ack_num, window)).await?;
+                self.tx_control(ShadowPacket::new_ack(tid, ack_num, window)).await?;
                 for missing in nacks {
-                    self.tx_control(CandyPacket::new_nack(tid, missing)).await?;
+                    self.tx_control(ShadowPacket::new_nack(tid, missing)).await?;
                 }
             }
 
@@ -371,7 +371,7 @@ impl TunnelManager {
 
             PacketKind::Heartbeat => {
                 let tid  = t.id;
-                let hb_ack = CandyPacket {
+                let hb_ack = ShadowPacket {
                     kind:      PacketKind::HeartbeatAck,
                     tunnel_id: tid,
                     seq:       pkt.seq,
@@ -437,7 +437,7 @@ impl TunnelManager {
                     && now.duration_since(t.last_heartbeat_sent) >= HEARTBEAT_MIN_INTERVAL
                 {
                     t.last_heartbeat_sent = now;
-                    hbs.push(CandyPacket::new_heartbeat(t.id, rand::random()));
+                    hbs.push(ShadowPacket::new_heartbeat(t.id, rand::random()));
                 }
             }
 
@@ -556,7 +556,7 @@ impl TunnelManager {
         self.tx_data(pkt).await
     }
 
-    async fn tx_control(&self, pkt: CandyPacket) -> Result<()> {
+    async fn tx_control(&self, pkt: ShadowPacket) -> Result<()> {
         let a   = &self.0.addr;
         let enc = pkt.encode_authenticated(&self.0.key);
         let out = OutPacket::Icmp {
@@ -569,7 +569,7 @@ impl TunnelManager {
         self.0.sender.send(out).await
     }
 
-    async fn tx_data(&self, pkt: CandyPacket) -> Result<()> {
+    async fn tx_data(&self, pkt: ShadowPacket) -> Result<()> {
         let a   = &self.0.addr;
         let enc = pkt.encode_authenticated(&self.0.key);
         let out = OutPacket::Udp {
@@ -592,7 +592,7 @@ mod tests {
         const PEER_SEQ: u32 = 777;
         let (app_tx, _app_rx) = mpsc::channel::<Bytes>(1);
         let mut tunnel = Tunnel::new(1, TunnelState::SynSent, 100, 0, app_tx, 10.0, Tuning::default());
-        let syn_ack = CandyPacket::new_syn_ack(1, 99, PEER_SEQ);
+        let syn_ack = ShadowPacket::new_syn_ack(1, 99, PEER_SEQ);
 
         assert_eq!(tunnel.arq.recv_base(), 0);
         assert!(tunnel.apply_syn_ack(&syn_ack));
@@ -629,7 +629,7 @@ mod tests {
             10.0,
             Tuning::default(),
         );
-        let syn_ack = CandyPacket::new_syn_ack(TID, PEER_SEQ, OUR_SYN_ACK_SEQ);
+        let syn_ack = ShadowPacket::new_syn_ack(TID, PEER_SEQ, OUR_SYN_ACK_SEQ);
         let first_data = tunnel.make_data_packet(Bytes::from_static(b"x"));
 
         assert_eq!(first_data.seq, syn_ack.seq.wrapping_add(1));

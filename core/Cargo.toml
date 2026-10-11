@@ -1,5 +1,5 @@
 [package]
-name = "candy-spoof"
+name = "shadow-spoof"
 version = "0.1.0"
 edition = "2021"
 authors = ["AmiRCandy"]
@@ -44,7 +44,7 @@ rand = "0.8"
 # Byte manipulation
 bytes = "1"
 
-# Packet authentication (keyed HMAC over each CandyPacket using the PSK)
+# Packet authentication (keyed HMAC over each ShadowPacket using the PSK)
 hmac = "0.12"
 sha2 = "0.10"
 

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use crate::packet::CandyPacket;
+use crate::packet::ShadowPacket;
 
 /// Maximum allowed send/receive window size.
 pub const MAX_WINDOW: u32 = 128;
@@ -22,7 +22,7 @@ pub const DEFAULT_RTO: Duration = Duration::from_millis(500);
 // ── Internal book-keeping ─────────────────────────────────────────────────────
 
 struct SendSlot {
-    packet:      CandyPacket,
+    packet:      ShadowPacket,
     sent_at:     Instant,
     retry_count: u32,
 }
@@ -39,7 +39,7 @@ pub struct SrArq {
 
     // Receiver
     recv_base: u32,
-    recv_buf:  HashMap<u32, CandyPacket>,
+    recv_buf:  HashMap<u32, ShadowPacket>,
 
     /// Current retransmission timeout.
     pub rto: Duration,
@@ -83,7 +83,7 @@ impl SrArq {
 
     /// Assign a sequence number and buffer the packet for potential
     /// retransmission.  Returns the sequence number.
-    pub fn enqueue(&mut self, pkt: &mut CandyPacket) -> u32 {
+    pub fn enqueue(&mut self, pkt: &mut ShadowPacket) -> u32 {
         let seq = self.send_next;
         pkt.seq = seq;
         self.send_buf.insert(seq, SendSlot {
@@ -117,7 +117,7 @@ impl SrArq {
 
     /// Process a NACK requesting retransmission of `seq`.  Returns the packet
     /// to resend, or `None` if `seq` is unknown or exhausted retries.
-    pub fn process_nack(&mut self, seq: u32) -> Option<CandyPacket> {
+    pub fn process_nack(&mut self, seq: u32) -> Option<ShadowPacket> {
         let slot = self.send_buf.get_mut(&seq)?;
         if slot.retry_count >= self.max_retries {
             log::warn!("ARQ: seq {} exceeded max retries – dropping", seq);
@@ -130,7 +130,7 @@ impl SrArq {
 
     /// Collect all in-flight packets whose RTO has expired.  The caller should
     /// retransmit them and notify the congestion controller.
-    pub fn take_timed_out(&mut self) -> Vec<CandyPacket> {
+    pub fn take_timed_out(&mut self) -> Vec<ShadowPacket> {
         let now = Instant::now();
         let rto = self.rto;
         let mut expired = Vec::new();
@@ -154,7 +154,7 @@ impl SrArq {
     /// - `deliverable`: payloads that are now in order and ready for the application
     /// - `ack_num`: the next seq we expect (use in the next ACK packet)
     /// - `nacks`: seq numbers of detected gaps (request retransmission)
-    pub fn receive(&mut self, pkt: CandyPacket) -> (Vec<Bytes>, u32, Vec<u32>) {
+    pub fn receive(&mut self, pkt: ShadowPacket) -> (Vec<Bytes>, u32, Vec<u32>) {
         let seq = pkt.seq;
         let mut deliverable = Vec::new();
         let mut nacks = Vec::new();
@@ -211,10 +211,10 @@ fn seq_before(a: u32, b: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::CandyPacket;
+    use crate::packet::ShadowPacket;
 
-    fn data_pkt(seq: u32) -> CandyPacket {
-        CandyPacket::new_data(1, seq, 0, 64, bytes::Bytes::from(vec![seq as u8]))
+    fn data_pkt(seq: u32) -> ShadowPacket {
+        ShadowPacket::new_data(1, seq, 0, 64, bytes::Bytes::from(vec![seq as u8]))
     }
 
     #[test]

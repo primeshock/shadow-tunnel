@@ -1,4 +1,4 @@
-//! Candy-Spoof wire protocol – the application-level packet that rides inside
+//! Shadow Spoof wire protocol – the application-level packet that rides inside
 //! spoofed UDP (data channel) or ICMP Echo (control channel) payloads.
 
 use anyhow::{bail, Result};
@@ -8,7 +8,7 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// 4-byte magic number at the start of every CandyPacket.
+/// 4-byte magic number at the start of every ShadowPacket.
 pub const MAGIC: u32 = 0xCA_FE_5F_00;
 /// Current protocol version.
 pub const VERSION: u8 = 1;
@@ -44,7 +44,7 @@ fn mac_tag(key: &[u8], bytes: &[u8]) -> [u8; MAC_LEN] {
     tag.copy_from_slice(&full[..MAC_LEN]);
     tag
 }
-/// Minimum wire size of a CandyPacket (no payload).
+/// Minimum wire size of a ShadowPacket (no payload).
 ///
 /// Layout: magic(4) + version(1) + kind(1) + tunnel_id(4) + seq(4) + ack(4)
 /// + window(2) = 20 bytes.  This MUST equal the number of bytes `encode`
@@ -52,7 +52,7 @@ fn mac_tag(key: &[u8], bytes: &[u8]) -> [u8; MAC_LEN] {
 /// pass the length guard and then panic reading past the end of the buffer.
 pub const HEADER_SIZE: usize = 20;
 
-/// Type of a CandyPacket.
+/// Type of a ShadowPacket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PacketKind {
@@ -91,14 +91,14 @@ impl TryFrom<u8> for PacketKind {
     }
 }
 
-/// An application-level Candy-Spoof packet.
+/// An application-level Shadow Spoof packet.
 ///
 /// Wire format (big-endian):
 /// ```text
 /// [magic:4][version:1][kind:1][tunnel_id:4][seq:4][ack:4][window:2][payload…]
 /// ```
 #[derive(Debug, Clone)]
-pub struct CandyPacket {
+pub struct ShadowPacket {
     pub kind:      PacketKind,
     pub tunnel_id: u32,
     /// Sequence number of this packet (data) or highest received seq + 1 (ack).
@@ -111,7 +111,7 @@ pub struct CandyPacket {
     pub payload:   Bytes,
 }
 
-impl CandyPacket {
+impl ShadowPacket {
     // ── Constructors ──────────────────────────────────────────────────────────
 
     pub fn new_syn(tunnel_id: u32, seq: u32) -> Self {
@@ -259,7 +259,7 @@ impl CandyPacket {
         let ack       = data.get_u32();
         let window    = data.get_u16();
         let payload   = data; // remaining bytes
-        Ok(CandyPacket { kind, tunnel_id, seq, ack, window, payload })
+        Ok(ShadowPacket { kind, tunnel_id, seq, ack, window, payload })
     }
 }
 
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn syn_uses_provided_sequence() {
-        let pkt = CandyPacket::new_syn(42, 12345);
+        let pkt = ShadowPacket::new_syn(42, 12345);
         assert_eq!(pkt.kind, PacketKind::Syn);
         assert_eq!(pkt.tunnel_id, 42);
         assert_eq!(pkt.seq, 12345);
@@ -278,20 +278,20 @@ mod tests {
     #[test]
     fn header_size_matches_encoded_header() {
         // An empty-payload packet must encode to exactly HEADER_SIZE bytes.
-        let pkt = CandyPacket::new_fin(7);
+        let pkt = ShadowPacket::new_fin(7);
         assert_eq!(pkt.encode().len(), HEADER_SIZE);
     }
 
     #[test]
     fn encode_decode_round_trips() {
-        let original = CandyPacket::new_data(
+        let original = ShadowPacket::new_data(
             0xDEAD_BEEF,
             0x0102_0304,
             0x0506_0708,
             0x090A,
             Bytes::from_static(b"hello candy"),
         );
-        let decoded = CandyPacket::decode(original.encode()).expect("decode");
+        let decoded = ShadowPacket::decode(original.encode()).expect("decode");
         assert_eq!(decoded.kind, original.kind);
         assert_eq!(decoded.tunnel_id, original.tunnel_id);
         assert_eq!(decoded.seq, original.seq);
@@ -303,10 +303,10 @@ mod tests {
     #[test]
     fn authenticated_round_trip_with_correct_key() {
         let key = derive_key("00112233445566778899aabbccddeeff");
-        let original = CandyPacket::new_data(1, 2, 3, 4, Bytes::from_static(b"payload"));
+        let original = ShadowPacket::new_data(1, 2, 3, 4, Bytes::from_static(b"payload"));
         let wire = original.encode_authenticated(&key);
         assert_eq!(wire.len(), original.encode().len() + MAC_LEN);
-        let decoded = CandyPacket::decode_authenticated(wire, &key).expect("auth decode");
+        let decoded = ShadowPacket::decode_authenticated(wire, &key).expect("auth decode");
         assert_eq!(decoded.payload, original.payload);
         assert_eq!(decoded.seq, original.seq);
     }
@@ -315,19 +315,19 @@ mod tests {
     fn authenticated_decode_rejects_wrong_key() {
         let key_a = derive_key("00112233445566778899aabbccddeeff");
         let key_b = derive_key("ffeeddccbbaa99887766554433221100");
-        let wire = CandyPacket::new_syn(9, 9).encode_authenticated(&key_a);
-        assert!(CandyPacket::decode_authenticated(wire, &key_b).is_err());
+        let wire = ShadowPacket::new_syn(9, 9).encode_authenticated(&key_a);
+        assert!(ShadowPacket::decode_authenticated(wire, &key_b).is_err());
     }
 
     #[test]
     fn authenticated_decode_rejects_tampered_payload() {
         let key = derive_key("00112233445566778899aabbccddeeff");
-        let wire = CandyPacket::new_data(1, 2, 3, 4, Bytes::from_static(b"abc"))
+        let wire = ShadowPacket::new_data(1, 2, 3, 4, Bytes::from_static(b"abc"))
             .encode_authenticated(&key);
         let mut bytes = wire.to_vec();
         // Flip a bit in the payload region (after the header, before the tag).
         bytes[HEADER_SIZE] ^= 0x01;
-        assert!(CandyPacket::decode_authenticated(Bytes::from(bytes), &key).is_err());
+        assert!(ShadowPacket::decode_authenticated(Bytes::from(bytes), &key).is_err());
     }
 
     #[test]
@@ -351,7 +351,7 @@ mod tests {
             let short = buf.freeze();
             assert_eq!(short.len(), len);
             assert!(
-                CandyPacket::decode(short).is_err(),
+                ShadowPacket::decode(short).is_err(),
                 "packet of {len} bytes should be rejected, not decoded"
             );
         }

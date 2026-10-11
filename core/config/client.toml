@@ -1,4 +1,4 @@
-# Candy-Spoof – Client Configuration
+# Shadow Spoof – Client Configuration
 # transport = "spoof"   # "spoof" (UDP data + ICMP control, forged source) or "tcp" (standard non-spoofed TCP)
 # ─────────────────────────────────────────────────────────────────────────────
 # IP Addressing
@@ -8,7 +8,7 @@
 # as the source of tunnel packets).
 real_ip        = "10.0.0.1"
 
-# The real IPv4 address of the remote Candy-Spoof server.
+# The real IPv4 address of the remote Shadow Spoof server.
 peer_real_ip   = "203.0.113.1"
 
 # The spoofed source IP this client puts in every outgoing packet.
