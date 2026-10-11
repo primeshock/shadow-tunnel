@@ -1273,6 +1273,8 @@ import time
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+import urllib.request
+import urllib.error
 
 # --------------------------------------------------------------------- paths --
 ETC = os.environ.get("SHADOW_ETC_DIR", "/etc/shadow-spoof")
@@ -2276,7 +2278,7 @@ def apply_edit(inst, data, note="edited"):
 def api_edit(req, name):
     inst = _inst_or_404(name)
     active, warn = apply_edit(inst, req.json, "edited from the panel")
-    return {"ok": True, "warnings": warn, "active": active}
+    return {"ok": True, "warnings": warn, "active": active, "peer": _maybe_push_peer(inst)}
 
 
 def api_action(req, name, action):
@@ -2893,6 +2895,111 @@ def api_panel_toggle(req):
     return {"ok": True, "enabled": False, "note": "panel is being disabled; this session will end"}
 
 
+# ── peer sync (two panels paired by a shared token) ─────────────────────────
+
+def _peer_request(method, path, body=None, timeout=8):
+    p = load_panel()
+    base = str(p.get("peer_url") or "").rstrip("/")
+    tok = str(p.get("sync_token") or "")
+    if not base or not tok:
+        raise ApiError(400, "peer not paired - set the peer URL and a shared token in Settings")
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(base + path, data=data, method=method,
+                               headers={"X-Sync-Token": tok, "Content-Type": "application/json"})
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE  # panels usually use self-signed certs
+    try:
+        with urllib.request.urlopen(r, timeout=timeout, context=ctx) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode()).get("error", str(e))
+        except Exception:
+            msg = "HTTP %s" % e.code
+        raise ApiError(502, "peer: %s" % msg)
+    except Exception as e:
+        raise ApiError(502, "peer unreachable: %s" % e)
+
+
+def api_sync_overview(req):
+    """Compact status served to a paired peer (token-authed)."""
+    role = get_role()
+    insts = instances()
+    props = systemd_show([i.unit for i in insts]) if insts else {}
+    tuns = []
+    for i in insts:
+        st = unit_status(i, props)
+        c = i.cfg()
+        tuns.append({"name": i.name, "active": st.get("active"),
+                     "transport": c.get("transport", "spoof"),
+                     "data_port": c.get("data_port"), "icmp_id": c.get("icmp_id")})
+    commit = ""
+    if os.path.exists(BUILD_INFO):
+        for line in read_text(BUILD_INFO).splitlines():
+            if line.startswith("commit="):
+                commit = line.split("=", 1)[1][:12]
+    return {"role": role, "host": socket.gethostname(), "tunnels": tuns, "build": commit}
+
+
+def api_sync_apply(req):
+    """Apply a config pushed by the paired peer (token-authed).  Reuses the
+    validate -> write -> restart -> rollback path, so a bad push is reverted."""
+    d = req.json if isinstance(req.json, dict) else {}
+    name = str(d.get("name", "main")).strip() or "main"
+    inst = _inst_or_404(name)
+    active, warn = apply_edit(inst, d, "synced from peer")
+    return {"ok": True, "name": name, "active": active, "warnings": warn}
+
+
+def api_peer_get(req):
+    p = load_panel()
+    return {"peer_url": p.get("peer_url", ""), "paired": bool(p.get("sync_token"))}
+
+
+def api_peer_set(req):
+    d = req.json if isinstance(req.json, dict) else {}
+    p = load_panel()
+    if d.get("unpair"):
+        p.pop("peer_url", None); p.pop("sync_token", None)
+        save_panel(p)
+        return {"ok": True, "paired": False, "peer_url": ""}
+    if "peer_url" in d:
+        u = str(d.get("peer_url", "")).strip().rstrip("/")
+        if u and not (u.startswith("http://") or u.startswith("https://")):
+            raise ApiError(400, "peer_url must start with http:// or https://")
+        p["peer_url"] = u
+    reveal = None
+    if d.get("generate"):
+        reveal = secrets.token_urlsafe(32); p["sync_token"] = reveal
+    elif str(d.get("sync_token", "")).strip():
+        p["sync_token"] = str(d.get("sync_token")).strip()
+    save_panel(p)
+    return {"ok": True, "paired": bool(p.get("sync_token")), "peer_url": p.get("peer_url", ""),
+            "sync_token": reveal}
+
+
+def api_peer_status(req):
+    return _peer_request("GET", "/api/sync/overview")
+
+
+def _maybe_push_peer(inst):
+    """After a local change, push the mirrored config to the paired peer so both
+    ends stay consistent.  Best-effort: returns a small status for the UI."""
+    p = load_panel()
+    if not (p.get("peer_url") and p.get("sync_token")):
+        return None
+    try:
+        mirror = peer_view(inst.role, inst.cfg())
+        mirror["name"] = inst.name
+        _peer_request("POST", "/api/sync/apply", mirror)
+        return {"ok": True}
+    except ApiError as e:
+        return {"ok": False, "error": e.msg}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 # ---------------------------------------------------------------- http server --
 INDEX_HTML = r'''<!doctype html>
 <html lang="en">
@@ -3034,7 +3141,7 @@ en: {
  paste_link:'Paste a shadowspoof:// link', apply:'Apply', pw_confirm:'Enter the panel password to reveal the key', reveal:'Reveal',
  level:'Level', search:'Search', lines:'Lines', auto_refresh:'Auto-refresh', run:'Run check', host:'Host', port:'Port', running:'Running...', avg:'Average', handshake_ok:'handshakes OK',
  wd:'Periodic restart (watchdog)', wd_hint:'Independent of crash recovery (Restart=on-failure).', chg_pw:'Change password', old_pw:'Current password', new_pw:'New password (10+ chars)',
- panel_cfg:'Web panel address', panel_cfg_hint:'Changing the port/address restarts the panel — you will reconnect on the new address.', panel_bind:'Bind address', panel_port:'Port', panel_save:'Save & restart panel', panel_warn:'Change the panel address and restart now? You will need to reconnect.', panel_disable:'Disable panel', panel_dis_warn:'Stop the web panel and turn off autostart? This session will end; re-enable it with: shadowtun panel enable', panel_disabled:'panel is being disabled…',
+ peer_cfg:'Peer server (auto-sync)', peer_hint:'Pair the two panels with the same shared token. Tunnel edits are then pushed to the peer automatically. Use HTTPS between panels.', peer_url:'Peer panel URL', peer_token:'Shared token', peer_token_ph:'paste the token from the other panel', peer_pair:'Pair', peer_gen:'Generate token', peer_check:'Check peer', peer_unpair:'Unpair', peer_paired:'Paired', peer_token_hint:'Copy this token to the OTHER panel (Settings > Peer), then set each panelu2019s Peer URL.', panel_cfg:'Web panel address', panel_cfg_hint:'Changing the port/address restarts the panel — you will reconnect on the new address.', panel_bind:'Bind address', panel_port:'Port', panel_save:'Save & restart panel', panel_warn:'Change the panel address and restart now? You will need to reconnect.', panel_disable:'Disable panel', panel_dis_warn:'Stop the web panel and turn off autostart? This session will end; re-enable it with: shadowtun panel enable', panel_disabled:'panel is being disabled…',
  lang:'Language', copied:'Copied', copy:'Copy', not_listening:'SOCKS5 not listening', last_est:'Last handshake', ago:'ago', never:'never', build:'Build', role:'Role',
  note_key:'The pre-shared key authenticates every packet (HMAC). Both sides must use the identical key.', srv_test_hint:'Listens for client packets for 10 s. Press Run here, then run the test on the client at the same time.', no_tunnels:'No tunnels yet.', warnings:'Warnings'
 },
@@ -3052,7 +3159,7 @@ fa: {
  paste_link:'لینک shadowspoof:// را بچسبانید', apply:'اعمال', pw_confirm:'برای نمایش کلید، رمز پنل را وارد کنید', reveal:'نمایش',
  level:'سطح', search:'جستجو', lines:'تعداد خط', auto_refresh:'به‌روزرسانی خودکار', run:'اجرای بررسی', host:'هاست', port:'پورت', running:'در حال اجرا...', avg:'میانگین', handshake_ok:'هندشیک موفق',
  wd:'ری‌استارت دوره‌ای (watchdog)', wd_hint:'مستقل از بازیابی خطا (Restart=on-failure).', chg_pw:'تغییر رمز', old_pw:'رمز فعلی', new_pw:'رمز جدید (حداقل ۱۰ کاراکتر)',
- panel_cfg:'آدرس وب‌پنل', panel_cfg_hint:'تغییر پورت/آدرس پنل را ری‌استارت می‌کند — روی آدرس جدید دوباره وصل می‌شوی.', panel_bind:'آدرس Bind', panel_port:'پورت', panel_save:'ذخیره و ری‌استارت پنل', panel_warn:'آدرس پنل عوض و همین حالا ری‌استارت شود؟ باید دوباره وصل شوی.', panel_disable:'غیرفعال‌کردن پنل', panel_dis_warn:'وب‌پنل متوقف و autostart خاموش شود؟ این نشست بسته می‌شود؛ دوباره فعال‌کردن: shadowtun panel enable', panel_disabled:'در حال غیرفعال‌کردن پنل…',
+ peer_cfg:'سرور طرف مقابل (سینک خودکار)', peer_hint:'دو پنل را با یک توکنِ مشترک جفت کن. بعد از آن، ویرایش‌های تونل خودکار به طرف مقابل push می‌شود. بینشان HTTPS استفاده کن.', peer_url:'آدرس پنلِ طرف مقابل', peer_token:'توکن مشترک', peer_token_ph:'توکن پنلِ دیگر را بچسبان', peer_pair:'جفت‌کردن', peer_gen:'ساخت توکن', peer_check:'بررسی طرف مقابل', peer_unpair:'قطع جفت', peer_paired:'جفت‌شده', peer_token_hint:'این توکن را در پنلِ دیگر وارد کن (تنظیمات > طرف مقابل)، بعد آدرس Peer هر دو را تنظیم کن.', panel_cfg:'آدرس وب‌پنل', panel_cfg_hint:'تغییر پورت/آدرس پنل را ری‌استارت می‌کند — روی آدرس جدید دوباره وصل می‌شوی.', panel_bind:'آدرس Bind', panel_port:'پورت', panel_save:'ذخیره و ری‌استارت پنل', panel_warn:'آدرس پنل عوض و همین حالا ری‌استارت شود؟ باید دوباره وصل شوی.', panel_disable:'غیرفعال‌کردن پنل', panel_dis_warn:'وب‌پنل متوقف و autostart خاموش شود؟ این نشست بسته می‌شود؛ دوباره فعال‌کردن: shadowtun panel enable', panel_disabled:'در حال غیرفعال‌کردن پنل…',
  lang:'زبان', copied:'کپی شد', copy:'کپی', not_listening:'SOCKS5 در حال شنیدن نیست', last_est:'آخرین هندشیک', ago:'پیش', never:'هرگز', build:'نسخه', role:'نقش',
  note_key:'کلید پیش‌اشتراکی هر بسته را احراز هویت می‌کند (HMAC). هر دو طرف باید کلید یکسان داشته باشند.', srv_test_hint:'۱۰ ثانیه به بسته‌های کلاینت گوش می‌دهد. همین‌جا اجرا را بزنید و هم‌زمان تست را روی کلاینت اجرا کنید.', no_tunnels:'هنوز تونلی نیست.', warnings:'هشدارها'
 }};
@@ -3398,6 +3505,15 @@ function viewDiagnose(m){
 /* ---------- settings ---------- */
 async function viewSettings(m){
   const st=await api('GET','/api/settings').catch(()=>({watchdog:'off'}));
+  // peer server pairing + status + auto-sync
+  const pr=await api('GET','/api/peer').catch(()=>({paired:false,peer_url:''}));
+  const purl=h('input',{value:pr.peer_url||'',placeholder:'https://<peer-ip>:7788'});
+  const ptok=h('input',{placeholder:t('peer_token_ph')});
+  const pstat=h('div',{class:'hint',text:t('peer_paired')+': '+(pr.paired?'✓':'—')});
+  const pgen=h('button',{class:'btn',text:t('peer_gen'),onclick:async()=>{try{const r=await api('POST','/api/peer',{generate:true});if(r.sync_token)openModal([h('h3',{text:t('peer_token')}),h('div',{class:'hint',text:t('peer_token_hint')}),h('div',{class:'copy mono',text:r.sync_token}),h('button',{class:'btn',onclick:closeModal,text:t('close')})]);toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+  const psave=h('button',{class:'btn pri',text:t('peer_pair'),onclick:async()=>{try{const body={peer_url:purl.value.trim()};if(ptok.value.trim())body.sync_token=ptok.value.trim();await api('POST','/api/peer',body);ptok.value='';toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+  const pcheck=h('button',{class:'btn',text:t('peer_check'),onclick:async()=>{pstat.textContent=t('running');try{const r=await api('GET','/api/peer/status');pstat.replaceChildren(h('div',{},'✓ '+(r.host||'')+' ('+(r.role||'')+')  ·  build '+(r.build||'?')),...(r.tunnels||[]).map(x=>h('div',{class:'hint'},x.name+': '+(x.active||'?')+'  ·  '+x.transport+'  ·  port '+(x.data_port||'?'))));}catch(e){if(!e.handled)pstat.replaceChildren(h('div',{class:'err',text:e.message}))}}});
+  const punpair=h('button',{class:'btn dng',text:t('peer_unpair'),onclick:async()=>{try{await api('POST','/api/peer',{unpair:true});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
   const wd=h('select',{},['off','30m','1h','6h','12h','24h'].map(v=>h('option',{value:v,text:v})));wd.value=st.watchdog;
   const wdBtn=h('button',{class:'btn',text:t('apply'),onclick:async()=>{try{await api('POST','/api/settings/watchdog',{value:wd.value});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
   const o=h('input',{type:'password',autocomplete:'current-password'}),n=h('input',{type:'password',autocomplete:'new-password'}),perr=h('div',{class:'err'});
@@ -3410,6 +3526,12 @@ async function viewSettings(m){
   const pdis=h('button',{class:'btn dng',text:t('panel_disable'),onclick:async()=>{if(!confirm(t('panel_dis_warn')))return;try{await api('POST','/api/settings/panel/toggle',{on:false});toast(t('panel_disabled'))}catch(e){if(!e.handled)toast(e.message,1)}}});
   const b=(S.meta.build||{});
   m.replaceChildren(
+    h('div',{class:'card'},h('b',{text:t('peer_cfg')}),h('div',{class:'hint',text:t('peer_hint')}),
+      h('label',{class:'f'},h('span',{text:t('peer_url')}),purl),
+      h('label',{class:'f'},h('span',{text:t('peer_token')}),ptok),
+      h('div',{class:'row'},psave,pgen,pcheck,punpair),
+      pstat),
+    h('div',{class:'lbl',text:' '}),
     h('div',{class:'card'},h('b',{text:t('panel_cfg')}),h('div',{class:'hint',text:t('panel_cfg_hint')}),
       h('div',{class:'two'},h('label',{class:'f'},h('span',{text:t('panel_bind')}),pbind),h('label',{class:'f'},h('span',{text:t('panel_port')}),pport)),
       h('label',{class:'f'},h('span',{text:'TLS'}),ptls),
@@ -3513,6 +3635,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/login" and method == "POST":
                 return self._login(ip, req)
+            # Peer-sync channel: authenticated by a shared token, not a session.
+            if path.startswith("/api/sync/"):
+                want = str(load_panel().get("sync_token") or "")
+                tok = self.headers.get("X-Sync-Token") or ""
+                if not want or not hmac.compare_digest(tok, want):
+                    self._json(401, {"error": "sync auth failed"})
+                    return
+                if method == "GET" and path == "/api/sync/overview":
+                    self._json(200, api_sync_overview(req)); return
+                if method == "POST" and path == "/api/sync/apply":
+                    self._json(200, api_sync_apply(req)); return
+                self._json(404, {"error": "not found"}); return
             sess = get_session(req.token)
             if not sess:
                 self._json(401, {"error": "login required"})
@@ -3563,6 +3697,10 @@ class Handler(BaseHTTPRequestHandler):
                 return api_health(req)
             if path == "/api/settings":
                 return api_settings_get(req)
+            if path == "/api/peer":
+                return api_peer_get(req)
+            if path == "/api/peer/status":
+                return api_peer_status(req)
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/logs$", path)
             if m:
                 return api_logs(req, m.group(1))
@@ -3592,6 +3730,8 @@ class Handler(BaseHTTPRequestHandler):
                 return api_panel_cfg(req)
             if path == "/api/settings/panel/toggle":
                 return api_panel_toggle(req)
+            if path == "/api/peer":
+                return api_peer_set(req)
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/(start|stop|restart)$", path)
             if m:
                 return api_action(req, m.group(1), m.group(2))
