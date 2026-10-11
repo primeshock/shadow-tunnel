@@ -3013,7 +3013,7 @@ INDEX_HTML = r'''<!doctype html>
 :root{--bg:#0a0d14;--bg2:#0f1420;--card:#141a28;--card2:#182032;--line:#243049;--tx:#eef1f8;--mut:#8f9ab2;--acc:#ff6fae;--acc2:#6fb7ff;--ok:#3ddc97;--warn:#f5b54a;--bad:#ff5d6c;--r:16px;--grad:linear-gradient(135deg,#ff6fae,#b06bff 60%,#6fb7ff);--shadow:0 10px 30px -12px #000a;--ring:0 0 0 3px #ff6fae33}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Vazirmatn,Tahoma,sans-serif;-webkit-text-size-adjust:100%}
-body{background:radial-gradient(1200px 700px at 78% -12%,#1a1a46,transparent 60%),radial-gradient(1000px 600px at -8% 8%,#331450,transparent 58%),#0c0c24;background-attachment:fixed}
+body{background:radial-gradient(900px 740px at 14% 18%,rgba(236,72,153,.20),transparent 60%),radial-gradient(1000px 820px at 86% 12%,rgba(34,197,94,.17),transparent 60%),radial-gradient(1000px 900px at 50% 98%,rgba(147,112,219,.20),transparent 62%),radial-gradient(820px 720px at 92% 88%,rgba(111,183,255,.15),transparent 60%),#0b0b22;background-attachment:fixed}
 #bgwave{position:fixed;inset:0;width:100vw;height:100vh;z-index:-2;display:block;pointer-events:none}
 #app{position:relative;z-index:0}
 @media(prefers-reduced-motion:no-preference){.card,.btn,nav.dock button{transition:transform .15s ease,border-color .15s ease,background .15s ease,box-shadow .15s ease}}
