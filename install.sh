@@ -3013,7 +3013,7 @@ INDEX_HTML = r'''<!doctype html>
 :root{--bg:#0a0d14;--bg2:#0f1420;--card:#141a28;--card2:#182032;--line:#243049;--tx:#eef1f8;--mut:#8f9ab2;--acc:#ff6fae;--acc2:#6fb7ff;--ok:#3ddc97;--warn:#f5b54a;--bad:#ff5d6c;--r:16px;--grad:linear-gradient(135deg,#ff6fae,#b06bff 60%,#6fb7ff);--shadow:0 10px 30px -12px #000a;--ring:0 0 0 3px #ff6fae33}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Vazirmatn,Tahoma,sans-serif;-webkit-text-size-adjust:100%}
-body{background:radial-gradient(1200px 700px at 78% -12%,#14143a,transparent 60%),radial-gradient(1000px 600px at -8% 8%,#2a1040,transparent 58%),#070716;background-attachment:fixed}
+body{background:radial-gradient(1200px 700px at 78% -12%,#1a1a46,transparent 60%),radial-gradient(1000px 600px at -8% 8%,#331450,transparent 58%),#0c0c24;background-attachment:fixed}
 #bgwave{position:fixed;inset:0;width:100vw;height:100vh;z-index:-2;display:block;pointer-events:none}
 #app{position:relative;z-index:0}
 @media(prefers-reduced-motion:no-preference){.card,.btn,nav.dock button{transition:transform .15s ease,border-color .15s ease,background .15s ease,box-shadow .15s ease}}
@@ -3096,31 +3096,50 @@ pre.log .t{color:var(--mut)}.lv-ERROR{color:var(--bad)}.lv-WARN{color:var(--warn
 <div id="app"></div>
 <script nonce="__NONCE__">
 'use strict';
-/* ---------- animated wave background ---------- */
+/* ---------- live background: drifting colour glows + soft waves ---------- */
 (function(){
   var c=document.getElementById('bgwave'); if(!c||!c.getContext) return;
-  var ctx=c.getContext('2d'), W=1, H=1, DPR=1;
+  var ctx=c.getContext('2d'), W=1,H=1,DPR=1;
+  var mx=0.5,my=0.42, tmx=0.5,tmy=0.42;
   function resize(){ DPR=Math.min(2,window.devicePixelRatio||1); W=c.width=Math.max(1,innerWidth*DPR); H=c.height=Math.max(1,innerHeight*DPR); }
   resize(); addEventListener('resize',resize);
-  var LINES=40;
-  function draw(t){
-    ctx.clearRect(0,0,W,H);
-    var baseY=H*0.54, step=14*DPR;
+  addEventListener('pointermove',function(e){ tmx=e.clientX/innerWidth; tmy=e.clientY/innerHeight; },{passive:true});
+  // soft colour blobs that fill the whole screen and slowly drift / follow the mouse
+  var blobs=[
+    {x:0.22,y:0.30,r:0.62,c:[236,72,153], ph:0.0, sp:0.00012},  // pink
+    {x:0.74,y:0.26,r:0.66,c:[34,197,94],  ph:2.1, sp:0.00010},  // green
+    {x:0.50,y:0.74,r:0.60,c:[147,112,219],ph:4.0, sp:0.00014},  // purple
+    {x:0.86,y:0.70,r:0.52,c:[111,183,255],ph:1.3, sp:0.00009}   // blue
+  ];
+  function blob(b,t){
+    var px=(b.x + Math.sin(t*b.sp+b.ph)*0.09 + (mx-0.5)*0.07)*W;
+    var py=(b.y + Math.cos(t*b.sp*1.3+b.ph)*0.09 + (my-0.42)*0.07)*H;
+    var rr=b.r*Math.max(W,H);
+    var g=ctx.createRadialGradient(px,py,0,px,py,rr);
+    g.addColorStop(0,'rgba('+b.c[0]+','+b.c[1]+','+b.c[2]+',0.34)');
+    g.addColorStop(0.45,'rgba('+b.c[0]+','+b.c[1]+','+b.c[2]+',0.12)');
+    g.addColorStop(1,'rgba('+b.c[0]+','+b.c[1]+','+b.c[2]+',0)');
+    ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  }
+  function waves(t){
+    var LINES=28, baseY=H*0.62, step=16*DPR;
     for(var i=0;i<LINES;i++){
-      var p=i/LINES, g=ctx.createLinearGradient(0,0,W,0);
-      g.addColorStop(0,   'rgba(236,72,153,'+(0.05+0.11*(1-p))+')');
-      g.addColorStop(0.5, 'rgba(34,197,94,' +(0.05+0.13*p)    +')');
-      g.addColorStop(1,   'rgba(147,112,219,0.09)');
-      ctx.strokeStyle=g; ctx.lineWidth=DPR; ctx.beginPath();
+      ctx.beginPath(); ctx.strokeStyle='rgba(190,205,255,'+(0.025+0.03*(i/LINES))+')'; ctx.lineWidth=DPR;
       for(var x=0;x<=W;x+=step){
-        var nx=x/W, env=H*0.2*Math.sin(Math.PI*nx);
-        var y=baseY + Math.sin(nx*6 + t*0.00040 + i*0.17)*env*0.55
-                    + Math.sin(nx*3 - t*0.00028 + i*0.11)*env*0.32
-                    + (i-LINES/2)*2.1*DPR;
+        var nx=x/W, env=H*0.17*Math.sin(Math.PI*nx);
+        var y=baseY + Math.sin(nx*5 + t*0.00030 + i*0.20)*env*0.5 + (i-LINES/2)*2.3*DPR;
         x===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
       }
       ctx.stroke();
     }
+  }
+  function draw(t){
+    mx+=(tmx-mx)*0.05; my+=(tmy-my)*0.05;
+    ctx.clearRect(0,0,W,H);
+    ctx.globalCompositeOperation='lighter';
+    for(var i=0;i<blobs.length;i++) blob(blobs[i],t);
+    ctx.globalCompositeOperation='source-over';
+    waves(t);
   }
   try{ if(matchMedia('(prefers-reduced-motion: reduce)').matches){ draw(0); return; } }catch(e){}
   (function loop(t){ draw(t||0); requestAnimationFrame(loop); })(0);
@@ -3319,7 +3338,7 @@ function fieldDefs(role){
   const me=t(role),peer=t(role==='client'?'server':'client');
   return [
    {k:'name',l:t('f_name'),create:true},
-   {k:'transport',l:t('f_transport'),hint:t('h_transport')},
+   {k:'transport',l:t('f_transport'),hint:t('h_transport'),opts:[['spoof','UDP + ICMP (spoofed)'],['tcp','TCP (standard)']]},
    {k:'real_ip',l:`${t('f_real')} (${me})`},{k:'spoofed_ip',l:`${t('f_spoof')} (${me})`},{k:'spoofed_ip_pool',l:t('f_pool'),list:true},
    {k:'peer_real_ip',l:`${t('f_real')} (${peer})`},{k:'peer_spoofed_ip',l:`${t('f_spoof')} (${peer})`},
    {k:'allowed_peers',l:t('f_peerpool'),list:true,hint:t('h_peerpool')},
@@ -3342,7 +3361,8 @@ function formModal(mode,x,prefill){
   for(const f of defs){
     if(f.create&&mode==='edit') continue;
     let inp;
-    if(f.select){inp=h('select',{},h('option',{value:'auto',text:t('auto')}),S.meta.ifaces.map(i=>h('option',{value:i,text:i})));inp.value=init(f.k)||'auto';if(![...inp.options].some(o=>o.value===inp.value))inp.add(new Option(inp.value,inp.value)),inp.value=init(f.k)}
+    if(f.opts){inp=h('select',{},f.opts.map(o=>h('option',{value:o[0],text:o[1]})));inp.value=init(f.k)||f.opts[0][0];if(![...inp.options].some(o=>o.value===inp.value))inp.value=f.opts[0][0]}
+    else if(f.select){inp=h('select',{},h('option',{value:'auto',text:t('auto')}),S.meta.ifaces.map(i=>h('option',{value:i,text:i})));inp.value=init(f.k)||'auto';if(![...inp.options].some(o=>o.value===inp.value))inp.add(new Option(inp.value,inp.value)),inp.value=init(f.k)}
     else inp=h('input',{value:mode==='edit'&&f.key?'':init(f.k),autocomplete:'off',spellcheck:'false',class:'mono'});
     inputs[f.k]=inp;errs[f.k]=h('div',{class:'err'});
     rows.push(h('label',{class:'f'},h('span',{text:f.l}),f.key?h('div',{class:'row'},inp,h('button',{class:'btn sm',type:'button',onclick:async()=>{inp.value=(await api('POST','/api/keygen',{})).key},text:t('gen')})):inp,f.hint&&h('div',{class:'hint',text:f.hint}),errs[f.k]));
@@ -3511,7 +3531,7 @@ async function viewSettings(m){
   const ptok=h('input',{placeholder:t('peer_token_ph')});
   const pstat=h('div',{class:'hint',text:t('peer_paired')+': '+(pr.paired?'✓':'—')});
   const pgen=h('button',{class:'btn',text:t('peer_gen'),onclick:async()=>{try{const r=await api('POST','/api/peer',{generate:true});if(r.sync_token)openModal([h('h3',{text:t('peer_token')}),h('div',{class:'hint',text:t('peer_token_hint')}),h('div',{class:'copy mono',text:r.sync_token}),h('button',{class:'btn',onclick:closeModal,text:t('close')})]);toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
-  const psave=h('button',{class:'btn pri',text:t('peer_pair'),onclick:async()=>{try{const body={peer_url:purl.value.trim()};if(ptok.value.trim())body.sync_token=ptok.value.trim();await api('POST','/api/peer',body);ptok.value='';toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+  const ppair=h('button',{class:'btn pri',text:t('peer_pair'),onclick:async()=>{try{const body={peer_url:purl.value.trim()};if(ptok.value.trim())body.sync_token=ptok.value.trim();await api('POST','/api/peer',body);ptok.value='';toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
   const pcheck=h('button',{class:'btn',text:t('peer_check'),onclick:async()=>{pstat.textContent=t('running');try{const r=await api('GET','/api/peer/status');pstat.replaceChildren(h('div',{},'✓ '+(r.host||'')+' ('+(r.role||'')+')  ·  build '+(r.build||'?')),...(r.tunnels||[]).map(x=>h('div',{class:'hint'},x.name+': '+(x.active||'?')+'  ·  '+x.transport+'  ·  port '+(x.data_port||'?'))));}catch(e){if(!e.handled)pstat.replaceChildren(h('div',{class:'err',text:e.message}))}}});
   const punpair=h('button',{class:'btn dng',text:t('peer_unpair'),onclick:async()=>{try{await api('POST','/api/peer',{unpair:true});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
   const wd=h('select',{},['off','30m','1h','6h','12h','24h'].map(v=>h('option',{value:v,text:v})));wd.value=st.watchdog;
@@ -3529,7 +3549,7 @@ async function viewSettings(m){
     h('div',{class:'card'},h('b',{text:t('peer_cfg')}),h('div',{class:'hint',text:t('peer_hint')}),
       h('label',{class:'f'},h('span',{text:t('peer_url')}),purl),
       h('label',{class:'f'},h('span',{text:t('peer_token')}),ptok),
-      h('div',{class:'row'},psave,pgen,pcheck,punpair),
+      h('div',{class:'row'},ppair,pgen,pcheck,punpair),
       pstat),
     h('div',{class:'lbl',text:' '}),
     h('div',{class:'card'},h('b',{text:t('panel_cfg')}),h('div',{class:'hint',text:t('panel_cfg_hint')}),
