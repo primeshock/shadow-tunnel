@@ -3371,6 +3371,34 @@ html[data-theme=light] #bg::after{background-image:linear-gradient(rgba(30,40,80
 .card{backdrop-filter:blur(30px) saturate(170%);-webkit-backdrop-filter:blur(30px) saturate(170%)}
 .modal{backdrop-filter:blur(36px) saturate(170%);-webkit-backdrop-filter:blur(36px) saturate(170%)}
 nav.dock,header.top{backdrop-filter:blur(30px) saturate(170%);-webkit-backdrop-filter:blur(30px) saturate(170%)}
+
+/* ===== v9: user-tunable UI (variables set from Settings > Appearance) ===== */
+.card{backdrop-filter:blur(var(--ub,30px)) saturate(170%);-webkit-backdrop-filter:blur(var(--ub,30px)) saturate(170%)}
+.modal{backdrop-filter:blur(calc(var(--ub,30px)*1.2)) saturate(170%);-webkit-backdrop-filter:blur(calc(var(--ub,30px)*1.2)) saturate(170%)}
+nav.dock,header.top{backdrop-filter:blur(var(--ub,30px)) saturate(170%);-webkit-backdrop-filter:blur(var(--ub,30px)) saturate(170%)}
+#bg{opacity:var(--ubg,1)}
+#bg::after{opacity:var(--ugrid,1)}
+#bg i{animation-play-state:var(--uplay,running)}
+#bg .b1{background:var(--c1,#1d2a8a);animation-duration:calc(46s*var(--uspd,1))}
+#bg .b2{background:var(--c2,#3a1d7a);animation-duration:calc(54s*var(--uspd,1))}
+#bg .b3{background:var(--c3,#2b1160);animation-duration:calc(60s*var(--uspd,1))}
+#bg .b4{background:var(--c4,#5a1226);animation-duration:calc(50s*var(--uspd,1))}
+html[data-theme=light] #bg .b1{background:#7c8cff}html[data-theme=light] #bg .b2{background:#b7a6ff}html[data-theme=light] #bg .b3{background:#9cc7ff}html[data-theme=light] #bg .b4{background:#ffb3d1}
+html.compact .card{padding:11px}
+html.compact .grid{gap:8px}
+html.compact .kv{gap:3px 12px;margin:6px 0}
+.hide{display:none}
+.uihead{display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;user-select:none}
+.uihead .chev{transition:transform .25s ease;color:var(--mut)}
+.uihead.open .chev{transform:rotate(180deg)}
+.uigrid{display:grid;grid-template-columns:1fr 1fr;gap:12px 20px;margin-top:10px}
+@media(max-width:600px){.uigrid{grid-template-columns:1fr}}
+.uigrid label.f{margin:0}
+.uichecks{display:flex;flex-wrap:wrap;gap:6px 22px;margin:14px 0 12px}
+.uichecks .rem{margin:0}
+.val{color:var(--mut);font-size:12px;margin-inline-start:8px}
+input[type=range]{padding:0;height:22px;border:0;background:transparent;accent-color:#a855f7;box-shadow:none}
+input[type=checkbox]{width:18px;height:18px;padding:0;margin:0;accent-color:#a855f7}
 </style>
 </head>
 <body>
@@ -3379,11 +3407,43 @@ nav.dock,header.top{backdrop-filter:blur(30px) saturate(170%);-webkit-backdrop-f
 <script nonce="__NONCE__">
 'use strict';
 const UIV='__UIV__';
-(function(){try{var th=localStorage.getItem('theme');if(th==='light'||th==='dark')document.documentElement.setAttribute('data-theme',th)}catch(e){}})();
+/* ---------- user UI preferences (stored in this browser) ---------- */
+const UI_DEF={theme:'dark',pal:'default',blur:30,glass:100,bg:100,anim:true,speed:1,grid:true,radius:16,compact:false};
+let UI=Object.assign({},UI_DEF);
+try{const j=JSON.parse(localStorage.getItem('ui')||'null');if(j&&typeof j==='object')Object.assign(UI,j);else{const th=localStorage.getItem('theme');if(th==='light'||th==='dark')UI.theme=th}}catch(e){}
+const PAL={
+  default:{g:['#ff6fae','#a855f7'],g2:['#3b82f6','#7dd3fc'],c:['#1d2a8a','#3a1d7a','#2b1160','#5a1226']},
+  ocean:{g:['#38bdf8','#6366f1'],g2:['#06b6d4','#67e8f9'],c:['#0b4f8a','#1d4ed8','#0e7490','#134e4a']},
+  emerald:{g:['#34d399','#22c55e'],g2:['#10b981','#6ee7b7'],c:['#065f46','#14532d','#134e4a','#1e3a8a']},
+  sunset:{g:['#fb923c','#f43f5e'],g2:['#f97316','#fcd34d'],c:['#7c2d12','#9f1239','#581c87','#78350f']},
+  mono:{g:['#94a3b8','#64748b'],g2:['#64748b','#cbd5e1'],c:['#334155','#1e293b','#27272a','#3f3f46']}
+};
+const GLASS={dark:{g1:[34,40,72,.62],g2:[20,24,46,.50]},light:{g1:[240,243,249,.82],g2:[231,235,244,.66]}};
+function effTheme(){return UI.theme==='auto'?((window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark'):UI.theme}
+function saveUI(){try{localStorage.setItem('ui',JSON.stringify(UI))}catch(e){}}
+function applyUI(){
+  const r=document.documentElement,st=r.style,th=effTheme();
+  r.setAttribute('data-theme',th);
+  const pal=PAL[UI.pal]||PAL.default;
+  st.setProperty('--grad','linear-gradient(135deg,'+pal.g[0]+','+pal.g[1]+')');
+  st.setProperty('--grad2','linear-gradient(135deg,'+pal.g2[0]+','+pal.g2[1]+')');
+  pal.c.forEach((c,i)=>st.setProperty('--c'+(i+1),c));
+  st.setProperty('--ub',UI.blur+'px');
+  const gl=GLASS[th],f=UI.glass/100,rg=a=>'rgba('+a[0]+','+a[1]+','+a[2]+','+Math.max(.12,Math.min(.98,a[3]*f)).toFixed(3)+')';
+  st.setProperty('--g1',rg(gl.g1));st.setProperty('--g2',rg(gl.g2));
+  st.setProperty('--ubg',(UI.bg/100).toFixed(2));
+  st.setProperty('--ugrid',UI.grid?'1':'0');
+  st.setProperty('--uspd',String(UI.speed));
+  st.setProperty('--uplay',UI.anim?'running':'paused');
+  st.setProperty('--r',UI.radius+'px');
+  r.classList.toggle('compact',!!UI.compact);
+}
+applyUI();
+try{matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{if(UI.theme==='auto')applyUI()})}catch(e){}
 /* ---------- i18n ---------- */
 const TR = {
 en: {
- ev_tab:'Events', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
+ ev_tab:'Events', ui_title:'Appearance & UI', ui_hint:'Visual preferences for this browser only (saved locally). Changes apply instantly.', ui_theme:'Theme', ui_pal:'Colour palette', ui_blur:'Glass blur', ui_glass:'Glass opacity', ui_bg:'Background colour strength', ui_radius:'Corner roundness', ui_speed:'Background motion speed', ui_anim:'Animate background', ui_grid:'Show grid', ui_compact:'Compact cards', ui_reset:'Reset to defaults', th_dark:'Dark', th_light:'Light', th_auto:'Auto (system)', pal_default:'Pink / Purple', pal_ocean:'Ocean', pal_emerald:'Emerald', pal_sunset:'Sunset', pal_mono:'Mono', sp_slow:'Slow', sp_norm:'Normal', sp_fast:'Fast', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
  diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load / uptime', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX',
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
@@ -3401,7 +3461,7 @@ en: {
  note_key:'The pre-shared key authenticates every packet (HMAC). Both sides must use the identical key.', srv_test_hint:'Listens for client packets for 10 s. Press Run here, then run the test on the client at the same time.', no_tunnels:'No tunnels yet.', warnings:'Warnings'
 },
 fa: {
- ev_tab:'رویدادها', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
+ ev_tab:'رویدادها', ui_title:'ظاهر و رابط کاربری', ui_hint:'تنظیمات ظاهری فقط برای همین مرورگر (به‌صورت محلی ذخیره می‌شود). تغییرات فوراً اعمال می‌شود.', ui_theme:'تم', ui_pal:'پالت رنگ', ui_blur:'بلور شیشه', ui_glass:'شفافیت شیشه', ui_bg:'شدت رنگ بک‌گراند', ui_radius:'گردی گوشه‌ها', ui_speed:'سرعت حرکت بک‌گراند', ui_anim:'بک‌گراند متحرک', ui_grid:'نمایش شبکه', ui_compact:'کارت‌های فشرده', ui_reset:'بازگشت به پیش‌فرض', th_dark:'تیره', th_light:'روشن', th_auto:'خودکار (سیستم)', pal_default:'صورتی / بنفش', pal_ocean:'اقیانوسی', pal_emerald:'زمردی', pal_sunset:'غروب', pal_mono:'تک‌رنگ', sp_slow:'آهسته', sp_norm:'معمولی', sp_fast:'سریع', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
  diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار / آپ‌تایم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال',
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
@@ -3460,7 +3520,7 @@ async function api(method,path,body){
 }
 function toast(msg,bad){const e=h('div',{class:'toast'+(bad?' bad':''),text:msg});document.body.append(e);setTimeout(()=>e.remove(),bad?6000:2800)}
 async function copy(text){try{await navigator.clipboard.writeText(text)}catch(e){const i=h('input',{value:text});document.body.append(i);i.select();document.execCommand('copy');i.remove()}toast(t('copied'))}
-function toggleTheme(){const r=document.documentElement,nx=r.getAttribute('data-theme')==='light'?'dark':'light';r.setAttribute('data-theme',nx);try{localStorage.setItem('theme',nx)}catch(e){}renderShell()}
+function toggleTheme(){UI.theme=effTheme()==='light'?'dark':'light';saveUI();applyUI();renderShell()}
 function stopTimers(){clearInterval(S.timer);clearInterval(S.logTimer);S.timer=S.logTimer=null}
 function fill(el,...kids){el.replaceChildren(...kids.flat(Infinity).filter(c=>c!=null&&c!==false))}
 function applyLang(){document.documentElement.lang=S.lang;document.documentElement.dir=S.lang==='fa'?'rtl':'ltr'}
@@ -3819,6 +3879,34 @@ function viewDiagnose(m){
 }
 
 /* ---------- settings ---------- */
+function uiCard(){
+  const sel=(key,label,opts,num)=>{const i=h('select',{},opts.map(o=>h('option',{value:o[0],text:o[1]})));
+    i.value=String(UI[key]);if(![...i.options].some(o=>o.value===i.value))i.value=opts[0][0];
+    i.addEventListener('change',()=>{UI[key]=num?+i.value:i.value;saveUI();applyUI()});
+    return h('label',{class:'f'},h('span',{text:label}),i)};
+  const rng=(key,label,min,max,step,unit)=>{const i=h('input',{type:'range',min:String(min),max:String(max),step:String(step),value:String(UI[key])});
+    const v=h('span',{class:'val',text:UI[key]+unit});
+    i.addEventListener('input',()=>{UI[key]=+i.value;v.textContent=i.value+unit;saveUI();applyUI()});
+    return h('label',{class:'f'},h('span',{},label,v),i)};
+  const chk=(key,label)=>{const i=h('input',{type:'checkbox',checked:!!UI[key]});
+    i.addEventListener('change',()=>{UI[key]=i.checked;saveUI();applyUI()});
+    return h('label',{class:'rem'},i,h('span',{text:label}))};
+  const body=h('div',{class:'uibody'+(S.uiOpen?'':' hide')},
+    h('div',{class:'hint',text:t('ui_hint')}),
+    h('div',{class:'uigrid'},
+      sel('theme',t('ui_theme'),[['dark',t('th_dark')],['light',t('th_light')],['auto',t('th_auto')]]),
+      sel('pal',t('ui_pal'),[['default',t('pal_default')],['ocean',t('pal_ocean')],['emerald',t('pal_emerald')],['sunset',t('pal_sunset')],['mono',t('pal_mono')]]),
+      rng('blur',t('ui_blur'),0,60,2,'px'),
+      rng('glass',t('ui_glass'),40,140,5,'%'),
+      rng('bg',t('ui_bg'),0,150,5,'%'),
+      rng('radius',t('ui_radius'),6,28,1,'px'),
+      sel('speed',t('ui_speed'),[['1.6',t('sp_slow')],['1',t('sp_norm')],['0.6',t('sp_fast')]],true)),
+    h('div',{class:'uichecks'},chk('anim',t('ui_anim')),chk('grid',t('ui_grid')),chk('compact',t('ui_compact'))),
+    h('div',{class:'row'},h('button',{class:'btn',text:t('ui_reset'),onclick:()=>{UI=Object.assign({},UI_DEF);saveUI();applyUI();renderShell()}})));
+  const head=h('div',{class:'uihead'+(S.uiOpen?' open':''),onclick:()=>{S.uiOpen=!S.uiOpen;body.classList.toggle('hide',!S.uiOpen);head.classList.toggle('open',!!S.uiOpen)}},
+    h('b',{text:t('ui_title')}),h('span',{class:'chev',text:'\u25BE'}));
+  return h('div',{class:'card'},head,body);
+}
 async function viewSettings(m){
   const st=await api('GET','/api/settings').catch(()=>({watchdog:'off'}));
   // update card
@@ -3861,6 +3949,8 @@ async function viewSettings(m){
   const b=(S.meta.build||{});
   m.replaceChildren(
     h('div',{class:'card'},h('b',{text:t('upd_title')}),h('div',{class:'hint',text:t('upd_hint')}),ubuild,h('div',{class:'row'},ubtn,ucheck),ulog),
+    h('div',{class:'lbl',text:'\u00a0'}),
+    uiCard(),
     h('div',{class:'lbl',text:'\u00a0'}),
     h('div',{class:'card'},h('b',{text:t('peer_cfg')}),h('div',{class:'hint',text:t('peer_hint')}),
       h('label',{class:'f'},h('span',{text:t('peer_url')}),purl),
