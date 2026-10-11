@@ -2110,6 +2110,33 @@ def save_panel(cfg):
 SESSIONS = {}
 SESS_LOCK = threading.Lock()
 FAILS = {}
+SESS_FILE = os.path.join(ETC, "sessions.json")
+
+
+def _skey(tok):
+    return hashlib.sha256((tok or "").encode()).hexdigest()
+
+
+def _load_sessions():
+    """Reload sessions after a restart (e.g. an update) so users stay signed in."""
+    try:
+        data = json.loads(read_text(SESS_FILE))
+    except Exception:
+        return
+    now = time.time()
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, dict) and v.get("exp", 0) > now and "csrf" in v:
+                v.setdefault("idle", now + 43200)
+                v["idle"] = max(v["idle"], now + 3600)
+                SESSIONS[k] = v
+
+
+def _save_sessions():
+    try:
+        atomic_write(SESS_FILE, json.dumps(SESSIONS), 0o600)
+    except Exception as e:
+        sys.stderr.write("could not persist sessions: %s\n" % e)
 
 
 def new_session(ip):
@@ -2118,16 +2145,18 @@ def new_session(ip):
         now = time.time()
         for k in [k for k, v in SESSIONS.items() if v["exp"] < now]:
             del SESSIONS[k]
-        SESSIONS[tok] = {"csrf": csrf, "exp": now + 86400, "idle": now + 43200, "ip": ip}
+        SESSIONS[_skey(tok)] = {"csrf": csrf, "exp": now + 86400, "idle": now + 43200, "ip": ip}
+        _save_sessions()
     return tok, csrf
 
 
 def get_session(tok):
     with SESS_LOCK:
-        s = SESSIONS.get(tok)
+        k = _skey(tok)
+        s = SESSIONS.get(k)
         now = time.time()
         if not s or s["exp"] < now or s["idle"] < now:
-            SESSIONS.pop(tok, None)
+            SESSIONS.pop(k, None)
             return None
         s["idle"] = now + 43200
         return s
@@ -2872,9 +2901,10 @@ def api_password(req):
     p["pw"] = hash_pw(new)
     save_panel(p)
     with SESS_LOCK:
-        keep = req.token
+        keep = _skey(req.token)
         for k in [k for k in SESSIONS if k != keep]:
             del SESSIONS[k]
+        _save_sessions()
     return {"ok": True}
 
 
@@ -3106,6 +3136,15 @@ def _maybe_push_peer(inst):
 
 
 # ---------------------------------------------------------------- http server --
+_UIV = []
+
+
+def ui_version():
+    if not _UIV:
+        _UIV.append(hashlib.sha256(INDEX_HTML.encode()).hexdigest()[:10])
+    return _UIV[0]
+
+
 INDEX_HTML = r'''<!doctype html>
 <html lang="en">
 <head>
@@ -3178,7 +3217,7 @@ pre.log .t{color:var(--mut)}.lv-ERROR{color:var(--bad)}.lv-WARN{color:var(--warn
 .copy{word-break:break-all;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:8px 10px;margin:6px 0}
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:90px;background:#202942;border:1px solid var(--line);padding:9px 16px;border-radius:12px;z-index:30;max-width:90vw}
 .toast.bad{border-color:var(--bad)}
-.loginwrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.loginwrap{min-height:calc(100vh - 70px);display:flex;align-items:center;justify-content:center;padding:24px}
 .login{width:min(440px,100%)}
 .login .logo{font-size:34px;text-align:center;margin-bottom:18px}
 .login .card{padding:28px 26px}
@@ -3281,6 +3320,7 @@ html[data-theme=light] .big{background:none;-webkit-text-fill-color:var(--tx);co
 <div id="app"></div>
 <script nonce="__NONCE__">
 'use strict';
+const UIV='__UIV__';
 (function(){try{var th=localStorage.getItem('theme');if(th==='light'||th==='dark')document.documentElement.setAttribute('data-theme',th)}catch(e){}})();
 /* ---------- live background: slow mouse parallax ---------- */
 (function(){
@@ -3362,6 +3402,8 @@ async function api(method,path,body){
   if(method!=='GET') o.headers['X-CSRF-Token']=S.csrf;
   if(body!==undefined) o.body=JSON.stringify(body);
   const r=await fetch(path,o);let j={};try{j=await r.json()}catch(e){}
+  const uv=r.headers.get('X-UI-Version');
+  if(uv&&UIV&&uv!==UIV&&!window.__rl){window.__rl=1;location.reload();return new Promise(()=>{})}
   if(r.status===401&&path!=='/api/login'){stopTimers();renderLogin();throw Object.assign(new Error('login'),{handled:true})}
   if(!r.ok) throw Object.assign(new Error(j.error||('HTTP '+r.status)),{data:j});
   return j;
@@ -3383,6 +3425,8 @@ function closeModal(){const o=document.getElementById('ovl');if(o)o.remove();S.m
 
 /* ---------- login ---------- */
 function renderLogin(){
+  stopTimers();
+  const ex=document.getElementById('pw');if(ex&&ex.value&&document.querySelector('.loginwrap'))return;
   applyLang();closeModal();
   const root=document.getElementById('app');root.replaceChildren();
   const user=h('input',{type:'text',name:'username',autocomplete:'username',value:'admin',class:'sr',tabindex:'-1','aria-hidden':'true'});
@@ -3802,6 +3846,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-UI-Version", ui_version())
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -3830,7 +3875,7 @@ class Handler(BaseHTTPRequestHandler):
         path = u.path
         if method == "GET" and path in ("/", "/index.html"):
             nonce = secrets.token_urlsafe(16)
-            body = INDEX_HTML.replace("__NONCE__", nonce).encode()
+            body = INDEX_HTML.replace("__NONCE__", nonce).replace("__UIV__", ui_version()).encode()
             self._headers(200, "text/html; charset=utf-8", len(body), nonce=nonce)
             self.wfile.write(body)
             return
@@ -3939,7 +3984,8 @@ class Handler(BaseHTTPRequestHandler):
         elif method == "POST":
             if path == "/api/logout":
                 with SESS_LOCK:
-                    SESSIONS.pop(req.token, None)
+                    SESSIONS.pop(_skey(req.token), None)
+                    _save_sessions()
                 return {"ok": True}
             if path == "/api/keygen":
                 return api_keygen(req)
@@ -4005,6 +4051,7 @@ class Server(ThreadingHTTPServer):
 
 
 def cmd_panel():
+    _load_sessions()
     cfg = load_panel()
     if not cfg.get("pw"):
         sys.exit("panel: no password configured (run: shadowtun panel passwd)")
