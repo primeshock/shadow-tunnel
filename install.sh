@@ -344,7 +344,10 @@ fetch_source() {
   else
     rm -rf "$SRC"; git clone --quiet "$REPO_URL" "$SRC"
   fi
-  git -C "$SRC" checkout --quiet --detach "$REPO_REF" \
+  # Prefer the freshly fetched remote branch: a plain `checkout master` would use
+  # the STALE local branch from the first install, so updates rebuilt old code.
+  { git -C "$SRC" checkout --quiet --detach "origin/$REPO_REF" 2>/dev/null \
+      || git -C "$SRC" checkout --quiet --detach "$REPO_REF"; } \
     || die "cannot check out '$REPO_REF' (set SHADOW_REF to a valid commit)"
   BUILD_REF=$(git -C "$SRC" rev-parse HEAD)
   if [[ $REPO_REF =~ ^[0-9a-f]{40}$ && $BUILD_REF != "$REPO_REF" ]]; then die "commit mismatch"; fi
@@ -1414,6 +1417,8 @@ def render_config(role, c, note):
         "initial_cwnd = %s" % ("%.1f" % c["initial_cwnd"]),
         "max_retries = %d" % c["max_retries"],
         "rto_min_ms = %d" % c["rto_min_ms"],
+        'auto_restart = "%s"' % c.get("auto_restart", "on-failure"),
+        "restart_sec = %d" % (c.get("restart_sec") or 5),
         'interface = "%s"' % c["interface"],
     ]
     if role == "client":
@@ -1602,6 +1607,15 @@ def validate(role, data, self_name, current=None):
     if n is None:
         errs["rto_min_ms"] = "10-60000"
     c["rto_min_ms"] = n
+    ar = str(pick("auto_restart", "on-failure")).strip().lower()
+    if ar not in ("no", "on-failure", "always"):
+        errs["auto_restart"] = "no, on-failure or always"
+        ar = "on-failure"
+    c["auto_restart"] = ar
+    n = as_int(pick("restart_sec", 5), 1, 3600)
+    if n is None:
+        errs["restart_sec"] = "1-3600"
+    c["restart_sec"] = n
 
     if role == "client":
         n = as_int(pick("socks5_port", 1080), 1024, 65535)
@@ -2183,7 +2197,7 @@ def api_meta(req):
     return {"role": get_role(), "detect_ip": detect_ip(), "ifaces": list_ifaces(), "build": info,
             "tls": bool(load_panel().get("tls")), "defaults": {"transport": "spoof", "data_port": 51820, "tunnel_count": 4, "mtu": 1380,
                                                               "initial_cwnd": 10, "socks5_port": 1080,
-                                                              "max_retries": 8, "rto_min_ms": 200,
+                                                              "max_retries": 8, "rto_min_ms": 200, "auto_restart": "on-failure", "restart_sec": 5,
                                                               "icmp_id": secrets.randbelow(65536)}}
 
 
@@ -2216,6 +2230,7 @@ def api_create(req):
     inst = Inst(name, role, os.path.join(TUNNELS, name + ".toml"))
     os.makedirs(TUNNELS, exist_ok=True)
     _write_inst(inst, role, clean, "created from the panel %s" % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    _apply_autorestart(inst, clean)
     rc, out, err = ctl("enable", "--now", inst.unit)
     time.sleep(1.5)
     st = unit_status(inst, systemd_show([inst.unit]))
@@ -2244,6 +2259,21 @@ def check_config_file(role, path):
     return False, detail
 
 
+def _apply_autorestart(inst, c):
+    """Per-tunnel systemd Restart=/RestartSec= drop-in from the config fields."""
+    mode, sec = c.get("auto_restart"), c.get("restart_sec")
+    if not mode or not sec:
+        return
+    try:
+        d = os.path.join(UNIT_DIR, inst.unit + ".d")
+        os.makedirs(d, exist_ok=True)
+        atomic_write(os.path.join(d, "20-autorestart.conf"),
+                     "[Service]\nRestart=%s\nRestartSec=%d\n" % (mode, int(sec)), 0o644)
+        ctl("daemon-reload")
+    except OSError as e:
+        sys.stderr.write("auto-restart drop-in failed for %s: %s\n" % (inst.name, e))
+
+
 def apply_edit(inst, data, note="edited"):
     """Validate + write + restart with automatic rollback. Returns (active, warnings)."""
     cur = inst.cfg()
@@ -2262,6 +2292,7 @@ def apply_edit(inst, data, note="edited"):
             atomic_write(PSK_FILE, old_psk, 0o600)
         raise ApiError(400, "the configuration parser rejected the new settings; reverted",
                        {"detail": detail[:500]})
+    _apply_autorestart(inst, clean)
     was_active = unit_status(inst, systemd_show([inst.unit]))["active"] == "active"
     ctl("try-restart", inst.unit)
     time.sleep(2.0)
@@ -2334,6 +2365,36 @@ def api_logs(req, name):
     rows = read_logs(inst, q.get("n", ["300"])[0], q.get("level", [None])[0], q.get("q", [None])[0],
                      q.get("since", [None])[0])
     return {"rows": rows}
+
+
+def api_tunnel_ping(req, name):
+    """Reachability of the other end: ICMP RTT, TCP connect time (tcp transport,
+    client side) and - when panels are paired - the peer panel round trip."""
+    inst = _inst_or_404(name)
+    cfg = inst.cfg()
+    peer = cfg.get("peer_real_ip")
+    out = {"peer": peer, "ping_ms": None, "tcp_ms": None, "peer_panel": None}
+    if peer and v_ip(peer):
+        rc, o, _ = run(["ping", "-c", "1", "-W", "1", peer], timeout=4)
+        m = re.search(r"time[=<]\s*([\d.]+)\s*ms", o or "")
+        if rc == 0 and m:
+            out["ping_ms"] = round(float(m.group(1)), 1)
+        if str(cfg.get("transport", "spoof")).lower() == "tcp" and inst.role == "client" and cfg.get("data_port"):
+            t0 = time.time()
+            try:
+                socket.create_connection((peer, int(cfg["data_port"])), timeout=2).close()
+                out["tcp_ms"] = round((time.time() - t0) * 1000, 1)
+            except OSError:
+                pass
+    p = load_panel()
+    if p.get("peer_url") and p.get("sync_token"):
+        t0 = time.time()
+        try:
+            _peer_request("GET", "/api/sync/overview", timeout=3)
+            out["peer_panel"] = {"ok": True, "ms": round((time.time() - t0) * 1000)}
+        except ApiError as e:
+            out["peer_panel"] = {"ok": False, "error": e.msg}
+    return out
 
 
 def api_tunnel_link(req, name):
@@ -3014,15 +3075,9 @@ def api_update_start(req):
         raise ApiError(409, "an update is already running")
     if not os.access(CTL, os.X_OK):
         raise ApiError(500, "%s not found - re-run the installer" % CTL)
-    os.makedirs(STATE, exist_ok=True)
-    try:
-        open(UPDATE_LOG, "w").close()
-    except OSError as e:
-        raise ApiError(500, "cannot write %s: %s" % (UPDATE_LOG, e))
     # A transient unit outlives the panel restart that the installer performs.
     rc, out, err = run(["systemd-run", "--unit=" + UPDATE_UNIT, "--collect", "--quiet",
-                        "-p", "StandardOutput=append:" + UPDATE_LOG,
-                        "-p", "StandardError=append:" + UPDATE_LOG,
+                        "-p", "StandardOutput=file:" + UPDATE_LOG,
                         CTL, "update", "-y"], timeout=15)
     if rc:
         raise ApiError(500, (err or out or "systemd-run failed").strip()[:300])
@@ -3056,7 +3111,7 @@ INDEX_HTML = r'''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="dark light">
 <title>Shadow Spoof</title>
 <link rel="icon" href="data:,">
 <style nonce="__NONCE__">
@@ -3064,12 +3119,12 @@ INDEX_HTML = r'''<!doctype html>
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Vazirmatn,Tahoma,sans-serif;-webkit-text-size-adjust:100%}
 html{background:#06061a}body{background:transparent}
-#bg{position:fixed;inset:0;z-index:-1;overflow:hidden;pointer-events:none;background:radial-gradient(120% 90% at 50% 0%,#0d0d2e 0%,#06061a 70%);transform:translate3d(calc(var(--mx,0)*26px),calc(var(--my,0)*26px),0);transition:transform 1.6s cubic-bezier(.2,.7,.2,1)}
-#bg i{position:absolute;display:block;filter:blur(80px);opacity:.40;will-change:transform,border-radius}
+#bg{position:fixed;inset:-80px;z-index:-1;overflow:hidden;pointer-events:none;background:radial-gradient(120% 90% at 50% 0%,#0a0a24 0%,#04040f 72%);transform:translate3d(calc(var(--mx,0)*22px),calc(var(--my,0)*22px),0);transition:transform 1.6s cubic-bezier(.2,.7,.2,1)}
+#bg i{position:absolute;display:block;filter:blur(90px);opacity:.20;will-change:transform,border-radius}
 #bg .b1{width:64vmax;height:64vmax;left:-18vmax;top:-22vmax;background:#c026d3;animation:liq1 46s ease-in-out infinite}
 #bg .b2{width:58vmax;height:58vmax;right:-20vmax;top:-12vmax;background:#2563eb;animation:liq2 54s ease-in-out infinite}
 #bg .b3{width:60vmax;height:60vmax;left:8vmax;bottom:-30vmax;background:#7c3aed;animation:liq3 60s ease-in-out infinite}
-#bg .b4{width:44vmax;height:44vmax;right:-8vmax;bottom:-16vmax;background:#db2777;opacity:.30;animation:liq4 50s ease-in-out infinite}
+#bg .b4{width:44vmax;height:44vmax;right:-8vmax;bottom:-16vmax;background:#db2777;opacity:.14;animation:liq4 50s ease-in-out infinite}
 @keyframes liq1{0%,100%{transform:translate(0,0) rotate(0) scale(1);border-radius:42% 58% 61% 39%/45% 38% 62% 55%}33%{transform:translate(16vmax,8vmax) rotate(120deg) scale(1.12);border-radius:58% 42% 38% 62%/55% 62% 38% 45%}66%{transform:translate(5vmax,22vmax) rotate(240deg) scale(.94);border-radius:38% 62% 55% 45%/62% 40% 60% 38%}}
 @keyframes liq2{0%,100%{transform:translate(0,0) rotate(0) scale(1);border-radius:55% 45% 40% 60%/50% 58% 42% 50%}40%{transform:translate(-14vmax,14vmax) rotate(-140deg) scale(1.1);border-radius:40% 60% 58% 42%/60% 40% 60% 40%}70%{transform:translate(-4vmax,26vmax) rotate(-250deg) scale(.95);border-radius:60% 40% 45% 55%/42% 55% 45% 58%}}
 @keyframes liq3{0%,100%{transform:translate(0,0) rotate(0) scale(1);border-radius:48% 52% 56% 44%/58% 42% 58% 42%}35%{transform:translate(20vmax,-10vmax) rotate(110deg) scale(1.1);border-radius:60% 40% 42% 58%/44% 58% 42% 56%}70%{transform:translate(-8vmax,-18vmax) rotate(230deg) scale(.96);border-radius:42% 58% 60% 40%/56% 44% 56% 44%}}
@@ -3158,6 +3213,34 @@ pre.log.ulog{height:150px;margin:10px 0 0}
   .kv{grid-template-columns:1fr}
   nav.dock button{padding:8px 10px;font-size:13px}
 }
+
+/* ===== v3: theme variables, glass, sections, light theme ===== */
+:root{--g1:rgba(34,40,72,.50);--g2:rgba(20,24,46,.36);--gl:rgba(255,255,255,.15);--m1:rgba(30,36,66,.86);--m2:rgba(18,22,44,.82);--btn:rgba(255,255,255,.07);--inp:rgba(5,7,20,.55);--tagbg:rgba(111,183,255,.13);--logbg:rgba(3,5,14,.62);--dock:rgba(14,16,34,.58);--ovl:rgba(0,0,8,.62)}
+:root[data-theme=light]{--bg:#e9ecf8;--bg2:#f4f6ff;--line:#c5cde6;--tx:#161a2e;--mut:#56608a;--acc2:#2563eb;--shadow:0 12px 30px -16px rgba(40,56,130,.45);--ring:0 0 0 3px rgba(37,99,235,.25);--g1:rgba(255,255,255,.66);--g2:rgba(255,255,255,.44);--gl:rgba(255,255,255,.95);--m1:rgba(255,255,255,.92);--m2:rgba(246,248,255,.9);--btn:rgba(30,45,110,.07);--inp:rgba(255,255,255,.75);--tagbg:rgba(37,99,235,.10);--logbg:rgba(255,255,255,.75);--dock:rgba(255,255,255,.66);--ovl:rgba(30,40,90,.35)}
+html[data-theme=light]{background:#e6e9f7}
+html[data-theme=light] #bg{background:radial-gradient(120% 90% at 50% 0%,#f6f3ff 0%,#e4e9fb 72%)}
+html[data-theme=light] #bg i{opacity:.30}
+html[data-theme=light] .big{background:linear-gradient(180deg,#161a2e,#3d4875);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+html[data-theme=light] .pill.ok{background:#dcfce7;border-color:#86efac;color:#15803d}
+html[data-theme=light] .pill.warn{background:#fef3c7;border-color:#fcd34d;color:#a16207}
+html[data-theme=light] .pill.bad{background:#fee2e2;border-color:#fca5a5;color:#b91c1c}
+html[data-theme=light] .banner{background:#fef3c7;border-color:#fcd34d;color:#a16207}
+html[data-theme=light] .btn.pri,html[data-theme=light] nav.dock button.on{color:#fff}
+.card{background:linear-gradient(160deg,var(--g1),var(--g2));border:1px solid var(--gl);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.22),inset 0 -1px 0 rgba(255,255,255,.04);backdrop-filter:blur(18px) saturate(175%);-webkit-backdrop-filter:blur(18px) saturate(175%)}
+.card::before{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:linear-gradient(125deg,rgba(255,255,255,.11),rgba(255,255,255,0) 40%)}
+.modal{background:linear-gradient(160deg,var(--m1),var(--m2));border:1px solid var(--gl);backdrop-filter:blur(22px) saturate(170%);-webkit-backdrop-filter:blur(22px) saturate(170%)}
+.overlay{background:var(--ovl)}
+nav.dock,header.top{background:var(--dock);border-color:var(--gl);backdrop-filter:blur(18px) saturate(175%);-webkit-backdrop-filter:blur(18px) saturate(175%)}
+.btn{background:var(--btn);border-color:var(--gl)}
+input,select{background:var(--inp);border-color:var(--gl);color:var(--tx)}
+.tag{background:var(--tagbg)}
+pre.log{background:var(--logbg)}
+.copy{background:var(--inp)}
+.toast{background:var(--m1);color:var(--tx)}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 22px}
+.linkbox{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 4px}
+.fsec{grid-column:1/-1;margin:20px 0 4px;padding-top:12px;border-top:1px solid var(--gl);font-weight:700;font-size:12px;letter-spacing:.7px;text-transform:uppercase;color:var(--mut)}
+.fsec:first-child{margin-top:4px;border-top:0;padding-top:0}
 </style>
 </head>
 <body>
@@ -3165,6 +3248,7 @@ pre.log.ulog{height:150px;margin:10px 0 0}
 <div id="app"></div>
 <script nonce="__NONCE__">
 'use strict';
+(function(){try{var th=localStorage.getItem('theme');if(th==='light'||th==='dark')document.documentElement.setAttribute('data-theme',th)}catch(e){}})();
 /* ---------- live background: slow mouse parallax ---------- */
 (function(){
   var r=document.documentElement, raf=0, x=0, y=0;
@@ -3176,7 +3260,7 @@ pre.log.ulog{height:150px;margin:10px 0 0}
 /* ---------- i18n ---------- */
 const TR = {
 en: {
- ev_tab:'Events', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
+ ev_tab:'Events', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
  diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load / uptime', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX',
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
@@ -3194,7 +3278,7 @@ en: {
  note_key:'The pre-shared key authenticates every packet (HMAC). Both sides must use the identical key.', srv_test_hint:'Listens for client packets for 10 s. Press Run here, then run the test on the client at the same time.', no_tunnels:'No tunnels yet.', warnings:'Warnings'
 },
 fa: {
- ev_tab:'رویدادها', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'آخرین نسخه', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
+ ev_tab:'رویدادها', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
  diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار / آپ‌تایم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال',
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
@@ -3251,6 +3335,7 @@ async function api(method,path,body){
 }
 function toast(msg,bad){const e=h('div',{class:'toast'+(bad?' bad':''),text:msg});document.body.append(e);setTimeout(()=>e.remove(),bad?6000:2800)}
 async function copy(text){try{await navigator.clipboard.writeText(text)}catch(e){const i=h('input',{value:text});document.body.append(i);i.select();document.execCommand('copy');i.remove()}toast(t('copied'))}
+function toggleTheme(){const r=document.documentElement,nx=r.getAttribute('data-theme')==='light'?'dark':'light';r.setAttribute('data-theme',nx);try{localStorage.setItem('theme',nx)}catch(e){}renderShell()}
 function stopTimers(){clearInterval(S.timer);clearInterval(S.logTimer);S.timer=S.logTimer=null}
 function fill(el,...kids){el.replaceChildren(...kids.flat(Infinity).filter(c=>c!=null&&c!==false))}
 function applyLang(){document.documentElement.lang=S.lang;document.documentElement.dir=S.lang==='fa'?'rtl':'ltr'}
@@ -3291,7 +3376,7 @@ function renderShell(){
   const root=document.getElementById('app');root.replaceChildren();
   const tabs=['overview','tunnels','events','logs','health','diagnose','settings'];
   root.append(
-    h('header',{class:'top'},h('div',{class:'logo'},h('b',{text:'Shadow'}),' Spoof'),h('span',{class:'tag',text:S.meta.role||'?'}),h('div',{class:'sp'}),h('button',{class:'btn sm',onclick:()=>{S.lang=S.lang==='fa'?'en':'fa';localStorage.setItem('lang',S.lang);renderShell()},text:S.lang==='fa'?'EN':'FA'})),
+    h('header',{class:'top'},h('div',{class:'logo'},h('b',{text:'Shadow'}),' Spoof'),h('span',{class:'tag',text:S.meta.role||'?'}),h('div',{class:'sp'}),h('button',{class:'btn sm',title:'theme',onclick:toggleTheme,text:(document.documentElement.getAttribute('data-theme')==='light'?'\u263E':'\u2600')}),h('button',{class:'btn sm',onclick:()=>{S.lang=S.lang==='fa'?'en':'fa';localStorage.setItem('lang',S.lang);renderShell()},text:S.lang==='fa'?'EN':'FA'})),
     h('div',{class:'wrap',id:'main'}),
     h('nav',{class:'dock'},tabs.map(v=>h('button',{class:S.view===v?'on':'',onclick:()=>{S.view=v;renderShell()},text:t(v==='events'?'ev_tab':v)})))
   );
@@ -3303,7 +3388,7 @@ function showView(){
   if(S.view==='health') return viewHealth(m);
   if(S.view==='diagnose') return viewDiagnose(m);
   if(S.view==='settings') return viewSettings(m);
-  const tick=async()=>{ if(S.modal) return; try{S.ov=await api('GET','/api/overview')}catch(e){return} const sy=window.scrollY; (S.view==='tunnels'?viewTunnels:S.view==='events'?viewEvents:viewOverview)(m); window.scrollTo(0,sy)};
+  const tick=async()=>{ if(S.modal) return; try{S.ov=await api('GET','/api/overview')}catch(e){return} refreshPings(); const sy=window.scrollY; (S.view==='tunnels'?viewTunnels:S.view==='events'?viewEvents:viewOverview)(m); window.scrollTo(0,sy)};
   tick();S.timer=setInterval(tick,3000);
 }
 
@@ -3330,6 +3415,27 @@ function evList(evs,max){
   if(!evs||!evs.length) return h('div',{class:'lbl',text:t('none')});
   return evs.slice().reverse().slice(0,max||25).map(e=>h('div',{class:'ev '+e.level},h('time',{class:'mono',text:fmtT(e.ts)}),h('span',{class:'tag',text:e.inst}),h('span',{class:'m mono',text:e.msg})));
 }
+let PING={},PINGAT={};
+function refreshPings(){
+  const now=Date.now();
+  for(const x of (S.ov&&S.ov.tunnels)||[]){
+    if(now-(PINGAT[x.name]||0)<9000) continue;
+    PINGAT[x.name]=now;
+    api('GET','/api/tunnels/'+x.name+'/ping').then(r=>{PING[x.name]=r}).catch(()=>{PING[x.name]={err:true}});
+  }
+}
+function linkBox(x){
+  const pg=PING[x.name],now=S.ov.now,hs=x.last_established;
+  const chip=(c,txt)=>h('span',{class:'pill '+c,text:txt});
+  if(!pg) return h('div',{class:'linkbox'},chip('warn',t('link_check')));
+  const reach=pg.ping_ms!=null||pg.tcp_ms!=null||(hs&&now-hs<600);
+  const parts=[chip(reach?'ok':'bad',reach?t('link_ok'):t('link_down')),
+    chip(pg.ping_ms!=null?'':'warn',pg.ping_ms!=null?'ping '+pg.ping_ms+' ms':'ping \u2014')];
+  if(pg.tcp_ms!=null) parts.push(chip('','tcp '+pg.tcp_ms+' ms'));
+  parts.push(chip(hs?'ok':'warn',hs?t('hs')+' '+fmtD(now-hs)+' '+t('ago'):t('no_hs')));
+  if(pg.peer_panel) parts.push(chip(pg.peer_panel.ok?'ok':'bad',t('peer_panel')+(pg.peer_panel.ok?' '+pg.peer_panel.ms+' ms':' \u2715')));
+  return h('div',{class:'linkbox'},parts);
+}
 function tc(x,full){
   const c=x.config||{},hs=x.history||{},l5=x.log5||{info:0,warn:0,error:0};
   const kv=(k,v)=>h('div',{},h('span',{class:'lbl',text:k}),h('span',{class:'v',text:v}));
@@ -3347,6 +3453,7 @@ function tc(x,full){
   return h('div',{class:'card'},
     h('div',{class:'row'},h('b',{text:x.name}),h('span',{class:'tag',text:x.role}),h('div',{class:'sp'}),pill(x.active)),
     h('div',{class:'lbl mono',text:`${c.real_ip||'?'} ⇄ ${c.peer_real_ip||'?'}  ·  UDP ${c.data_port||'?'} · ICMP ${c.icmp_id??'?'}`}),
+    linkBox(x),
     h('div',{class:'kv'},
       kv(t('uptime'),fmtD(x.uptime)),kv(t('restarts'),x.restarts),kv(t('cpu'),(x.cpu??0)+'%'),kv(t('rss'),fmtB(x.rss)),
       kv(t('conns'),x.conns??0),x.role==='client'?kv('SOCKS5','127.0.0.1:'+(c.socks5_port||'?')):kv(t('f_tun'),c.tunnel_count),
@@ -3364,21 +3471,31 @@ async function del(x){if(!confirm(t('confirm_del').replace('%s',x.name)))return;
 function viewTunnels(m){
   const o=S.ov;
   m.replaceChildren(
-    h('div',{class:'row'},h('button',{class:'btn pri',onclick:()=>formModal('create'),text:'+ '+t('create')}),h('button',{class:'btn',onclick:importModal,text:t('import')})),
+    h('div',{class:'toolbar'},h('button',{class:'btn pri',onclick:()=>formModal('create'),text:'+ '+t('create')}),h('button',{class:'btn',onclick:importModal,text:t('import')})),
     h('div',{class:'grid'},o.tunnels.length?o.tunnels.map(x=>tc(x,true)):h('div',{class:'card',text:t('no_tunnels')})));
 }
 function fieldDefs(role){
   const me=t(role),peer=t(role==='client'?'server':'client');
   return [
+   {sec:'sec_general'},
    {k:'name',l:t('f_name'),create:true},
    {k:'transport',l:t('f_transport'),hint:t('h_transport'),opts:[['spoof','UDP + ICMP (spoofed)'],['tcp','TCP (standard)']]},
-   {k:'real_ip',l:`${t('f_real')} (${me})`},{k:'spoofed_ip',l:`${t('f_spoof')} (${me})`},{k:'spoofed_ip_pool',l:t('f_pool'),list:true},
-   {k:'peer_real_ip',l:`${t('f_real')} (${peer})`},{k:'peer_spoofed_ip',l:`${t('f_spoof')} (${peer})`},
+   {sec:'sec_addr'},
+   {k:'real_ip',l:`${t('f_real')} (${me})`},{k:'peer_real_ip',l:`${t('f_real')} (${peer})`},
+   {k:'spoofed_ip',l:`${t('f_spoof')} (${me})`},{k:'peer_spoofed_ip',l:`${t('f_spoof')} (${peer})`},
+   {k:'spoofed_ip_pool',l:t('f_pool'),list:true},
    {k:'allowed_peers',l:t('f_peerpool'),list:true,hint:t('h_peerpool')},
-   {k:'interface',l:t('f_iface'),select:true},{k:'data_port',l:t('f_port')},{k:'icmp_id',l:t('f_icmp')},
+   {sec:'sec_port'},
+   {k:'data_port',l:t('f_port')},{k:'icmp_id',l:t('f_icmp')},{k:'interface',l:t('f_iface'),select:true},
    role==='client'&&{k:'socks5_port',l:t('f_socks')},
-   {k:'tunnel_count',l:t('f_tun')},{k:'mtu',l:t('f_mtu')},{k:'initial_cwnd',l:t('f_cwnd')},
+   {sec:'sec_perf'},
+   {k:'mtu',l:t('f_mtu')},{k:'initial_cwnd',l:t('f_cwnd')},
    {k:'max_retries',l:t('f_retries'),hint:t('h_retries')},{k:'rto_min_ms',l:t('f_rto'),hint:t('h_rto')},
+   {k:'tunnel_count',l:t('f_tun')},
+   {sec:'sec_rel'},
+   {k:'auto_restart',l:t('f_autorestart'),hint:t('h_autorestart'),opts:[['on-failure',t('ar_fail')],['always',t('ar_always')],['no',t('ar_no')]]},
+   {k:'restart_sec',l:t('f_restartsec')},
+   {sec:'sec_sec'},
    {k:'pre_shared_key',l:t('f_key'),key:true}
   ].filter(Boolean);
 }
@@ -3392,6 +3509,7 @@ function formModal(mode,x,prefill){
   const body=h('div',{});
   const rows=[];
   for(const f of defs){
+    if(f.sec){rows.push(h('div',{class:'fsec',text:t(f.sec)}));continue}
     if(f.create&&mode==='edit') continue;
     let inp;
     if(f.opts){inp=h('select',{},f.opts.map(o=>h('option',{value:o[0],text:o[1]})));inp.value=init(f.k)||f.opts[0][0];if(![...inp.options].some(o=>o.value===inp.value))inp.value=f.opts[0][0]}
@@ -3403,7 +3521,7 @@ function formModal(mode,x,prefill){
   const globalErr=h('div',{class:'err'});
   const save=h('button',{class:'btn pri',text:t('save')});
   save.addEventListener('click',async()=>{
-    const data={};for(const f of defs){if(f.create&&mode==='edit')continue;data[f.k]=inputs[f.k].value.trim()}
+    const data={};for(const f of defs){if(f.sec||(f.create&&mode==='edit'))continue;data[f.k]=inputs[f.k].value.trim()}
     for(const k in errs) errs[k].textContent='';globalErr.textContent='';save.disabled=true;
     try{
       const r=mode==='edit'?await api('PUT','/api/tunnels/'+x.name,data):await api('POST','/api/tunnels',data);
@@ -3569,7 +3687,7 @@ async function viewSettings(m){
       const st=r.running?t('upd_running'):r.error?r.error:r.available?t('upd_avail'):t('upd_latest');
       ubuild.textContent=t('upd_cur')+': '+(r.current||'?')+(r.latest?'  ·  '+t('upd_new')+': '+r.latest:'')+'  ·  '+st;
       ulog.textContent=r.log||'';ulog.scrollTop=ulog.scrollHeight;
-      ubtn.disabled=!!r.running;
+      ubtn.disabled=!r.available||!!r.running;
       if(r.running){clearInterval(S.timer);S.timer=setInterval(()=>uref(false),3000)} else if(S.timer){clearInterval(S.timer);S.timer=null}
     }catch(e){ubuild.textContent=t('upd_reconnect');clearInterval(S.timer);S.timer=setInterval(()=>uref(false),4000)}
   };
@@ -3782,6 +3900,9 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/link$", path)
             if m:
                 return api_tunnel_link(req, m.group(1))
+            m = re.match(r"^/api/tunnels/([a-z0-9-]+)/ping$", path)
+            if m:
+                return api_tunnel_ping(req, m.group(1))
         elif method == "POST":
             if path == "/api/logout":
                 with SESS_LOCK:
