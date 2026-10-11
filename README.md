@@ -17,21 +17,33 @@ doctor** — bundled so it builds and runs from this one repository.
 
 ## Install
 
+**One-liner** (fetches and runs the installer, which pulls this repo's core and builds it):
+
 ```bash
-gh repo clone primeshock/shadow-tunnel
+curl -fsSL https://raw.githubusercontent.com/primeshock/shadow-tunnel/master/install.sh | sudo bash
+```
+
+**Or clone first** (recommended if you want to read the script, or to build fully offline from the bundled `core/`):
+
+```bash
+git clone https://github.com/primeshock/shadow-tunnel.git
 cd shadow-tunnel
 sudo ./install.sh
 ```
 
-(or `git clone https://github.com/primeshock/shadow-tunnel.git`)
+Both are interactive — pick the role (**client** or **server**) and follow the
+prompts (the piped form reads your answers from the terminal). When cloned, the
+installer builds from the bundled `core/` with no extra network fetch.
 
-The installer detects the bundled `core/` and builds from it — no network fetch
-of the source needed. It is interactive; pick the role (**client** or
-**server**) and follow the prompts. For an unattended install:
+For an unattended install:
 
 ```bash
-sudo CANDY_NONINTERACTIVE=1 CANDY_ROLE=server CANDY_REAL_IP=203.0.113.1 ./install.sh
+curl -fsSL https://raw.githubusercontent.com/primeshock/shadow-tunnel/master/install.sh \
+  | sudo CANDY_NONINTERACTIVE=1 CANDY_ROLE=server CANDY_REAL_IP=203.0.113.1 bash
 ```
+
+> It runs as root and installs a Rust toolchain + packages on first run. Review
+> [`install.sh`](install.sh) before piping it to `sudo bash` if you prefer.
 
 When it finishes it prints the pre-shared key, a `candyspoof://` setup link for
 the other side, and the web-panel URL + password.

@@ -46,10 +46,10 @@ readonly PANEL_PY=$LIB_DIR/candy-panel.py
 readonly PANEL_JSON=$ETC_DIR/panel.json
 readonly TUNNELS_DIR=$ETC_DIR/tunnels
 readonly DEFAULT_ICMP_ID=17185   # 0x4321 - identical default on client and server
-readonly DEFAULT_REF=a6e1bc6c7a3de6ea9f02107ec91a98fe61c8721a
+readonly DEFAULT_REF=master
 readonly MIN_RUSTC=1.85.0
 
-REPO_URL=${CANDY_REPO_URL:-https://github.com/AmiRCandy/Candy-Spoof.git}
+REPO_URL=${CANDY_REPO_URL:-https://github.com/primeshock/shadow-tunnel.git}
 REPO_REF=${CANDY_REF:-$DEFAULT_REF}
 NONINTERACTIVE=${CANDY_NONINTERACTIVE:-0}
 ROLE=${CANDY_ROLE:-}
@@ -341,6 +341,8 @@ fetch_source() {
   BUILD_REF=$(git -C "$SRC" rev-parse HEAD)
   if [[ $REPO_REF =~ ^[0-9a-f]{40}$ && $BUILD_REF != "$REPO_REF" ]]; then die "commit mismatch"; fi
   [[ $REPO_REF =~ ^[0-9a-f]{40}$ ]] || warn "building unpinned ref '$REPO_REF' -> $BUILD_REF"
+  # This repo keeps the Rust core in a core/ subdirectory; build from there.
+  if [[ ! -f $SRC/Cargo.toml && -f $SRC/core/Cargo.toml ]]; then SRC=$SRC/core; fi
   ok "Source at $BUILD_REF"
 }
 
