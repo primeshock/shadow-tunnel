@@ -1107,7 +1107,8 @@ tunnel_menu() { # tunnel_menu <tunnel>
     item 4 Restart
     item 5 "Live Log"  "Ctrl+C to return"
     item 6 "Setup Link" "builds the other end"
-    item 7 Delete      "remove permanently"
+    item 7 "MTU test"  "recommend a tunnel mtu"
+    item 8 Delete      "remove permanently"
     printf '\nEnter your choice (%s0 to go back%s): ' "$c_c" "$c_0"
     local ch; read -r ch <"$TTY" || true
     case "$ch" in
@@ -1117,7 +1118,8 @@ tunnel_menu() { # tunnel_menu <tunnel>
       4) "$CTL" -t "$t" restart || true; pause ;;
       5) ( "$CTL" -t "$t" logs -f ) || true ;;
       6) echo "pre-shared key:"; "$CTL" -t "$t" token; echo; echo "setup link for the other end:"; "$CTL" -t "$t" link; pause ;;
-      7) if [[ $t == main ]]; then echo "the main tunnel cannot be deleted here"; pause
+      7) "$CTL" -t "$t" mtu || true; pause ;;
+      8) if [[ $t == main ]]; then echo "the main tunnel cannot be deleted here"; pause
          elif [[ "$(ask "type the name '$t' to confirm delete: ")" == "$t" ]]; then
            systemctl disable --now "$(unit_of "$t")" 2>/dev/null; rm -f "$TUNNELS/$t.toml"; systemctl reset-failed "$(unit_of "$t")" 2>/dev/null
            printf '%sdeleted%s\n' "$c_g" "$c_0"; pause; return 0
@@ -2332,6 +2334,15 @@ def api_logs(req, name):
     return {"rows": rows}
 
 
+def api_tunnel_link(req, name):
+    # The setup link embeds the pre-shared key; it is returned to the already
+    # authenticated session without a second password prompt (convenience for
+    # copying links / MTU setup).
+    inst = _inst_or_404(name)
+    cfg = inst.cfg()
+    return {"link": make_link(inst.name, inst.role, cfg), "fp": fingerprint(cfg.get("pre_shared_key", ""))}
+
+
 MAGIC = b"\xca\xfe\x5f\x00"
 
 
@@ -3011,10 +3022,10 @@ pre.log .t{color:var(--mut)}.lv-ERROR{color:var(--bad)}.lv-WARN{color:var(--warn
 const TR = {
 en: {
  overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
- diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
+ diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load / uptime', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX',
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
- events:'Recent events', none:'Nothing yet', details:'Details', start:'Start', stop:'Stop', restart:'Restart', del:'Delete', edit:'Edit', test:'Link test', key:'Key & link',
+ events:'Recent events', none:'Nothing yet', details:'Details', start:'Start', stop:'Stop', restart:'Restart', del:'Delete', edit:'Edit', test:'Link test', key:'Key & link', link:'Setup link',
  create:'Create tunnel', import:'Import link', cancel:'Cancel', save:'Save', close:'Close', confirm_del:'Delete tunnel "%s"? Its service and config are removed.',
  f_name:'Tunnel name', f_transport:'Transport', h_transport:'spoof = UDP+ICMP forged source · tcp = standard non-spoofed TCP', f_real:'Real IP', f_spoof:'Spoofed IP', f_pool:'Spoofed IP pool (comma-separated, optional)', f_peerpool:'Peer spoofed IP pool (optional)',
  h_peerpool:'Every pool address the peer may use, otherwise its packets are dropped (allowed_peers).', f_iface:'Interface', f_port:'Data port', f_icmp:'ICMP ID (0-65535 or 0x..)',
@@ -3029,10 +3040,10 @@ en: {
 },
 fa: {
  overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
- diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
+ diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار / آپ‌تایم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال',
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
- events:'رویدادهای اخیر', none:'هنوز چیزی نیست', details:'جزئیات', start:'شروع', stop:'توقف', restart:'ری‌استارت', del:'حذف', edit:'ویرایش', test:'تست لینک', key:'کلید و لینک',
+ events:'رویدادهای اخیر', none:'هنوز چیزی نیست', details:'جزئیات', start:'شروع', stop:'توقف', restart:'ری‌استارت', del:'حذف', edit:'ویرایش', test:'تست لینک', key:'کلید و لینک', link:'لینک راه‌اندازی',
  create:'ساخت تونل', import:'وارد کردن لینک', cancel:'انصراف', save:'ذخیره', close:'بستن', confirm_del:'تونل «%s» حذف شود؟ سرویس و کانفیگ آن پاک می‌شود.',
  f_name:'نام تونل', f_transport:'نوع انتقال', h_transport:'spoof = UDP+ICMP با منبع جعلی · tcp = TCP استاندارد بدون جعل', f_real:'IP واقعی', f_spoof:'IP جعلی', f_pool:'استخر IP جعلی (با کاما، اختیاری)', f_peerpool:'استخر IP جعلی طرف مقابل (اختیاری)',
  h_peerpool:'همهٔ IPهایی که طرف مقابل ممکن است استفاده کند؛ وگرنه بسته‌هایش دور ریخته می‌شود (allowed_peers).', f_iface:'اینترفیس', f_port:'پورت دیتا', f_icmp:'ICMP ID ‏(۰ تا ۶۵۵۳۵ یا 0x..)',
@@ -3170,6 +3181,7 @@ function tc(x,full){
   ];
   if(full) acts.push(
     h('button',{class:'btn sm',onclick:()=>formModal('edit',x),text:t('edit')}),
+    h('button',{class:'btn sm',onclick:()=>linkModal(x),text:t('link')}),
     h('button',{class:'btn sm',onclick:()=>keyModal(x),text:t('key')}),
     h('button',{class:'btn sm',onclick:()=>testModal(x),text:t('test')}),
     x.name!=='main'&&h('button',{class:'btn sm dng',onclick:()=>del(x),text:t('del')}));
@@ -3255,6 +3267,16 @@ function keyView(r){
   return [h('div',{class:'lbl',text:t('f_key')}),h('div',{class:'copy mono',text:r.key}),h('div',{class:'row'},h('button',{class:'btn sm',onclick:()=>copy(r.key),text:t('copy')}),h('span',{class:'lbl',text:`${t('fp')}: ${r.fp}`})),
     h('div',{class:'lbl',text:'Link'}),h('div',{class:'copy mono',text:r.link}),h('div',{class:'row'},h('button',{class:'btn sm',onclick:()=>copy(r.link),text:t('copy')})),
     h('div',{class:'hint',text:t('link_hint')}),h('div',{class:'hint',text:t('note_key')})];
+}
+async function linkModal(x){
+  let r; try{ r=await api('GET','/api/tunnels/'+x.name+'/link'); }catch(e){ if(!e.handled)toast(e.message,1); return; }
+  openModal([h('h3',{text:t('link')+': '+x.name}),
+    h('div',{class:'hint',text:t('link_hint')}),
+    h('div',{class:'copy mono',text:r.link}),
+    h('div',{class:'hint',text:t('fp')+': '+(r.fp||'?')}),
+    h('div',{class:'row'},
+      h('button',{class:'btn pri',text:t('copy'),onclick:()=>{try{navigator.clipboard.writeText(r.link);toast(t('copied'))}catch(e){toast(t('copied'))}}}),
+      h('button',{class:'btn',onclick:closeModal,text:t('close')}))]);
 }
 function keyModal(x,known){
   if(known&&known.key) return openModal([h('h3',{text:`${t('key')}: ${x.name}`}),keyView(known),h('button',{class:'btn',onclick:closeModal,text:t('close')})]);
@@ -3344,23 +3366,28 @@ function viewDiagnose(m){
     }catch(e){if(!e.handled)out.replaceChildren(h('div',{class:'err',text:e.message}))}
   };
   const mout=h('div',{class:'hint'});
+  const tnames=(S.ov&&S.ov.tunnels||[]).map(x=>x.name); if(!tnames.length) tnames.push('main');
+  const tsel=h('select',{},tnames.map(n=>h('option',{value:n,text:n})));
   const mtu=async()=>{
     mout.textContent=t('running');
+    const nm=tsel.value||'main';
     try{
-      const r=await api('POST','/api/mtu',{name:'main'});
+      const r=await api('POST','/api/mtu',{name:nm});
       mout.replaceChildren(
-        h('div',{},t('mtu_path')+': '+r.path_mtu+'  \u00b7  '+t('mtu_rec')+': '+h_b(r.recommended_mtu)+'  \u00b7  '+t('mtu_cur')+': '+(r.current_mtu||'-')),
-        h('div',{class:'row'},h('button',{class:'btn sm',text:t('mtu_apply'),onclick:async()=>{try{await api('PUT','/api/tunnels/main',{mtu:r.recommended_mtu});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}})));
+        h('div',{},t('mtu_path')+': '+r.path_mtu+'  \u00b7  '+t('mtu_rec')+': '+r.recommended_mtu+'  \u00b7  '+t('mtu_cur')+': '+(r.current_mtu||'-')),
+        h('div',{class:'row'},h('button',{class:'btn sm',text:t('mtu_apply'),onclick:async()=>{try{await api('PUT','/api/tunnels/'+nm,{mtu:r.recommended_mtu});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}})));
     }catch(e){if(!e.handled)mout.textContent=e.message}
   };
-  function h_b(x){return x} // plain value
   m.replaceChildren(
     h('div',{class:'card'},
       h('b',{text:t('diag_title')}),
       h('div',{class:'hint',text:t('diag_hint')}),
       h('label',{class:'f'},h('span',{text:t('peer_link')}),link),
       h('div',{class:'row'},
-        h('button',{class:'btn pri',onclick:run,text:t('run_diag')}),
+        h('button',{class:'btn pri',onclick:run,text:t('run_diag')})),
+      h('div',{class:'lbl',text:'\u00a0'}),
+      h('div',{class:'row'},
+        h('span',{class:'lbl',text:t('mtu_for')}),tsel,
         h('button',{class:'btn',onclick:mtu,text:t('mtu_test')})),
       mout),
     h('div',{class:'lbl',text:'\u00a0'}),
@@ -3539,6 +3566,9 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/logs$", path)
             if m:
                 return api_logs(req, m.group(1))
+            m = re.match(r"^/api/tunnels/([a-z0-9-]+)/link$", path)
+            if m:
+                return api_tunnel_link(req, m.group(1))
         elif method == "POST":
             if path == "/api/logout":
                 with SESS_LOCK:
