@@ -1979,7 +1979,7 @@ class Monitor(object):
             self.window.append((ts or now, name, lvl, kind))
             if kind:
                 self.totals[name][kind] += 1
-            if kind == "established":
+            if kind in ("established", "accepted", "forward"):
                 self.last_est[name] = ts or now
             if lvl in ("WARN", "ERROR"):
                 self.event(name, "error" if lvl == "ERROR" else "warn", msg.strip()[:300], key=(name, kind or msg[:40]))
@@ -3241,6 +3241,39 @@ pre.log{background:var(--logbg)}
 .linkbox{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 4px}
 .fsec{grid-column:1/-1;margin:20px 0 4px;padding-top:12px;border-top:1px solid var(--gl);font-weight:700;font-size:12px;letter-spacing:.7px;text-transform:uppercase;color:var(--mut)}
 .fsec:first-child{margin-top:4px;border-top:0;padding-top:0}
+
+/* ===== v4: calmer glow, dashboard-style backdrop, clean light theme ===== */
+.btn.pri{box-shadow:0 2px 8px -3px rgba(176,107,255,.45)}
+.btn.pri:hover{filter:brightness(1.06)}
+nav.dock button.on{box-shadow:0 2px 8px -3px rgba(176,107,255,.5)}
+.grid .card:hover{transform:none;border-color:rgba(255,255,255,.26);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.24)}
+.card{box-shadow:0 6px 18px -12px rgba(0,0,0,.7),inset 0 1px 0 rgba(255,255,255,.18)}
+.card::before{background:linear-gradient(125deg,rgba(255,255,255,.07),rgba(255,255,255,0) 38%)}
+.pill.dim{color:var(--acc2);border-color:rgba(111,183,255,.25);background:rgba(111,183,255,.07);opacity:.8}
+.pill.ok{font-weight:600}
+/* backdrop: near-black base, navy glow top-left, maroon bottom-right, faint grid */
+html{background:#05060b}
+#bg{background:radial-gradient(130% 100% at 0% 0%,#0b1033 0%,#05060b 62%)}
+#bg i{opacity:.32}
+#bg .b1{background:#1d2a8a}
+#bg .b2{background:#3a1d7a}
+#bg .b3{background:#2b1160}
+#bg .b4{background:#5a1226;opacity:.30}
+#bg::after{content:"";position:absolute;inset:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.028) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.028) 1px,transparent 1px);background-size:42px 42px;-webkit-mask-image:radial-gradient(90% 80% at 50% 40%,#000 30%,transparent 100%);mask-image:radial-gradient(90% 80% at 50% 40%,#000 30%,transparent 100%)}
+/* light theme: clean neutral panel, soft white glass, barely-there tint */
+:root[data-theme=light]{--bg:#f3f5fa;--bg2:#ffffff;--line:#d5dbe8;--tx:#141a2e;--mut:#5b6685;--g1:rgba(255,255,255,.78);--g2:rgba(255,255,255,.58);--gl:rgba(20,30,70,.10);--m1:rgba(255,255,255,.96);--m2:rgba(247,249,254,.95);--btn:rgba(20,30,70,.05);--inp:#ffffff;--dock:rgba(255,255,255,.82);--shadow:0 6px 18px -12px rgba(30,45,100,.35)}
+html[data-theme=light]{background:#f3f5fa}
+html[data-theme=light] #bg{background:radial-gradient(120% 90% at 0% 0%,#eaeefc 0%,#f3f5fa 60%)}
+html[data-theme=light] #bg i{opacity:.12}
+html[data-theme=light] #bg .b1{background:#7c8cff}html[data-theme=light] #bg .b2{background:#b7a6ff}html[data-theme=light] #bg .b3{background:#9cc7ff}html[data-theme=light] #bg .b4{background:#ffb3d1;opacity:.10}
+html[data-theme=light] #bg::after{background-image:linear-gradient(rgba(20,30,70,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(20,30,70,.045) 1px,transparent 1px)}
+html[data-theme=light] .card{box-shadow:0 4px 14px -10px rgba(30,45,100,.35),inset 0 1px 0 #fff}
+html[data-theme=light] .card::before{background:linear-gradient(125deg,rgba(255,255,255,.55),rgba(255,255,255,0) 40%)}
+html[data-theme=light] header.top,html[data-theme=light] nav.dock{border-color:var(--gl)}
+html[data-theme=light] .btn{color:var(--tx)}
+html[data-theme=light] .btn.pri{color:#fff}
+html[data-theme=light] .pill.dim{color:#2563eb;background:rgba(37,99,235,.07);border-color:rgba(37,99,235,.25)}
+html[data-theme=light] .big{background:none;-webkit-text-fill-color:var(--tx);color:var(--tx)}
 </style>
 </head>
 <body>
@@ -3430,10 +3463,10 @@ function linkBox(x){
   if(!pg) return h('div',{class:'linkbox'},chip('warn',t('link_check')));
   const reach=pg.ping_ms!=null||pg.tcp_ms!=null||(hs&&now-hs<600);
   const parts=[chip(reach?'ok':'bad',reach?t('link_ok'):t('link_down')),
-    chip(pg.ping_ms!=null?'':'warn',pg.ping_ms!=null?'ping '+pg.ping_ms+' ms':'ping \u2014')];
+    chip(pg.ping_ms!=null?'ok':'warn',pg.ping_ms!=null?'ping '+pg.ping_ms+' ms':'ping \u2014')];
   if(pg.tcp_ms!=null) parts.push(chip('','tcp '+pg.tcp_ms+' ms'));
   parts.push(chip(hs?'ok':'warn',hs?t('hs')+' '+fmtD(now-hs)+' '+t('ago'):t('no_hs')));
-  if(pg.peer_panel) parts.push(chip(pg.peer_panel.ok?'ok':'bad',t('peer_panel')+(pg.peer_panel.ok?' '+pg.peer_panel.ms+' ms':' \u2715')));
+  if(pg.peer_panel) parts.push(chip(pg.peer_panel.ok?'dim':'bad',t('peer_panel')+(pg.peer_panel.ok?' '+pg.peer_panel.ms+' ms':' \u2715')));
   return h('div',{class:'linkbox'},parts);
 }
 function tc(x,full){
