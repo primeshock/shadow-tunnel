@@ -24,7 +24,7 @@ binary parses, so what you see is what the service actually does.
   - [Diagnose — the tunnel doctor](#diagnose--the-tunnel-doctor)
   - [Settings](#settings)
 - [Configuration reference](#configuration-reference)
-- [`shadowctl` command-line](#shadowctl-command-line)
+- [`shadowtun` command-line](#shadowtun-command-line)
 - [HTTP API](#http-api)
 - [Troubleshooting a tunnel](#troubleshooting-a-tunnel)
 - [Internationalisation (EN / FA RTL)](#internationalisation-en--fa-rtl)
@@ -38,10 +38,10 @@ binary parses, so what you see is what the service actually does.
 | `shadow-spoof-client` / `shadow-spoof-server` | the Rust tunnel binary (built from the `Shadow Spoof` repo) | `shadow-spoof` user, `CAP_NET_RAW` |
 | `shadow-panel.py panel` | the web panel (this document) | **root**, hardened by systemd |
 | `shadow-panel.py monitor` | background sampler that writes metrics/history/events | `shadow-spoof` user |
-| `shadowctl` | the operator CLI | root (via `sudo`) |
+| `shadowtun` | the operator CLI | root (via `sudo`) |
 
 The panel, monitor, and CLI are all the same `shadow-panel.py` file invoked with
-different sub-commands. The panel talks to systemd through `shadowctl`/`systemctl`
+different sub-commands. The panel talks to systemd through `shadowtun`/`systemctl`
 and reads `/etc/shadow-spoof/*.toml`, `/proc`, `ss`, and journald.
 
 A node is exactly one **role** — `client` **or** `server` — chosen at install
@@ -58,7 +58,7 @@ After install, the final report prints the URL and the one-time password.
 
 ```bash
 sudo ./install.sh                 # interactive; enables the panel by default
-shadowctl panel info               # print the panel URL any time
+shadowtun panel info               # print the panel URL any time
 ```
 
 Defaults: it listens on **`127.0.0.1:7777`** over HTTP. Because it binds to
@@ -72,11 +72,11 @@ ssh -L 7777:127.0.0.1:7777 root@<your-server>
 Change where it listens (see also the **Settings** tab):
 
 ```bash
-shadowctl panel port 8443
-shadowctl panel bind 10.0.0.5      # bind a specific address
-shadowctl panel tls on             # serve HTTPS with a self-signed cert
-shadowctl panel passwd             # set a new password (prompted)
-shadowctl panel restart
+shadowtun panel port 8443
+shadowtun panel bind 10.0.0.5      # bind a specific address
+shadowtun panel tls on             # serve HTTPS with a self-signed cert
+shadowtun panel passwd             # set a new password (prompted)
+shadowtun panel restart
 ```
 
 ---
@@ -91,7 +91,7 @@ shadowctl panel restart
 - **Brute-force**: failed logins are rate-limited per client IP.
 - **Loopback by default** + optional TLS; intended to be reached over SSH.
 - **Secrets**: the pre-shared key is shown in the UI only after re-entering the
-  panel password, and is redacted in `shadowctl config` output.
+  panel password, and is redacted in `shadowtun config` output.
 
 > The panel runs as root (it manages systemd units and raw-socket services), so
 > treat access to it as root access. Keep it on loopback + SSH, or behind TLS.
@@ -225,23 +225,23 @@ these and the Rust binary enforces them.
 
 ---
 
-## `shadowctl` command-line
+## `shadowtun` command-line
 
 ```
-shadowctl [-t NAME] <command>
+shadowtun [-t NAME] <command>
 
   status                  services, watchdog, panel and (redacted) config
   check                   validate the config with the binary (--check-config); exit 1 if rejected
   tunnels                 list tunnels on this host
   start | stop | restart  all tunnels (or one with -t NAME)
-  logs [journalctl args]  e.g. shadowctl logs -f
+  logs [journalctl args]  e.g. shadowtun logs -f
   monitor                 live dashboard (CPU/RAM/connections/traffic/events)
   monitor logs [LEVEL]    live colourised logs
   test [--host H --port P --secs N]
                           end-to-end tunnel test: handshake, real data, packet capture
   config                  print the config (pre_shared_key redacted)
   config edit             edit in $EDITOR; validated, applied with automatic rollback
-  set key=value ...       change fields, e.g. shadowctl set icmp_id=17185 mtu=1300
+  set key=value ...       change fields, e.g. shadowtun set icmp_id=17185 mtu=1300
   token                   print the pre-shared key
   link                    print the setup link for the other side
   watchdog <off|30m|1h|6h|12h|24h>
@@ -250,7 +250,7 @@ shadowctl [-t NAME] <command>
   panel [info|passwd|passwd-set|port N|bind IP|tls on|off|start|stop|restart]
 ```
 
-`shadowctl check` is the quickest way to confirm a config will actually be
+`shadowtun check` is the quickest way to confirm a config will actually be
 accepted by the binary before (re)starting the service.
 
 ---
@@ -298,7 +298,7 @@ all of these and names the field:
    won't start if it doesn't exist. Use the device that owns `real_ip`.
 4. **Firewall** — inbound `UDP/<data_port>` and ICMP echo from the peer must be
    allowed.
-5. **Service "up" but not working** — `shadowctl check` confirms the config
+5. **Service "up" but not working** — `shadowtun check` confirms the config
    parses; the Logs tab shows `tunnel N established` on success. Process-liveness
    alone is not success.
 

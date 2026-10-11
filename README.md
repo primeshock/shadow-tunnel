@@ -1,7 +1,7 @@
 # Shadow Tunnel
 
 A Shadow Spoof tunnel node — the Rust tunnel core, a one-shot installer, a
-`shadowctl` CLI, and a bilingual (EN/FA) web panel with a built-in **tunnel
+`shadowtun` CLI, and a bilingual (EN/FA) web panel with a built-in **tunnel
 doctor** — bundled so it builds and runs from this one repository.
 
 > Linux + systemd server, root required. The tunnel uses raw sockets
@@ -11,9 +11,9 @@ doctor** — bundled so it builds and runs from this one repository.
 
 | Path | What it is |
 |---|---|
-| `install.sh` | installer + runtime layer (builds the core, writes config/units, installs `shadowctl` and the web panel) |
+| `install.sh` | installer + runtime layer (builds the core, writes config/units, installs `shadowtun` and the web panel) |
 | `core/` | the Rust tunnel core (client/server binaries) — built automatically |
-| `PANEL.md` | full documentation for the web panel, `shadowctl`, config fields, API, and troubleshooting |
+| `PANEL.md` | full documentation for the web panel, `shadowtun`, config fields, API, and troubleshooting |
 
 ## Install
 
@@ -50,36 +50,36 @@ the other side, and the web-panel URL + password.
 
 ## Use it
 
-**`shadowspoof`** — one command opens an interactive menu for everything:
+**`shadowtun`** — one command opens an interactive menu for everything:
 manage tunnels (list/active state, per-field config edit, start/stop/restart/
 delete), open the web panel, **update**, **backup**, health, logs, the
 **Diagnose** tunnel-doctor, and panel settings (password/watchdog/bind/port/TLS).
 
 ```bash
-sudo shadowspoof
+sudo shadowtun
 ```
 
-Or drive it directly with `shadowctl`:
+Or drive it directly with `shadowtun`:
 
 ```bash
-shadowctl status          # services, config (key redacted)
-shadowctl check           # validate the config against the binary
-shadowctl diagnose        # tunnel doctor (add --link <peer link> for a 2-sided check)
-shadowctl test            # end-to-end tunnel test
-shadowctl logs -f         # follow the logs
-shadowctl backup          # tar.gz of /etc/shadow-spoof (config + keys)
-shadowctl update          # rebuild + reinstall the latest, keeping your config
-shadowctl panel info      # print the panel URL
+shadowtun status          # services, config (key redacted)
+shadowtun check           # validate the config against the binary
+shadowtun diagnose        # tunnel doctor (add --link <peer link> for a 2-sided check)
+shadowtun test            # end-to-end tunnel test
+shadowtun logs -f         # follow the logs
+shadowtun backup          # tar.gz of /etc/shadow-spoof (config + keys)
+shadowtun update          # rebuild + reinstall the latest, keeping your config
+shadowtun panel info      # print the panel URL
 ```
 
 ### Updating without losing your tunnels
 
-`shadowctl update` (or re-running the installer) **keeps `/etc/shadow-spoof`** —
+`shadowtun update` (or re-running the installer) **keeps `/etc/shadow-spoof`** —
 your config, keys, panel password and extra tunnels are preserved; only the
 binary, CLI and panel are rebuilt. It makes a backup first. To update by hand:
 
 ```bash
-sudo shadowctl update            # recommended
+sudo shadowtun update            # recommended
 # or, equivalently, re-run the installer (answer "y" to "keep configuration")
 curl -fsSL https://raw.githubusercontent.com/primeshock/shadow-tunnel/master/install.sh | sudo bash
 ```

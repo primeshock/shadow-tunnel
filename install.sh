@@ -41,7 +41,7 @@ readonly SRC_DIR=$STATE_DIR/src
 readonly UNIT_DIR=${SHADOW_UNIT_DIR:-/etc/systemd/system}
 readonly BIN_DIR=/usr/local/bin
 readonly SHADOWCTL=$BIN_DIR/shadowctl
-readonly SHADOWSPOOF=$BIN_DIR/shadowspoof
+readonly SHADOWTUN=$BIN_DIR/shadowtun
 readonly LIB_DIR=${SHADOW_LIB_DIR:-/usr/local/lib/shadow-spoof}
 readonly PANEL_PY=$LIB_DIR/shadow-panel.py
 readonly PANEL_JSON=$ETC_DIR/panel.json
@@ -626,6 +626,8 @@ PSK_FILE=$ETC/psk
 ROLE_FILE=$ETC/role
 BUILD_INFO=$ETC/build-info
 UNIT_DIR=${SHADOW_UNIT_DIR:-/etc/systemd/system}
+STATE=${SHADOW_STATE_DIR:-/var/lib/shadow-spoof}
+SVC_USER=shadow-spoof
 LIB=/usr/local/lib/shadow-spoof
 PYSCRIPT=$LIB/shadow-panel.py
 
@@ -647,6 +649,8 @@ Usage: shadowctl [-t NAME] <command>
   diagnose [--link L]    full tunnel-path doctor; pass the peer's setup link for a two-sided check
   update                 update to the latest release (rebuild), keeping your configuration
   backup [FILE]          write a .tar.gz of /etc/shadow-spoof (config + keys)
+  restore <FILE>         restore config/keys from a backup, then restart (backs up current first)
+  uninstall              remove services, binaries, panel and config
   config                 print the configuration (pre_shared_key redacted)
   config edit            edit in \$EDITOR; validated, applied with automatic rollback
   set key=value ...      change fields, e.g.  shadowctl set icmp_id=17185 mtu=1300
@@ -929,6 +933,43 @@ cmd_update() { # rebuild + reinstall from the latest release, keeping the config
   curl -fsSL "$url" | SHADOW_NONINTERACTIVE=1 SHADOW_RECONFIGURE=0 SHADOW_ROLE="$ROLE" bash
 }
 
+cmd_restore() { # restore /etc/shadow-spoof from a backup tar.gz, then restart
+  local f=${1-}
+  [[ -f $f ]] || die "backup file not found: '$f'"
+  tar tzf "$f" >/dev/null 2>&1 || die "not a valid .tar.gz: $f"
+  local safety; safety=$(cmd_backup) && echo "current config saved to $safety first" >&2
+  local tmp; tmp=$(mktemp -d)
+  tar xzf "$f" -C "$tmp" || die "extract failed"
+  local src="$tmp/$(basename "$ETC")"
+  [[ -d $src ]] || src=$(find "$tmp" -maxdepth 1 -type d ! -path "$tmp" | head -n1)
+  [[ -d $src ]] || die "backup does not contain a config directory"
+  rm -rf "$ETC"; mv "$src" "$ETC"; rm -rf "$tmp"
+  chown -R root:"$SVC_USER" "$ETC" 2>/dev/null || true
+  [[ -f $PSK_FILE ]] && chmod 0600 "$PSK_FILE" 2>/dev/null || true
+  $SYSTEMCTL daemon-reload 2>/dev/null || true
+  local n; for n in $(inst_names); do $SYSTEMCTL try-restart "$(unit_of "$n")" 2>/dev/null || true; done
+  echo "restored $ETC from $f"
+}
+
+cmd_uninstall() {
+  if [[ ${1-} != -y ]]; then
+    printf 'This removes services, binaries, the panel and %s. Type YES to confirm: ' "$ETC" >&2
+    local a=""; read -r a </dev/tty 2>/dev/null || true
+    [[ $a == YES ]] || { echo "aborted" >&2; return 1; }
+  fi
+  local u
+  for u in $($SYSTEMCTL list-unit-files --no-legend 'shadow-spoof-*' 2>/dev/null | awk '{print $1}'); do
+    $SYSTEMCTL disable --now "$u" >/dev/null 2>&1 || true
+  done
+  rm -f  "$UNIT_DIR"/shadow-spoof-*.service "$UNIT_DIR"/shadow-spoof-*.timer 2>/dev/null || true
+  rm -rf "$UNIT_DIR"/shadow-spoof-*.service.d 2>/dev/null || true
+  $SYSTEMCTL daemon-reload 2>/dev/null || true
+  rm -f  /usr/local/bin/shadow-spoof-client /usr/local/bin/shadow-spoof-server \
+         /usr/local/bin/shadowctl /usr/local/bin/shadowtun 2>/dev/null || true
+  rm -rf /usr/local/lib/shadow-spoof "$ETC" "${STATE:-/var/lib/shadow-spoof}" 2>/dev/null || true
+  echo "Shadow Spoof removed. (the 'shadow-spoof' system user was left in place)"
+}
+
 cmd=$1; shift
 check_target
 case $cmd in
@@ -937,6 +978,8 @@ case $cmd in
   diagnose)    need_py; exec "${PY[@]}" diagnose ${TARGET:+-t "$TARGET"} "$@" ;;
   update)      cmd_update "${1-}" ;;
   backup)      cmd_backup "${1-}" ;;
+  restore)     cmd_restore "${1-}" ;;
+  uninstall)   cmd_uninstall "${1-}" ;;
   tunnels)     cmd_tunnels ;;
   start|stop|restart)
                for n in $(targets); do $SYSTEMCTL "$cmd" "$(unit_of "$n")"; done; echo "$cmd: $(targets | tr '\n' ' ')" ;;
@@ -959,54 +1002,78 @@ SHADOWCTL_EOF
   ok "Installed $SHADOWCTL"
 }
 
-install_shadowspoof() {
-  cat >"$SHADOWSPOOF.new" <<'SHADOWSPOOF_EOF'
+install_shadowtun() {
+  cat >"$SHADOWTUN.new" <<'SHADOWTUN_EOF'
 #!/usr/bin/env bash
-# shadowspoof - friendly interactive menu over shadowctl (installed by install.sh)
+# shadowtun - the single Shadow Spoof command: interactive menu, or a
+# pass-through to the scriptable backend (installed by install.sh).
+#
+#   shadowtun              open the interactive menu
+#   shadowtun <command>    run a backend command, e.g. shadowtun status
 set -Euo pipefail
 
 ETC=${SHADOW_ETC_DIR:-/etc/shadow-spoof}
 ROLE_FILE=$ETC/role
 TUNNELS=$ETC/tunnels
 CTL=${SHADOW_CTL:-/usr/local/bin/shadowctl}
-PANEL_JSON=$ETC/panel.json
+VERSION=2.0.0
+
+# Pass-through: `shadowtun <anything>` runs the backend so every command lives
+# under one name (status, check, diagnose, update, backup, restore, ...).
+if [[ $# -gt 0 ]]; then exec "$CTL" "$@"; fi
 
 if [[ $EUID -ne 0 ]]; then
   command -v sudo >/dev/null && exec sudo -- "$0" "$@"
-  echo "shadowspoof: must run as root" >&2; exit 1
+  echo "shadowtun: must run as root" >&2; exit 1
 fi
-[[ -r $ROLE_FILE ]] || { echo "shadowspoof: not installed (missing $ROLE_FILE)"; exit 1; }
+[[ -r $ROLE_FILE ]] || { echo "shadowtun: not installed (missing $ROLE_FILE)"; exit 1; }
 ROLE=$(<"$ROLE_FILE")
 
 if [[ -t 0 ]]; then TTY=/dev/stdin; elif { : </dev/tty; } 2>/dev/null; then TTY=/dev/tty
-else echo "shadowspoof needs a terminal; use 'shadowctl' directly for scripting" >&2; exit 1; fi
+else echo "shadowtun needs a terminal; run 'shadowtun <command>' for scripting" >&2; exit 1; fi
 
-c_b=$'\e[36m'; c_g=$'\e[32m'; c_y=$'\e[33m'; c_d=$'\e[2m'; c_0=$'\e[0m'
-[[ -t 1 ]] || { c_b=; c_g=; c_y=; c_d=; c_0=; }
+c_r=$'\e[38;5;203m'; c_c=$'\e[36m'; c_b=$'\e[1m'; c_g=$'\e[32m'; c_y=$'\e[33m'; c_d=$'\e[2m'; c_0=$'\e[0m'
+[[ -t 1 ]] || { c_r=; c_c=; c_b=; c_g=; c_y=; c_d=; c_0=; }
 
 ask()   { local p=$1 v=""; printf '%s' "$p" >&2; read -r v <"$TTY" || true; printf '%s' "$v"; }
 pause() { printf '\n%sEnter to continue%s ' "$c_d" "$c_0" >&2; read -r _ <"$TTY" || true; }
+item()  { printf '  %s%2s)%s %s%-15s%s %s%s%s\n' "$c_c" "$1" "$c_0" "$c_b" "$2" "$c_0" "$c_d" "${3:-}" "$c_0"; }
 names() { echo main; local f; for f in "$TUNNELS"/*.toml; do [[ -e $f ]] && basename "$f" .toml; done; return 0; }
 active(){ systemctl is-active "shadow-spoof-$ROLE${1:+@$1}.service" 2>/dev/null || true; }
 unit_of(){ [[ $1 == main ]] && echo "shadow-spoof-$ROLE.service" || echo "shadow-spoof-$ROLE@$1.service"; }
-
+cfgval(){ "$CTL" -t "$1" config 2>/dev/null | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" | head -n1 | tr -d '"'; }
 panel_url() { command -v python3 >/dev/null && python3 /usr/local/lib/shadow-spoof/shadow-panel.py admin info 2>/dev/null || true; }
 
-FIELDS_COMMON=(real_ip peer_real_ip spoofed_ip peer_spoofed_ip spoofed_ip_pool allowed_peers \
-               data_port icmp_id mtu initial_cwnd max_retries rto_min_ms interface pre_shared_key)
+banner() {
+  printf '%s' "$c_r"
+  cat <<'ART'
+   ███████ ██   ██  █████  ██████   ██████  ██     ██
+   ██      ██   ██ ██   ██ ██   ██ ██    ██ ██     ██
+   ███████ ███████ ███████ ██   ██ ██    ██ ██  █  ██
+        ██ ██   ██ ██   ██ ██   ██ ██    ██ ██ ███ ██
+   ███████ ██   ██ ██   ██ ██████   ██████   ███ ███
+ART
+  printf '%s' "$c_0"
+  printf '   %sShadow Spoof%s  %sv%s%s   role: %s%s%s\n' "$c_b" "$c_0" "$c_r" "$VERSION" "$c_0" "$c_g" "$ROLE" "$c_0"
+  printf '   %sGitHub: https://github.com/primeshock/shadow-tunnel%s\n' "$c_d" "$c_0"
+  local url; url=$(panel_url); [[ -n $url ]] && printf '   %spanel : %s%s\n' "$c_d" "$url" "$c_0"
+  printf '  %s%s%s\n\n' "$c_d" "──────────────────────────────────────────────────────" "$c_0"
+}
+
+state_tag() { local s=$1 col=$c_y; [[ $s == active ]] && col=$c_g; [[ $s == failed ]] && col=$c_r; printf '%s%s%s' "$col" "${s:-unknown}" "$c_0"; }
 
 edit_fields() { # edit_fields <tunnel>
   local t=$1
   while :; do
     clear 2>/dev/null || true
-    echo "${c_b}Edit config — $t${c_0}"
-    local fields=("${FIELDS_COMMON[@]}"); [[ $ROLE == client ]] && fields+=(socks5_port)
+    printf '%sEdit config%s — %s%s%s\n\n' "$c_b" "$c_0" "$c_c" "$t" "$c_0"
+    local fields=(transport "${FIELDS_COMMON[@]}"); [[ $ROLE == client ]] && fields+=(socks5_port)
     local cur i=1
     for f in "${fields[@]}"; do
-      cur=$("$CTL" -t "$t" config 2>/dev/null | sed -n "s/^[[:space:]]*$f[[:space:]]*=[[:space:]]*//p" | head -n1)
-      printf "  %2d) %-16s %s%s%s\n" "$i" "$f" "$c_d" "$cur" "$c_0"; ((i++))
+      cur=$(cfgval "$t" "$f")
+      printf '  %s%2d)%s %-16s %s%s%s\n' "$c_c" "$i" "$c_0" "$f" "$c_d" "$cur" "$c_0"; ((i++))
     done
-    echo "   0) back"
+    printf '   %s0)%s back\n' "$c_c" "$c_0"
     local sel; sel=$(ask "pick a field to edit: ")
     [[ $sel == 0 || -z $sel ]] && return 0
     local idx=$((sel-1))
@@ -1014,30 +1081,42 @@ edit_fields() { # edit_fields <tunnel>
     local key=${fields[$idx]} val
     val=$(ask "new value for $key: ")
     [[ -z $val ]] && { echo "unchanged"; pause; continue; }
-    if "$CTL" -t "$t" set "$key=$val"; then echo "${c_g}saved${c_0}"; else echo "${c_y}rejected (see message above)${c_0}"; fi
+    if "$CTL" -t "$t" set "$key=$val"; then printf '%ssaved%s\n' "$c_g" "$c_0"; else printf '%srejected (see message above)%s\n' "$c_y" "$c_0"; fi
     pause
   done
 }
+
+FIELDS_COMMON=(real_ip peer_real_ip spoofed_ip peer_spoofed_ip spoofed_ip_pool allowed_peers \
+               data_port icmp_id mtu initial_cwnd max_retries rto_min_ms interface pre_shared_key)
 
 tunnel_menu() { # tunnel_menu <tunnel>
   local t=$1
   while :; do
     clear 2>/dev/null || true
-    echo "${c_b}Tunnel: $t${c_0}  (state: $(active "$([[ $t == main ]] || echo "$t")"))"
-    echo "  1) status      2) start      3) stop     4) restart"
-    echo "  5) edit config 6) logs       7) diagnose"
-    [[ $t != main ]] && echo "  8) delete tunnel"
-    echo "  0) back"
-    case "$(ask '> ')" in
-      1) "$CTL" -t "$t" status; pause ;;
-      2) "$CTL" -t "$t" start; pause ;;
-      3) "$CTL" -t "$t" stop; pause ;;
-      4) "$CTL" -t "$t" restart; pause ;;
-      5) edit_fields "$t" ;;
-      6) "$CTL" -t "$t" logs -n 60 --no-pager 2>/dev/null || "$CTL" -t "$t" logs; pause ;;
-      7) "$CTL" -t "$t" diagnose || true; pause ;;
-      8) if [[ $t != main ]]; then
-           [[ "$(ask "really delete '$t'? type the name: ")" == "$t" ]] && { systemctl disable --now "$(unit_of "$t")" 2>/dev/null; rm -f "$TUNNELS/$t.toml"; systemctl reset-failed "$(unit_of "$t")" 2>/dev/null; echo "deleted"; pause; return 0; }
+    local st tp; st=$(active "$([[ $t == main ]] || echo "$t")"); tp=$(cfgval "$t" transport); tp=${tp:-spoof}
+    printf '%sTunnel: %s%s\n' "$c_r" "$t" "$c_0"
+    printf '   %s/%s  %s\n\n' "$ROLE" "$tp" "$(state_tag "$st")"
+    printf '%sAction%s\n\n' "$c_r" "$c_0"
+    item 1 Edit        "ports, transport, settings"
+    item 2 Start
+    item 3 Stop
+    item 4 Restart
+    item 5 "Live Log"  "Ctrl+C to return"
+    item 6 "Setup Link" "builds the other end"
+    item 7 Delete      "remove permanently"
+    printf '\nEnter your choice (%s0 to go back%s): ' "$c_c" "$c_0"
+    local ch; read -r ch <"$TTY" || true
+    case "$ch" in
+      1) edit_fields "$t" ;;
+      2) "$CTL" -t "$t" start || true; pause ;;
+      3) "$CTL" -t "$t" stop || true; pause ;;
+      4) "$CTL" -t "$t" restart || true; pause ;;
+      5) ( "$CTL" -t "$t" logs -f ) || true ;;
+      6) echo "pre-shared key:"; "$CTL" -t "$t" token; echo; echo "setup link for the other end:"; "$CTL" -t "$t" link; pause ;;
+      7) if [[ $t == main ]]; then echo "the main tunnel cannot be deleted here"; pause
+         elif [[ "$(ask "type the name '$t' to confirm delete: ")" == "$t" ]]; then
+           systemctl disable --now "$(unit_of "$t")" 2>/dev/null; rm -f "$TUNNELS/$t.toml"; systemctl reset-failed "$(unit_of "$t")" 2>/dev/null
+           printf '%sdeleted%s\n' "$c_g" "$c_0"; pause; return 0
          fi ;;
       0|"") return 0 ;;
     esac
@@ -1047,16 +1126,15 @@ tunnel_menu() { # tunnel_menu <tunnel>
 manage_tunnels() {
   while :; do
     clear 2>/dev/null || true
-    echo "${c_b}Tunnels${c_0}"
-    local list=() i=1 n st
+    printf '%sTunnels%s\n\n' "$c_r" "$c_0"
+    local list=() i=1 n st tp
     while read -r n; do
       [[ -z $n ]] && continue
-      st=$(active "$([[ $n == main ]] || echo "$n")")
-      local col=$c_y; [[ $st == active ]] && col=$c_g
-      printf "  %2d) %-16s %s%s%s\n" "$i" "$n" "$col" "${st:-unknown}" "$c_0"
+      st=$(active "$([[ $n == main ]] || echo "$n")"); tp=$(cfgval "$n" transport); tp=${tp:-spoof}
+      printf '  %s%2d)%s %s%-16s%s %s%-6s%s %s\n' "$c_c" "$i" "$c_0" "$c_b" "$n" "$c_0" "$c_d" "$tp" "$c_0" "$(state_tag "$st")"
       list+=("$n"); ((i++))
     done < <(names)
-    echo "   0) back"
+    printf '   %s0)%s back\n' "$c_c" "$c_0"
     local sel; sel=$(ask "pick a tunnel: ")
     [[ $sel == 0 || -z $sel ]] && return 0
     local idx=$((sel-1))
@@ -1067,60 +1145,79 @@ manage_tunnels() {
 panel_menu() {
   while :; do
     clear 2>/dev/null || true
-    echo "${c_b}Web panel${c_0}   $(panel_url)"
-    echo "  1) info / URL      2) reset password   3) watchdog"
-    echo "  4) bind address    5) port             6) TLS on/off"
-    echo "  7) start  8) stop  9) restart          0) back"
-    case "$(ask '> ')" in
+    printf '%sWeb Panel%s   %s%s%s\n\n' "$c_r" "$c_0" "$c_d" "$(panel_url)" "$c_0"
+    item 1 "Info / URL"
+    item 2 "Reset password"
+    item 3 "Watchdog"       "off 30m 1h 6h 12h 24h"
+    item 4 "Bind address"
+    item 5 "Port"
+    item 6 "TLS on/off"
+    item 7 "Start"
+    item 8 "Stop"
+    item 9 "Restart"
+    printf '\nEnter your choice (%s0 to go back%s): ' "$c_c" "$c_0"
+    local ch; read -r ch <"$TTY" || true
+    case "$ch" in
       1) "$CTL" panel info; pause ;;
       2) "$CTL" panel passwd; pause ;;
-      3) echo "values: off 30m 1h 6h 12h 24h"; "$CTL" watchdog "$(ask 'watchdog: ')"; pause ;;
-      4) "$CTL" panel bind "$(ask 'bind IP (e.g. 0.0.0.0): ')"; pause ;;
-      5) "$CTL" panel port "$(ask 'port: ')"; pause ;;
-      6) "$CTL" panel tls "$(ask 'tls on|off: ')"; pause ;;
-      7) "$CTL" panel start; pause ;;
-      8) "$CTL" panel stop; pause ;;
-      9) "$CTL" panel restart; pause ;;
+      3) "$CTL" watchdog "$(ask 'watchdog: ')" || true; pause ;;
+      4) "$CTL" panel bind "$(ask 'bind IP (e.g. 0.0.0.0): ')" || true; pause ;;
+      5) "$CTL" panel port "$(ask 'port: ')" || true; pause ;;
+      6) "$CTL" panel tls "$(ask 'tls on|off: ')" || true; pause ;;
+      7) "$CTL" panel start || true; pause ;;
+      8) "$CTL" panel stop || true; pause ;;
+      9) "$CTL" panel restart || true; pause ;;
       0|"") return 0 ;;
     esac
   done
 }
 
+backup_menu() {
+  clear 2>/dev/null || true
+  printf '%sBackup & Restore%s\n\n' "$c_r" "$c_0"
+  item 1 "Backup now"   "write a .tar.gz of all settings"
+  item 2 "Restore"      "from a backup file"
+  printf '\nEnter your choice (%s0 to go back%s): ' "$c_c" "$c_0"
+  local ch; read -r ch <"$TTY" || true
+  case "$ch" in
+    1) echo "backup written to: $("$CTL" backup)"; pause ;;
+    2) local f; f=$(ask "path to backup .tar.gz: "); [[ -n $f ]] && { "$CTL" restore "$f" || true; }; pause ;;
+  esac
+}
+
 main_menu() {
   while :; do
     clear 2>/dev/null || true
-    echo "${c_b}Shadow Tunnel${c_0}  —  role: $ROLE  host: $(hostname)"
-    local url; url=$(panel_url); [[ -n $url ]] && echo "${c_d}panel: $url${c_0}"
-    echo
-    echo "  1) Manage tunnels"
-    echo "  2) Open web panel (show URL)"
-    echo "  3) Diagnose (tunnel doctor)"
-    echo "  4) Health check"
-    echo "  5) Logs (follow)"
-    echo "  6) Setup link / pre-shared key"
-    echo "  7) Panel settings"
-    echo "  8) Backup config"
-    echo "  9) Update (keep config)"
-    echo "  0) Quit"
-    case "$(ask '> ')" in
+    banner
+    item 1 "Manage"        "tunnels, status, edit, start/stop, delete"
+    item 2 "Connection Test" "diagnose the whole tunnel path"
+    item 3 "Web Panel"     "link, login code, port"
+    item 4 "Health & Logs" "service health and live logs"
+    item 5 "Setup Link"    "build / import the other end"
+    item 6 "Backup"        "backup & restore all settings"
+    item 7 "Update"        "rebuild, keep config, auto-rollback"
+    item 8 "Uninstall"     "remove everything"
+    item 0 "Exit"
+    printf '\nSelect an option: '
+    local ch; read -r ch <"$TTY" || true
+    case "$ch" in
       1) manage_tunnels ;;
-      2) "$CTL" panel info 2>/dev/null; echo; echo "Reach it over SSH:  ssh -L 7777:127.0.0.1:7777 root@<server>"; pause ;;
-      3) "$CTL" diagnose; local l; l=$(ask "paste the peer's shadowspoof:// link for a 2-sided check (or Enter to skip): "); [[ -n $l ]] && "$CTL" diagnose --link "$l"; pause ;;
-      4) command -v python3 >/dev/null && "$CTL" status; "$CTL" check || true; pause ;;
-      5) "$CTL" logs -f ;;
-      6) echo "pre-shared key:"; "$CTL" token; echo; echo "setup link for the other side:"; "$CTL" link; pause ;;
-      7) panel_menu ;;
-      8) echo "backup written to: $("$CTL" backup)"; pause ;;
-      9) "$CTL" update ;;
+      2) "$CTL" diagnose || true; local l; l=$(ask "paste the peer's shadowspoof:// link for a 2-sided check (or Enter to skip): "); [[ -n $l ]] && { "$CTL" diagnose --link "$l" || true; }; pause ;;
+      3) panel_menu ;;
+      4) "$CTL" status || true; echo; "$CTL" check || true; echo; if [[ "$(ask 'follow live logs? [y/N] ')" =~ ^[Yy] ]]; then ( "$CTL" logs -f ) || true; fi ;;
+      5) echo "pre-shared key:"; "$CTL" token; echo; echo "setup link for the OTHER end (paste it there):"; "$CTL" link; echo; printf '%sto import a link into THIS node, use the web panel: Tunnels -> Import link%s\n' "$c_d" "$c_0"; pause ;;
+      6) backup_menu ;;
+      7) "$CTL" update || true; pause ;;
+      8) if [[ "$(ask 'really uninstall everything? type YES: ')" == YES ]]; then "$CTL" uninstall || echo "uninstall: see the project README"; fi; pause ;;
       0|q|"") clear 2>/dev/null || true; exit 0 ;;
     esac
   done
 }
 
 main_menu
-SHADOWSPOOF_EOF
-  chmod 0755 "$SHADOWSPOOF.new"; chown root:root "$SHADOWSPOOF.new"; mv -f "$SHADOWSPOOF.new" "$SHADOWSPOOF"
-  ok "Installed $SHADOWSPOOF"
+SHADOWTUN_EOF
+  chmod 0755 "$SHADOWTUN.new"; chown root:root "$SHADOWTUN.new"; mv -f "$SHADOWTUN.new" "$SHADOWTUN"
+  ok "Installed $SHADOWTUN"
 }
 
 install_panel_files() {
@@ -4006,7 +4103,7 @@ main() {
   configure
   write_service_unit
   install_shadowctl
-  install_shadowspoof
+  install_shadowtun
   setup_watchdog
   start_service
   setup_panel
