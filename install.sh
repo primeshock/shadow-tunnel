@@ -1307,6 +1307,7 @@ PANEL_JSON = os.path.join(ETC, "panel.json")
 STATE_JSON = os.path.join(RUN, "state.json")
 EVENTS_FILE = os.path.join(STATE, "monitor", "events.jsonl")
 CURSOR_FILE = os.path.join(STATE, "monitor", "journal.cursor")
+EVENTS_CLEAR_FILE = os.path.join(RUN, "events_clear")
 
 SAMPLE_SEC = 5
 HIST_LEN = 360
@@ -1857,6 +1858,8 @@ class Monitor(object):
         self.iface_cache = {}
         self.listen_alerted = set()
         self.events = deque(maxlen=200)
+        self.throttle_win = {}
+        self.clear_seen = 0.0
         self.clk = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
         os.makedirs(os.path.dirname(EVENTS_FILE), exist_ok=True)
         for line in read_text(EVENTS_FILE).splitlines()[-200:]:
@@ -1867,16 +1870,27 @@ class Monitor(object):
 
     # -- events
     def event(self, inst, level, msg, key=None):
+        """Record an event. `key`, when given, dedupes repeats: a burst within
+        the current window is collapsed into one line with a "+N similar"
+        suffix. A chronically-repeating key (the same failure firing over and
+        over, e.g. a downstream connect that keeps failing) backs its window
+        off up to 10 minutes instead of resurfacing every 30s forever; a key
+        that goes quiet for a full window resets back to the 30s baseline."""
         now = time.time()
         if key:
             last = self.throttle.get(key, 0)
-            if now - last < 30:
+            win = self.throttle_win.get(key, 30)
+            if now - last < win:
                 self.suppressed[key] += 1
                 return
             self.throttle[key] = now
             extra = self.suppressed.pop(key, 0)
             if extra:
-                msg += " (+%d similar in the last 30s)" % extra
+                win_txt = "%dm" % round(win / 60) if win >= 60 else "%ds" % int(win)
+                msg += " (+%d similar in the last %s)" % (extra, win_txt)
+                self.throttle_win[key] = min(win * 4, 600)
+            else:
+                self.throttle_win[key] = 30
         ev = {"ts": now, "inst": inst, "level": level, "msg": msg}
         self.events.append(ev)
         try:
@@ -2029,10 +2043,32 @@ class Monitor(object):
             self.window.popleft()
 
     # -- one cycle
+    def check_clear_request(self):
+        """The panel (a separate process) asks for Recent Events to be wiped
+        by touching EVENTS_CLEAR_FILE; pick that up here since only this
+        process owns the in-memory event/throttle state."""
+        try:
+            mtime = os.path.getmtime(EVENTS_CLEAR_FILE)
+        except OSError:
+            return
+        if mtime <= self.clear_seen:
+            return
+        self.clear_seen = mtime
+        self.events.clear()
+        self.throttle.clear()
+        self.throttle_win.clear()
+        self.suppressed.clear()
+        try:
+            atomic_write(EVENTS_FILE, "", 0o640, SVC_USER, None)
+        except OSError:
+            pass
+        self.event("-", "info", "events cleared")
+
     def cycle(self):
         role = get_role()
         if not role:
             return
+        self.check_clear_request()
         insts = instances()
         props = systemd_show([i.unit for i in insts])
         self.read_journal(role)
@@ -2241,6 +2277,25 @@ def describe(inst, props, st):
             d[k] = m[k]
     d["history"] = ((st or {}).get("history", {}) or {}).get(inst.name, {})
     return d
+
+
+def api_events_clear(req):
+    """Recent Events lives in the monitor process's memory, not the panel's,
+    so ask it to wipe its state by touching a marker file it polls each
+    cycle (see Monitor.check_clear_request); also patch the last-written
+    state snapshot so the panel shows an empty list immediately instead of
+    waiting up to SAMPLE_SEC for the monitor to notice."""
+    os.makedirs(RUN, exist_ok=True)
+    with open(EVENTS_CLEAR_FILE, "w") as f:
+        f.write(str(time.time()))
+    st = load_state()
+    if st is not None:
+        st["events"] = []
+        try:
+            atomic_write(STATE_JSON, json.dumps(st), 0o644, None, None)
+        except OSError:
+            pass
+    return {"ok": True}
 
 
 def api_overview(req):
@@ -3719,6 +3774,7 @@ en: {
  tab_general:'General', tab_appearance:'Appearance', tab_panel:'Web Panel', tab_peer:'Peer Sync', tab_security:'Security', tab_update:'Update',
  panel_path:'Custom URL path (optional)', panel_path_ph:'leave empty for none', panel_path_hint:'Serve the panel under an extra secret path, e.g. https://host:port/thispath — harder to find by scanning. Empty = served at the root, as now.',
  sync_proxy:'Sync via SOCKS5 proxy (optional)', sync_proxy_ph:'e.g. 127.0.0.1:1080', sync_proxy_hint:'Routes only this panel’s sync calls to the peer panel through a SOCKS5 proxy (e.g. this node’s own tunnel SOCKS5 port) — never the tunnel data itself. Useful when the two panels can’t reach each other directly but a tunnel can. Empty = connect directly.',
+ clear_events:'Clear', clear_events_confirm:'Clear all recent events? This cannot be undone.',
  diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX', cavg:'AVG', cpeak:'PEAK', traffic:'Traffic', overall_speed:'live', overall_label:'Overall speed', upload:'Upload', download:'Download', sent:'Sent', received:'Received', conn_stats:'Connection Stats', conn_local:'local', conn_sessions:'sessions', open_sockets:'open sockets', client:'client', server:'server',
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
@@ -3741,6 +3797,7 @@ fa: {
  tab_general:'عمومی', tab_appearance:'ظاهر', tab_panel:'وب‌پنل', tab_peer:'سینک طرف مقابل', tab_security:'امنیت', tab_update:'آپدیت',
  panel_path:'مسیر سفارشی لینک (اختیاری)', panel_path_ph:'برای نداشتن مسیر خالی بگذار', panel_path_hint:'پنل را زیر یک مسیر مخفیِ اضافه سرو کن، مثلاً https://host:port/thispath — پیداکردنش با اسکن سخت‌تر می‌شود. خالی = مثل الان روی ریشه.',
  sync_proxy:'سینک از طریق پراکسی SOCKS5 (اختیاری)', sync_proxy_ph:'مثلاً 127.0.0.1:1080', sync_proxy_hint:'فقط درخواست‌های سینکِ این پنل با پنلِ طرف مقابل را از یک پراکسی SOCKS5 (مثلاً پورت SOCKS5 تونل همین نود) عبور می‌دهد — نه ترافیک خود تونل را. وقتی دو پنل مستقیم به هم نمی‌رسند ولی یک تونل می‌رسد مفید است. خالی = اتصال مستقیم.',
+ clear_events:'پاک کردن', clear_events_confirm:'همهٔ رویدادهای اخیر پاک شوند؟ این کار قابل بازگشت نیست.',
  diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار سیستم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال', cavg:'میانگین', cpeak:'اوج', traffic:'ترافیک', overall_speed:'لحظه‌ای', overall_label:'سرعت کلی', upload:'آپلود', download:'دانلود', sent:'ارسال‌شده', received:'دریافت‌شده', conn_stats:'وضعیت اتصال', conn_local:'محلی', conn_sessions:'نشست‌ها', open_sockets:'سوکت باز', client:'کلاینت', server:'سرور',
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
@@ -3945,7 +4002,10 @@ function viewOverview(m){
   );
 }
 function viewEvents(m){
-  fill(m,h('h2',{text:t('events')}),h('div',{class:'card'},evList(S.ov.events,100)));
+  const doClear=async()=>{if(!confirm(t('clear_events_confirm')))return;try{await api('POST','/api/events/clear',{});S.ov.events=[];showView();toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}};
+  fill(m,
+    h('div',{class:'row'},h('h2',{text:t('events')}),h('div',{class:'sp'}),h('button',{class:'btn sm',onclick:doClear,text:t('clear_events')})),
+    h('div',{class:'card'},evList(S.ov.events,100)));
 }
 function evList(evs,max){
   if(!evs||!evs.length) return h('div',{class:'lbl',text:t('none')});
@@ -4582,6 +4642,8 @@ class Handler(BaseHTTPRequestHandler):
                 return api_panel_restart_now(req)
             if path == "/api/core/restart":
                 return api_core_restart(req)
+            if path == "/api/events/clear":
+                return api_events_clear(req)
             if path == "/api/update":
                 return api_update_start(req)
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/(start|stop|restart)$", path)
@@ -5114,7 +5176,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 # Runs as root because it manages systemd units and the config files; confined as far as that allows.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=$ETC_DIR $UNIT_DIR
+ReadWritePaths=$ETC_DIR $UNIT_DIR /run/shadow-spoof
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
