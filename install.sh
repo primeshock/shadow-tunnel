@@ -53,7 +53,7 @@ readonly MIN_RUSTC=1.85.0
 # live inside THIS install.sh, independent of the Rust core commit). Bump it
 # on every change to install.sh so operators can see whether an update applied.
 # Must match PANEL_VERSION in the embedded Python panel below.
-readonly SHADOW_RELEASE=2.3.0
+readonly SHADOW_RELEASE=2.4.0
 
 REPO_URL=${SHADOW_REPO_URL:-https://github.com/primeshock/shadow-tunnel.git}
 REPO_REF=${SHADOW_REF:-$DEFAULT_REF}
@@ -1330,7 +1330,7 @@ SVC_USER = "shadow-spoof"
 # installer above; both are bumped together on every install.sh change. This is
 # the version actually executing now (not what build-info last recorded), so the
 # Update tab can show whether a restart picked up new panel code.
-PANEL_VERSION = "2.3.0"
+PANEL_VERSION = "2.4.0"
 
 CONF_MAIN = os.path.join(ETC, "config.toml")
 TUNNELS = os.path.join(ETC, "tunnels")
@@ -4178,7 +4178,6 @@ input:focus,select:focus{outline:none;box-shadow:var(--ring);border-color:var(--
 input:hover,select:hover{border-color:#34426a}
 label.f{display:block;margin:10px 0}label.f>span{display:block;color:var(--mut);font-size:12px;margin-bottom:3px}
 .err{color:var(--bad);font-size:12px;margin-top:3px}.hint{color:var(--mut);font-size:12px;margin-top:3px}
-.spark{width:100%;height:30px;display:block}.spark polyline{stroke:var(--acc2);stroke-width:1.5;vector-effect:non-scaling-stroke}.spark.pink polyline{stroke:var(--acc)}.spark.grn polyline{stroke:var(--ok)}
 .banner{padding:10px 12px;border-radius:12px;margin:10px 0;border:1px solid #6b4f17;background:#2a2110;color:var(--warn)}
 .ev{display:flex;gap:10px;padding:5px 0;border-bottom:1px dashed var(--line);font-size:13px}.ev time{color:var(--mut);min-width:64px}
 .ev.error .m{color:var(--bad)}.ev.warn .m{color:var(--warn)}
@@ -4387,18 +4386,17 @@ html[data-theme=light] #bg::after{background-image:linear-gradient(rgba(30,40,80
 /* ===== v14: redesigned stat/tunnel cards, charts, heartbeat, responsive tuning ===== */
 .card.stat{display:flex;flex-direction:column;gap:2px}
 .lbl.sub{min-height:14px}
-.chartwrap{margin:8px 0 2px}
-.chartwrap.dual{display:flex;flex-direction:column;gap:2px;margin:6px 0 2px}
-.chartwrap.dual .mchart{height:26px}
-.mchart{width:100%;height:46px;display:block;overflow:visible}
-.mchart .mline{stroke:var(--acc2);stroke-width:1.6;vector-effect:non-scaling-stroke}
-.mchart .marea{opacity:.9}
-.mchart .gs1{stop-color:var(--acc2);stop-opacity:.34}
-.mchart .gs2{stop-color:var(--acc2);stop-opacity:0}
-.mchart.pink .mline{stroke:var(--acc)}.mchart.pink .gs1{stop-color:var(--acc);stop-opacity:.34}.mchart.pink .gs2{stop-color:var(--acc);stop-opacity:0}
-.mchart.grn .mline{stroke:var(--ok)}.mchart.grn .gs1{stop-color:var(--ok);stop-opacity:.3}.mchart.grn .gs2{stop-color:var(--ok);stop-opacity:0}
-.mchart.up .mline{stroke:var(--warn)}.mchart.up .gs1{stop-color:var(--warn);stop-opacity:.32}.mchart.up .gs2{stop-color:var(--warn);stop-opacity:0}
-.mchart.dn .mline{stroke:var(--ok)}.mchart.dn .gs1{stop-color:var(--ok);stop-opacity:.32}.mchart.dn .gs2{stop-color:var(--ok);stop-opacity:0}
+.chartwrap{margin:10px 0 2px}
+.chartwrap.dual{display:flex;flex-direction:column;gap:8px;margin:8px 0 2px}
+.chartwrap.dual .mchart{height:40px}
+.mchart{width:100%;height:64px;display:block;overflow:visible}
+.mchart .mline{stroke:var(--acc2);stroke-width:2;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke}
+.mchart .marea{opacity:1}
+.mchart .gs1{stop-color:var(--acc);stop-opacity:.33}
+.mchart .gs2{stop-color:var(--acc);stop-opacity:0}
+.mchart .mbase{stroke:var(--acc2);stroke-opacity:.22;stroke-width:1;stroke-dasharray:1 5;vector-effect:non-scaling-stroke}
+.mchart.up .mline{stroke:var(--acc2)}.mchart.up .gs1{stop-color:var(--acc2);stop-opacity:.3}.mchart.up .gs2{stop-color:var(--acc2);stop-opacity:0}
+.mchart.dn .mline{stroke:#2f6fe0}.mchart.dn .gs1{stop-color:#2f6fe0;stop-opacity:.3}.mchart.dn .gs2{stop-color:#2f6fe0;stop-opacity:0}
 .mchart .mflat{stroke:var(--line);stroke-width:1;stroke-dasharray:3 4}
 .cstats{display:flex;justify-content:space-between;font-size:11px;color:var(--mut);letter-spacing:.3px;margin-top:2px}
 .loadrow{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:6px 0 4px;text-align:center}
@@ -4434,7 +4432,7 @@ html[data-theme=light] .subcard{background:rgba(20,30,70,.035)}
 .titem{display:flex;flex-direction:column;gap:1px}
 .titem .v{font-weight:700;font-size:15px}
 .titem .v.sm{font-size:12px;font-weight:600;color:var(--mut)}
-.lbl.up{color:var(--warn)}.lbl.dn{color:var(--ok)}
+.lbl.up{color:var(--acc2)}.lbl.dn{color:#2f6fe0}
 .lbl.ospeed{margin-top:6px;font-size:10px;text-transform:uppercase;letter-spacing:.5px}
 .row.acts{margin-top:14px;gap:6px}
 .grid.wide{grid-template-columns:repeat(auto-fill,minmax(360px,1fr))}
@@ -4571,14 +4569,6 @@ const fmtB=n=>{n=+n||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&
 const fmtR=n=>fmtB(n)+'/s';
 const fmtD=s=>{s=Math.floor(+s||0);const d=Math.floor(s/86400),hh=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?`${d}d ${hh}h`:hh?`${hh}h ${m}m`:m?`${m}m ${s%60}s`:`${s}s`};
 const fmtT=ts=>new Date(ts*1000).toLocaleTimeString([], {hour12:false});
-function spark(vals,cls){
-  const ns='http://www.w3.org/2000/svg',W=120,H=30,svg=document.createElementNS(ns,'svg');
-  svg.setAttribute('viewBox',`0 0 ${W} ${H}`);svg.setAttribute('preserveAspectRatio','none');svg.setAttribute('class','spark '+(cls||''));
-  if(!vals||vals.length<2) return svg;
-  let max=1e-9;for(const v of vals) if(v>max) max=v;
-  const n=vals.length,pts=vals.map((v,i)=>`${(i/(n-1)*W).toFixed(1)},${(H-2-(v/max)*(H-4)).toFixed(1)}`).join(' ');
-  const pl=document.createElementNS(ns,'polyline');pl.setAttribute('points',pts);pl.setAttribute('fill','none');svg.appendChild(pl);return svg;
-}
 async function api(method,path,body){
   const o={method,headers:{'Content-Type':'application/json'},credentials:'same-origin'};
   if(method!=='GET') o.headers['X-CSRF-Token']=S.csrf;
@@ -4671,9 +4661,24 @@ function showView(){
 
 /* ---------- overview ---------- */
 let CHART_UID=0;
+function smoothPath(pts){
+  // Catmull-Rom spline through the points, emitted as cubic beziers, so the
+  // sparkline reads as a soft curve with no sharp corners or peaks.
+  if(pts.length<2) return '';
+  if(pts.length===2) return 'M'+pts[0][0]+','+pts[0][1]+' L'+pts[1][0]+','+pts[1][1];
+  const T=1/6;
+  let d='M'+pts[0][0].toFixed(2)+','+pts[0][1].toFixed(2);
+  for(let i=0;i<pts.length-1;i++){
+    const p0=pts[i-1]||pts[i],p1=pts[i],p2=pts[i+1],p3=pts[i+2]||p2;
+    const c1x=p1[0]+(p2[0]-p0[0])*T,c1y=p1[1]+(p2[1]-p0[1])*T;
+    const c2x=p2[0]-(p3[0]-p1[0])*T,c2y=p2[1]-(p3[1]-p1[1])*T;
+    d+=' C'+c1x.toFixed(2)+','+c1y.toFixed(2)+' '+c2x.toFixed(2)+','+c2y.toFixed(2)+' '+p2[0].toFixed(2)+','+p2[1].toFixed(2);
+  }
+  return d;
+}
 function miniChart(vals,opts){
   opts=opts||{};
-  const ns='http://www.w3.org/2000/svg',W=260,H=58,id='mc'+(++CHART_UID);
+  const ns='http://www.w3.org/2000/svg',W=260,H=72,id='mc'+(++CHART_UID);
   const svg=document.createElementNS(ns,'svg');
   svg.setAttribute('viewBox',`0 0 ${W} ${H}`);svg.setAttribute('preserveAspectRatio','none');
   svg.setAttribute('class','mchart'+(opts.cls?(' '+opts.cls):''));
@@ -4684,16 +4689,17 @@ function miniChart(vals,opts){
   const s2=document.createElementNS(ns,'stop');s2.setAttribute('offset','100%');s2.setAttribute('class','gs2');
   grad.append(s1,s2);defs.append(grad);svg.append(defs);
   if(vv.length<2){
-    const fl=document.createElementNS(ns,'line');fl.setAttribute('x1','0');fl.setAttribute('y1',H-3);fl.setAttribute('x2',W);fl.setAttribute('y2',H-3);fl.setAttribute('class','mflat');svg.append(fl);
+    const fl=document.createElementNS(ns,'line');fl.setAttribute('x1','0');fl.setAttribute('y1',H-4);fl.setAttribute('x2',W);fl.setAttribute('y2',H-4);fl.setAttribute('class','mflat');svg.append(fl);
     return svg;
   }
-  let max=1e-9;for(const v of vv) if(v>max) max=v;
-  const n=vv.length,pad=3,yof=v=>H-pad-(v/max)*(H-pad*2-4);
+  let max=1e-9,sum=0;for(const v of vv){if(v>max)max=v;sum+=v;}
+  const n=vv.length,pad=5,span=H-pad*2,yof=v=>H-pad-(v/max)*span;
   const pts=vv.map((v,i)=>[(i/(n-1)*W),yof(v)]);
-  const line=pts.map(pt=>pt.join(',')).join(' ');
-  const area='M0,'+H+' L'+line.split(' ').join(' L')+' L'+W+','+H+' Z';
-  if(opts.fill!==false){const ap=document.createElementNS(ns,'path');ap.setAttribute('d',area);ap.setAttribute('fill',`url(#${id})`);ap.setAttribute('class','marea');svg.append(ap)}
-  const pl=document.createElementNS(ns,'polyline');pl.setAttribute('points',line);pl.setAttribute('fill','none');pl.setAttribute('class','mline');svg.append(pl);
+  const sp=smoothPath(pts);
+  if(opts.fill!==false){const ap=document.createElementNS(ns,'path');ap.setAttribute('d',sp+' L'+W+','+H+' L0,'+H+' Z');ap.setAttribute('fill',`url(#${id})`);ap.setAttribute('class','marea');svg.append(ap)}
+  const my=yof(sum/n);
+  const bl=document.createElementNS(ns,'line');bl.setAttribute('x1','0');bl.setAttribute('y1',my.toFixed(2));bl.setAttribute('x2',W);bl.setAttribute('y2',my.toFixed(2));bl.setAttribute('class','mbase');svg.append(bl);
+  const pa=document.createElementNS(ns,'path');pa.setAttribute('d',sp);pa.setAttribute('fill','none');pa.setAttribute('class','mline');svg.append(pa);
   return svg;
 }
 function chartStats(vals,fmt){
