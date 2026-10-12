@@ -242,11 +242,16 @@ async fn handle_new_tunnel(
         }
     });
 
-    tokio::select! {
-        _ = t_to_tcp => {}
-        _ = tcp_to_t => {}
+    // If the target finished first (the usual end of a response), its last
+    // bytes may still be queued or unacknowledged: wait for them to be
+    // delivered before the FIN, or the client loses the tail of the reply.
+    let local_done = tokio::select! {
+        _ = t_to_tcp => false,
+        _ = tcp_to_t => true,
+    };
+    if local_done {
+        manager.drain(tunnel_id, shadow_spoof::tunnel::DRAIN_TIMEOUT).await;
     }
-
     manager.close_tunnel(tunnel_id).await;
     Ok(())
 }

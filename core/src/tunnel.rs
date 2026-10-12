@@ -8,6 +8,7 @@
 //! by both the client (SOCKS5) and server (TCP proxy) code.
 
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,14 @@ use crate::stats::Stats;
 
 const HEARTBEAT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// An Established tunnel that has received nothing (not even heartbeat
+/// acks, sent every ~2s while idle) for this long has a dead peer.
+const DEAD_PEER_TIMEOUT: Duration = Duration::from_secs(90);
+/// A client tunnel still waiting for its SYN-ACK after this long never will.
+const SYN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound on how long a closing tunnel waits for its queued data to be
+/// sent and acknowledged before sending FIN.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ── Tunnel state ──────────────────────────────────────────────────────────────
 
@@ -51,6 +60,8 @@ struct Tunnel {
     window_notify: Arc<Notify>,
     /// Notified when the tunnel transitions to Established.
     established_notify: Arc<Notify>,
+    /// Set once this tunnel's send task has drained its queue and exited.
+    send_done: Arc<AtomicBool>,
 }
 
 impl Tunnel {
@@ -77,6 +88,7 @@ impl Tunnel {
             last_heartbeat_sent: Instant::now(),
             window_notify:      Arc::new(Notify::new()),
             established_notify: Arc::new(Notify::new()),
+            send_done:          Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -204,10 +216,11 @@ impl TunnelManager {
         // Grab the notifiers before inserting (to avoid re-locking).
         let window_notify      = tunnel.window_notify.clone();
         let established_notify = tunnel.established_notify.clone();
+        let send_done          = tunnel.send_done.clone();
         self.0.tunnels.insert(id, Arc::new(Mutex::new(tunnel)));
 
         // Spawn a task that forwards application data to the raw socket.
-        self.spawn_send_task(id, net_rx, window_notify);
+        self.spawn_send_task(id, net_rx, window_notify, send_done);
 
         // Send the initial SYN on the control channel.
         let syn = ShadowPacket::new_syn(id, syn_seq);
@@ -250,9 +263,10 @@ impl TunnelManager {
         // Server transitions to Established immediately after SYN-ACK.
         tunnel.state = TunnelState::Established;
         let window_notify = tunnel.window_notify.clone();
+        let send_done     = tunnel.send_done.clone();
         self.0.tunnels.insert(id, Arc::new(Mutex::new(tunnel)));
 
-        self.spawn_send_task(id, net_rx, window_notify);
+        self.spawn_send_task(id, net_rx, window_notify, send_done);
 
         let syn_ack = ShadowPacket::new_syn_ack(id, syn.seq, our_seq);
         self.tx_control(syn_ack).await?;
@@ -266,11 +280,34 @@ impl TunnelManager {
         if let Some((_, t)) = self.0.tunnels.remove(&id) {
             let mut t = t.lock().await;
             t.state = TunnelState::Closed;
+            // Wake a send task blocked on the window so it sees the tunnel is
+            // gone and exits.
+            t.window_notify.notify_one();
         }
         self.0.established_notifiers.remove(&id);
 
         let fin = ShadowPacket::new_fin(id);
         let _ = self.tx_control(fin).await;
+    }
+
+    /// Wait (up to `timeout`) until everything the local side queued for this
+    /// tunnel has been sent AND acknowledged by the peer.  Call before
+    /// `close_tunnel` when the local side finished first: closing at once
+    /// dropped the tail of the data (e.g. the end of an HTTP response).
+    pub async fn drain(&self, id: u32, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let Some(tunnel) = self.0.tunnels.get(&id).map(|t| t.clone()) else { return; };
+            let done = {
+                let t = tunnel.lock().await;
+                t.state != TunnelState::Established
+                    || (t.send_done.load(Ordering::SeqCst) && t.arq.in_flight() == 0)
+            };
+            if done || Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     // ── Incoming packet handler ───────────────────────────────────────────────
@@ -419,10 +456,11 @@ impl TunnelManager {
 
     /// Drive retransmissions and send heartbeats.  Call every ~100 ms.
     pub async fn tick(&self) -> Result<()> {
-        let (expired_pkts, heartbeats, _to_remove): (Vec<_>, Vec<_>, Vec<_>) = {
-            let mut exp  = Vec::new();
-            let mut hbs  = Vec::new();
-            let mut dead = Vec::new();
+        let (expired_pkts, heartbeats, stale): (Vec<_>, Vec<_>, Vec<_>) = {
+            let mut exp   = Vec::new();
+            let mut hbs   = Vec::new();
+            let mut dead  = Vec::new();
+            let mut stale = Vec::new();
             let now = Instant::now();
 
             let tunnels: Vec<(u32, Arc<Mutex<Tunnel>>)> = self
@@ -436,7 +474,19 @@ impl TunnelManager {
                 let mut t = tunnel.lock().await;
 
                 if t.state == TunnelState::Closed {
-                    dead.push(id);
+                    dead.push((id, t.window_notify.clone()));
+                    continue;
+                }
+                // Sessions that can never make progress again: a SYN nobody
+                // answered, or a peer that has gone silent (not even heartbeat
+                // acks).  Close them so the apps get EOF and the session counts
+                // stay truthful instead of leaking forever.
+                if t.state == TunnelState::SynSent && t.is_idle(SYN_TIMEOUT) {
+                    stale.push((id, "no SYN-ACK from the peer"));
+                    continue;
+                }
+                if t.state == TunnelState::Established && t.is_idle(DEAD_PEER_TIMEOUT) {
+                    stale.push((id, "peer silent"));
                     continue;
                 }
                 let timed_out = t.arq.take_timed_out();
@@ -448,6 +498,10 @@ impl TunnelManager {
                 let gave_up = t.arq.take_gave_up();
                 if gave_up > 0 {
                     self.0.stats.add_gave_up(gave_up);
+                    // A packet that exhausted max_retries is never delivered,
+                    // so this ordered stream can no longer advance.
+                    stale.push((id, "data could not be delivered after max_retries"));
+                    continue;
                 }
                 if t.state == TunnelState::Established
                     && t.is_idle(HEARTBEAT_IDLE_TIMEOUT)
@@ -458,13 +512,18 @@ impl TunnelManager {
                 }
             }
 
-            for id in &dead {
+            for (id, wn) in &dead {
                 self.0.tunnels.remove(id);
                 self.0.established_notifiers.remove(id);
+                wn.notify_one();
             }
-            (exp, hbs, dead)
+            (exp, hbs, stale)
         };
 
+        for (id, why) in stale {
+            log::info!("tunnel {} closed: {}", id, why);
+            self.close_tunnel(id).await;
+        }
         for pkt in expired_pkts { self.tx_data(pkt).await?; }
         for hb  in heartbeats   { self.tx_control(hb).await?; }
         Ok(())
@@ -589,10 +648,18 @@ impl TunnelManager {
         tunnel_id:     u32,
         mut net_rx:    mpsc::Receiver<Bytes>,
         window_notify: Arc<Notify>,
+        send_done:     Arc<AtomicBool>,
     ) {
+        /// Marks the queue as drained on every exit path (normal end, send
+        /// error, tunnel removed), so a graceful close never waits in vain.
+        struct Done(Arc<AtomicBool>);
+        impl Drop for Done {
+            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+        }
         let this = self.clone();
         let mtu  = self.0.cfg.mtu;
         tokio::spawn(async move {
+            let _done = Done(send_done);
             while let Some(data) = net_rx.recv().await {
                 // Fragment large buffers into MTU-sized chunks.
                 let mut offset = 0;
@@ -604,17 +671,19 @@ impl TunnelManager {
                     // `Notify::notified()` is consumed by one waiter so this
                     // is race-free: if the window opens between the `can_send`
                     // check and the await, the notification is stored and we
-                    // wake immediately.
+                    // wake immediately.  If the tunnel is gone, stop: waiting
+                    // for a window that can never open leaked the task.
                     loop {
-                        let can = {
-                            if let Some(tunnel) = this.0.tunnels.get(&tunnel_id).map(|t| t.clone()) {
-                                tunnel.lock().await.can_send()
-                            } else {
-                                false
+                        let can = match this.0.tunnels.get(&tunnel_id).map(|t| t.clone()) {
+                            Some(tunnel) => tunnel.lock().await.can_send(),
+                            None => {
+                                log::debug!("send task tunnel {}: tunnel gone", tunnel_id);
+                                return;
                             }
                         };
                         if can { break; }
-                        // Block until an ACK arrives and opens the window.
+                        // Block until an ACK arrives and opens the window (or
+                        // close_tunnel wakes us to notice the tunnel is gone).
                         window_notify.notified().await;
                     }
 

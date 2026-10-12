@@ -53,7 +53,7 @@ readonly MIN_RUSTC=1.85.0
 # live inside THIS install.sh, independent of the Rust core commit). Bump it
 # on every change to install.sh so operators can see whether an update applied.
 # Must match PANEL_VERSION in the embedded Python panel below.
-readonly SHADOW_RELEASE=2.5.0
+readonly SHADOW_RELEASE=2.6.0
 
 REPO_URL=${SHADOW_REPO_URL:-https://github.com/primeshock/shadow-tunnel.git}
 REPO_REF=${SHADOW_REF:-$DEFAULT_REF}
@@ -1330,7 +1330,7 @@ SVC_USER = "shadow-spoof"
 # installer above; both are bumped together on every install.sh change. This is
 # the version actually executing now (not what build-info last recorded), so the
 # Update tab can show whether a restart picked up new panel code.
-PANEL_VERSION = "2.5.0"
+PANEL_VERSION = "2.6.0"
 
 CONF_MAIN = os.path.join(ETC, "config.toml")
 TUNNELS = os.path.join(ETC, "tunnels")
@@ -1930,6 +1930,8 @@ class Monitor(object):
         self.clear_seen = 0.0
         self.arq = {}
         self.bytes_total = {}
+        self.jhealth = {}
+        self.last_log = {}
         self.arq_samples = defaultdict(lambda: deque(maxlen=90))
         self.clk = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
         os.makedirs(os.path.dirname(EVENTS_FILE), exist_ok=True)
@@ -2084,13 +2086,48 @@ class Monitor(object):
         return n
 
     # -- journal
+    def _drop_cursor(self):
+        try:
+            os.unlink(CURSOR_FILE)
+        except OSError:
+            pass
+
     def read_journal(self, role):
-        args = [JOURNALCTL, "--no-pager", "-q", "-o", "json", "--cursor-file", CURSOR_FILE,
+        """Read new core log lines since the last call. Self-healing, because a
+        single stuck cursor was leaving the monitor reading NOTHING forever -
+        which showed up as log 5m 0/0/0, no handshake, no agent data and the
+        traffic falling back to the interface counter on one side.
+
+        A cursor can get stuck two ways: journalctl errors on it (rotated /
+        vacuumed away), or it silently returns zero lines. The core logs a
+        `stats:` line at least once a minute, so if NO lines arrive for ~2
+        minutes we drop the cursor and re-read the last 2 minutes from scratch,
+        regardless of the exit code. The outcome is kept in self.jhealth so the
+        panel can show WHY data is missing instead of guessing."""
+        base = [JOURNALCTL, "--no-pager", "-o", "json",
                 "-u", "shadow-spoof-%s.service" % role, "-u", "shadow-spoof-%s@*.service" % role]
-        if not os.path.exists(CURSOR_FILE):
-            args += ["--since", "-2min"]
-        rc, out, _ = run(args, timeout=25)
         now = time.time()
+        got0 = self.jhealth.get("lines_at", 0)
+        # Re-sync from scratch when there is no cursor yet, or we have seen no
+        # lines at all for 2 minutes (the core should log at least every 60s).
+        fresh = not os.path.exists(CURSOR_FILE) or (got0 and now - got0 > 120)
+        if fresh:
+            self._drop_cursor()
+            args = base + ["--cursor-file", CURSOR_FILE, "--since", "-2min"]
+        else:
+            args = base + ["--cursor-file", CURSOR_FILE]
+        rc, out, err = run(args, timeout=25)
+        if rc != 0 and not fresh:
+            # Cursor errored (rotated/vacuumed away): start over right now. A
+            # merely-empty read is normal between stats lines and is handled by
+            # the 2-minute no-lines re-sync above, not here.
+            self._drop_cursor()
+            rc, out, err = run(base + ["--cursor-file", CURSOR_FILE, "--since", "-2min"], timeout=25)
+        errline = next((l.strip() for l in (err or "").splitlines() if l.strip()), "")
+        nlines = 0
+        self.jhealth.update(rc=rc, error=errline[:300] if (rc != 0 or "permission" in errline.lower()) else "",
+                            at=now)
+        self.jhealth.setdefault("lines_at", now)
         for line in out.splitlines():
             e = journal_entry(line)
             if not e:
@@ -2099,6 +2136,8 @@ class Monitor(object):
             name = unit_to_name(unit)
             if not name:
                 continue
+            nlines += 1
+            self.last_log[name] = max(self.last_log.get(name, 0), ts or now)
             lvl, kind = classify(msg, prio)
             if kind == "stats":
                 d = parse_stats_line(msg)
@@ -2106,14 +2145,13 @@ class Monitor(object):
                     d["ts"] = ts or now
                     self.arq[name] = d
                     self.arq_samples[name].append(d)
-                    # Liveness is symmetric: the core logs rx_pkts>0 on BOTH
-                    # ends whenever authenticated packets arrive from the peer,
-                    # and established>0 while a tunnel session is up. Either
-                    # proves the link works, so refresh the handshake clock on
-                    # the server side too (it only ever logged "established" on
-                    # the client, which is why the Iran side showed "no
-                    # handshake" while the tunnel was fine).
-                    if (d.get("rx_pkts") or 0) > 0 or (d.get("established") or 0) > 0:
+                    # Liveness is symmetric and evidence-based: the core counts
+                    # every authenticated packet / byte RECEIVED from the peer
+                    # (heartbeat acks keep it non-zero even when idle). Only
+                    # that proves the link works - an open session alone may be
+                    # a dead one - so it refreshes the handshake clock on both
+                    # ends, not just on the client's "established" log line.
+                    if (d.get("rx_pkts") or 0) > 0 or (d.get("bytes_rx") or 0) > 0:
                         self.last_est[name] = ts or now
                 continue
             self.window.append((ts or now, name, lvl, kind))
@@ -2125,6 +2163,9 @@ class Monitor(object):
                 self.event(name, "error" if lvl == "ERROR" else "warn", msg.strip()[:300], key=(name, kind or msg[:40]))
             elif kind in ("start", "listening"):
                 self.event(name, "info", msg.strip()[:200])
+        self.jhealth["lines"] = nlines
+        if nlines:
+            self.jhealth["lines_at"] = now
         cutoff = now - 300
         while self.window and self.window[0][0] < cutoff:
             self.window.popleft()
@@ -2218,7 +2259,8 @@ class Monitor(object):
                                   rx=rx, tx=tx, net_totals={"rx": rx_tot, "tx": tx_tot}, listening=listening,
                                   log5={"info": w["INFO"], "warn": w["WARN"], "error": w["ERROR"]},
                                   totals=dict(self.totals[inst.name]), last_established=self.last_est.get(inst.name, 0),
-                                  arq=self._fresh_arq(inst.name))
+                                  last_log=self.last_log.get(inst.name, 0), arq=self._fresh_arq(inst.name),
+                                  traffic_src="tunnel" if (fa0 and isinstance(fa0.get("bytes_tx"), (int, float))) else "iface")
             h = self.hist.setdefault(inst.name, _hist())
             fa = out[inst.name]["arq"] or {}
             for k, v in (("retx", fa.get("retx_pct")), ("srtt", fa.get("srtt_ms"))):
@@ -2252,6 +2294,7 @@ class Monitor(object):
             "arq_samples": {n: list(v) for n, v in self.arq_samples.items()},
             "sys_history": {k: list(v) for k, v in self.sys_hist.items()},
             "events": list(self.events)[-60:],
+            "journal": dict(self.jhealth),
         }
         os.makedirs(RUN, exist_ok=True)
         atomic_write(STATE_JSON, json.dumps(state), 0o644, None, None)
@@ -2395,7 +2438,8 @@ def describe(inst, props, st):
     m = (st or {}).get("instances", {}).get(inst.name, {})
     d = {"name": inst.name, "unit": inst.unit, "role": inst.role, "config": redact(cfg)}
     d.update(s)
-    for k in ("cpu", "rss", "conns", "iface", "rx", "tx", "net_totals", "listening", "log5", "totals", "last_established", "arq"):
+    for k in ("cpu", "rss", "conns", "iface", "rx", "tx", "net_totals", "listening", "log5", "totals", "last_established", "arq",
+              "last_log", "traffic_src"):
         if k in m:
             d[k] = m[k]
     d["history"] = ((st or {}).get("history", {}) or {}).get(inst.name, {})
@@ -2432,6 +2476,7 @@ def api_overview(req):
         "system": (st or {}).get("system", {}), "sys_history": (st or {}).get("sys_history", {}),
         "tunnels": [describe(i, props, st if fresh else None) for i in insts],
         "events": ((st or {}).get("events") or [])[-30:], "watchdog": wd,
+        "journal": (st or {}).get("journal") or {},
         "step": SAMPLE_SEC, "now": time.time(),
     }
 
@@ -4580,7 +4625,7 @@ en: {
  cert_title:'Custom SSL certificate', cert_hint:'Use a real certificate for your domain (e.g. a Let’s Encrypt cert) instead of the self-signed one, so browsers stop warning about it. Give the paths to the files as already uploaded on this server — they are copied into place and TLS is turned on. The files must be readable by root and not live under /root or /home (the panel service cannot read those two directories).', cert_path:'Certificate file path (.crt / .pem / fullchain)', cert_path_ph:'/etc/letsencrypt/live/yourdomain/fullchain.pem', key_path:'Private key file path', key_path_ph:'/etc/letsencrypt/live/yourdomain/privkey.pem', cert_apply:'Apply certificate & restart panel', cert_both_required:'Both the certificate and the key path are required.',
  diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', diag_for:'Tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX', cavg:'AVG', cpeak:'PEAK', traffic:'Traffic', overall_speed:'live', overall_label:'Overall speed', upload:'Upload', download:'Download', sent:'Sent', received:'Received', conn_stats:'Connection Stats', conn_local:'local', conn_sessions:'sessions', open_sockets:'open sockets', client:'client', server:'server',
- active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
+ active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.', journal_err:'Cannot read the core logs:', nocore:'no core data', nocore_hint:'The service is running but the core is not reporting stats yet. If this persists, the core may be an older build - run Update. Handshake, traffic and agent data come from these stats.',
  events:'Recent events', none:'Nothing yet', details:'Details', start:'Start', stop:'Stop', restart:'Restart', del:'Delete', edit:'Edit', test:'Link test', key:'Key & link', link:'Setup link',
  create:'Create tunnel', import:'Import link', cancel:'Cancel', save:'Save', close:'Close', confirm_del:'Delete tunnel "%s"? Its service and config are removed.',
  f_name:'Tunnel name', f_transport:'Transport', h_transport:'spoof = UDP+ICMP forged source · tcp = standard non-spoofed TCP', f_real:'Real IP', f_spoof:'Spoofed IP', f_pool:'Spoofed IP pool (comma-separated, optional)', f_peerpool:'Peer spoofed IP pool (optional)',
@@ -4608,7 +4653,7 @@ fa: {
  cert_title:'سرتیفیکیت SSL اختصاصی', cert_hint:'به‌جای سرتیفیکیت خودامضا، یک سرتیفیکیت واقعی برای دامنه‌ات (مثلاً سرتیفیکیت Let’s Encrypt) استفاده کن تا مرورگرها دیگه هشدار ندن. مسیر فایل‌هایی که از قبل روی همین سرور آپلود کردی رو بده — کپی می‌شن و TLS روشن می‌شه. فایل‌ها باید توسط root قابل خوندن باشن و زیر /root یا /home نباشن (سرویس پنل اجازهٔ خوندن اون دو مسیر رو نداره).', cert_path:'مسیر فایل سرتیفیکیت (.crt / .pem / fullchain)', cert_path_ph:'/etc/letsencrypt/live/yourdomain/fullchain.pem', key_path:'مسیر فایل کلید خصوصی', key_path_ph:'/etc/letsencrypt/live/yourdomain/privkey.pem', cert_apply:'اعمال سرتیفیکیت و ری‌استارت پنل', cert_both_required:'هم مسیر سرتیفیکیت و هم مسیر کلید لازمه.',
  diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', diag_for:'تانل:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار سیستم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال', cavg:'میانگین', cpeak:'اوج', traffic:'ترافیک', overall_speed:'لحظه‌ای', overall_label:'سرعت کلی', upload:'آپلود', download:'دانلود', sent:'ارسال‌شده', received:'دریافت‌شده', conn_stats:'وضعیت اتصال', conn_local:'محلی', conn_sessions:'نشست‌ها', open_sockets:'سوکت باز', client:'کلاینت', server:'سرور',
- active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
+ active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.', journal_err:'خواندن لاگ‌های هسته ممکن نیست:', nocore:'بدون داده‌ی هسته', nocore_hint:'سرویس بالاست ولی هسته هنوز آمار نمی‌دهد. اگر ادامه داشت، احتمالاً نسخه‌ی هسته قدیمی است - آپدیت بزن. هندشیک، ترافیک و دادهٔ ایجنت از همین آمار می‌آیند.',
  events:'رویدادهای اخیر', none:'هنوز چیزی نیست', details:'جزئیات', start:'شروع', stop:'توقف', restart:'ری‌استارت', del:'حذف', edit:'ویرایش', test:'تست لینک', key:'کلید و لینک', link:'لینک راه‌اندازی',
  create:'ساخت تونل', import:'وارد کردن لینک', cancel:'انصراف', save:'ذخیره', close:'بستن', confirm_del:'تونل «%s» حذف شود؟ سرویس و کانفیگ آن پاک می‌شود.',
  f_name:'نام تونل', f_transport:'نوع انتقال', h_transport:'spoof = UDP+ICMP با منبع جعلی · tcp = TCP استاندارد بدون جعل', f_real:'IP واقعی', f_spoof:'IP جعلی', f_pool:'استخر IP جعلی (با کاما، اختیاری)', f_peerpool:'استخر IP جعلی طرف مقابل (اختیاری)',
@@ -4825,8 +4870,10 @@ function pill(a){
 }
 function viewOverview(m){
   const o=S.ov,sy=o.system||{},sh=o.sys_history||{};
+  const jh=o.journal||{};
   fill(m,
     !o.monitor_up&&h('div',{class:'banner',text:t('monitor_down')}),
+    (o.monitor_up&&jh.error)&&h('div',{class:'banner',text:t('journal_err')+' '+jh.error}),
     h('div',{class:'grid'},
       statCard(t('cpu'),(sy.cpu??0)+'%','',sh.cpu,'pink',v=>v.toFixed(0)+'%'),
       statCard(t('mem'),sy.mem_total?Math.round(100*sy.mem_used/sy.mem_total)+'%':'-',fmtB(sy.mem_used)+' / '+fmtB(sy.mem_total),sh.mem,'',v=>v.toFixed(0)+'%'),
@@ -4960,7 +5007,8 @@ function agentBox(x){
 function tc(x,full){
   const c=x.config||{},l5=x.log5||{info:0,warn:0,error:0};
   const kv=(k,v)=>h('div',{},h('span',{class:'lbl',text:k}),h('span',{class:'v',text:v}));
-  const head=h('div',{class:'row'},h('b',{text:x.name}),h('span',{class:'tag',text:t(x.role)}),h('div',{class:'sp'}),pill(x.active));
+  const noCore=x.active==='active'&&S.ov.monitor_up&&!x.arq;
+  const head=h('div',{class:'row'},h('b',{text:x.name}),h('span',{class:'tag',text:t(x.role)}),h('div',{class:'sp'}),noCore&&h('span',{class:'pill sm warn',title:t('nocore_hint'),text:t('nocore')}),pill(x.active));
   const addr=h('div',{class:'lbl mono addr',text:`${c.real_ip||'?'} ⇄ ${c.peer_real_ip||'?'}  ·  ${(c.transport||'spoof')==='tcp'?'TCP':'UDP '+(c.data_port||'?')+' · ICMP '+(c.icmp_id??'?')}`});
   if(!full){
     return h('div',{class:'card tcard compact'},head,addr,

@@ -100,6 +100,8 @@ async fn handle_client(
 
     // Wait (without polling) for the tunnel to be established (SYN-ACK).
     if !manager.wait_established(tunnel_id, Duration::from_secs(15)).await {
+        // Free the half-open session (it leaked before, inflating counts).
+        manager.close_tunnel(tunnel_id).await;
         socks5_reply(&mut stream, REP_GENERAL_FAIL).await?;
         bail!("tunnel {} handshake timed out", tunnel_id);
     }
@@ -107,8 +109,10 @@ async fn handle_client(
     // Send CONNECT destination as the first payload so the server knows
     // where to forward the TCP connection.
     let connect_meta = format!("CONNECT {}:{}", target_host, target_port);
-    net_tx.send(Bytes::from(connect_meta)).await
-        .context("sending CONNECT meta")?;
+    if let Err(e) = net_tx.send(Bytes::from(connect_meta)).await {
+        manager.close_tunnel(tunnel_id).await;
+        return Err(e).context("sending CONNECT meta");
+    }
 
     // Reply SOCKS5 success to the local application.
     socks5_reply(&mut stream, REP_SUCCESS).await?;
@@ -144,11 +148,14 @@ async fn handle_client(
         }
     });
 
-    tokio::select! {
-        _ = a_to_t => {}
-        _ = t_to_a => {}
+    // If the local app finished first, deliver what it sent before the FIN.
+    let local_done = tokio::select! {
+        _ = a_to_t => true,
+        _ = t_to_a => false,
+    };
+    if local_done {
+        manager.drain(tunnel_id, crate::tunnel::DRAIN_TIMEOUT).await;
     }
-
     manager.close_tunnel(tunnel_id).await;
     Ok(())
 }
