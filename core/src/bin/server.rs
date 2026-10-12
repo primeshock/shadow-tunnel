@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -149,14 +149,31 @@ async fn handle_new_tunnel(
         .await
         .context("accept_syn")?;
 
-    // First message from the client is the CONNECT destination.
-    let first_msg = tokio::time::timeout(Duration::from_secs(15), app_rx.recv())
-        .await
-        .context("timeout waiting for CONNECT meta")?
-        .context("tunnel closed before CONNECT meta")?;
+    // From here on the tunnel is registered with the manager: any early
+    // return must close it (manager.close_tunnel sends the peer a FIN and
+    // frees the slot) instead of just bailing out, or the client is left
+    // hanging on a session the server has silently abandoned - the "handshake
+    // works but no data comes back" symptom.
+    let first_msg = match tokio::time::timeout(Duration::from_secs(15), app_rx.recv()).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            manager.close_tunnel(tunnel_id).await;
+            bail!("tunnel closed before CONNECT meta");
+        }
+        Err(_) => {
+            manager.close_tunnel(tunnel_id).await;
+            bail!("timeout waiting for CONNECT meta");
+        }
+    };
 
     let meta = String::from_utf8_lossy(&first_msg);
-    let (target_host, target_port) = parse_connect_meta(&meta)?;
+    let (target_host, target_port) = match parse_connect_meta(&meta) {
+        Ok(v) => v,
+        Err(e) => {
+            manager.close_tunnel(tunnel_id).await;
+            return Err(e);
+        }
+    };
 
     log::info!(
         "tunnel {} forwarding to {}:{}",
@@ -179,6 +196,7 @@ async fn handle_new_tunnel(
                 "tunnel {} could not reach requested destination {}: {}",
                 tunnel_id, target_addr, e
             );
+            manager.close_tunnel(tunnel_id).await;
             return Ok(());
         }
     };
