@@ -5,4 +5,5 @@ pub mod congestion;
 pub mod raw_socket;
 pub mod tunnel;
 pub mod socks5;
+pub mod stats;
 pub mod tcp;

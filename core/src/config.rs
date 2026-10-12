@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 use serde::Deserialize;
 
 /// Top-level configuration loaded from a TOML file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
     /// The real (physical) IPv4 address of this node.
     pub real_ip: Ipv4Addr,
@@ -211,6 +211,15 @@ impl Config {
         Ok(())
     }
 
+    /// True when `other` differs from `self` only in fields that can be
+    /// applied to a running process (see [`Config::tuning`]).
+    pub fn differs_only_in_tuning(&self, other: &Config) -> bool {
+        let mut o = other.clone();
+        o.max_retries = self.max_retries;
+        o.rto_min_ms = self.rto_min_ms;
+        o == *self
+    }
+
     /// The robustness knobs applied to each tunnel.
     pub fn tuning(&self) -> Tuning {
         Tuning { max_retries: self.max_retries, rto_min_ms: self.rto_min_ms }
@@ -317,6 +326,17 @@ initial_cwnd    = 10.0
 
     fn parse(toml: &str) -> Config {
         toml::from_str(toml).expect("config should parse")
+    }
+
+    #[test]
+    fn tuning_only_change_is_detected() {
+        let a = parse(&valid_toml());
+        let mut b = a.clone();
+        b.rto_min_ms = 900;
+        b.max_retries = 20;
+        assert!(a.differs_only_in_tuning(&b));
+        b.mtu = 1200;
+        assert!(!a.differs_only_in_tuning(&b));
     }
 
     #[test]

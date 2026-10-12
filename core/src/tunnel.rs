@@ -21,6 +21,7 @@ use crate::congestion::CongestionControl;
 use crate::config::{Config, Tuning};
 use crate::packet::{ShadowPacket, PacketKind};
 use crate::raw_socket::{OutPacket, RawSender};
+use crate::stats::Stats;
 
 const HEARTBEAT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_MIN_INTERVAL: Duration = Duration::from_secs(2);
@@ -150,8 +151,11 @@ struct Inner {
     cfg:     Arc<Config>,
     /// HMAC key bytes derived once from `cfg.pre_shared_key`.
     key:     Vec<u8>,
-    /// ARQ/congestion robustness knobs from the config.
-    tuning:  Tuning,
+    /// ARQ/congestion robustness knobs.  Behind a lock so a config reload
+    /// (SIGHUP) can change them without restarting the process.
+    tuning:  std::sync::RwLock<Tuning>,
+    /// Interval counters reported by `spawn_stats_reporter`.
+    stats:   Stats,
 }
 
 /// Manages all active tunnels.  Cheaply cloneable (`Arc` inside).
@@ -169,7 +173,8 @@ impl TunnelManager {
             addr,
             cfg,
             key,
-            tuning,
+            tuning: std::sync::RwLock::new(tuning),
+            stats:  Stats::default(),
         }))
     }
 
@@ -194,7 +199,7 @@ impl TunnelManager {
             0,
             app_tx,
             self.0.cfg.initial_cwnd,
-            self.0.tuning,
+            self.current_tuning(),
         );
         // Grab the notifiers before inserting (to avoid re-locking).
         let window_notify      = tunnel.window_notify.clone();
@@ -240,7 +245,7 @@ impl TunnelManager {
             syn.seq.wrapping_add(1),
             app_tx,
             self.0.cfg.initial_cwnd,
-            self.0.tuning,
+            self.current_tuning(),
         );
         // Server transitions to Established immediately after SYN-ACK.
         tunnel.state = TunnelState::Established;
@@ -338,6 +343,7 @@ impl TunnelManager {
             PacketKind::Nack => {
                 if let Some(retransmit) = t.arq.process_nack(pkt.seq) {
                     drop(t);
+                    self.0.stats.add_retx_nack(1);
                     self.tx_data(retransmit).await?;
                     return Ok(None);
                 }
@@ -395,6 +401,7 @@ impl TunnelManager {
                         .as_millis() as f64;
                     let rtt = (now_ms - sent_ms).max(0.0);
                     t.record_rtt(rtt);
+                    self.0.stats.add_rtt_sample();
                     log::debug!("tunnel {} RTT {:.1} ms", pkt.tunnel_id, rtt);
                 }
             }
@@ -430,7 +437,12 @@ impl TunnelManager {
                 let timed_out = t.arq.take_timed_out();
                 if !timed_out.is_empty() {
                     t.on_loss();
+                    self.0.stats.add_retx_timeout(timed_out.len() as u64);
                     exp.extend(timed_out);
+                }
+                let gave_up = t.arq.take_gave_up();
+                if gave_up > 0 {
+                    self.0.stats.add_gave_up(gave_up);
                 }
                 if t.state == TunnelState::Established
                     && t.is_idle(HEARTBEAT_IDLE_TIMEOUT)
@@ -451,6 +463,74 @@ impl TunnelManager {
         for pkt in expired_pkts { self.tx_data(pkt).await?; }
         for hb  in heartbeats   { self.tx_control(hb).await?; }
         Ok(())
+    }
+
+    // ── Live tuning & stats ───────────────────────────────────────────────────
+
+    /// The ARQ/congestion knobs new tunnels are created with.
+    pub fn current_tuning(&self) -> Tuning {
+        *self.0.tuning.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Replace the tuning knobs for new tunnels and apply them to every
+    /// existing tunnel, so a reload takes effect without dropping sessions.
+    pub async fn apply_tuning(&self, tuning: Tuning) {
+        *self.0.tuning.write().unwrap_or_else(|e| e.into_inner()) = tuning;
+        let tunnels: Vec<Arc<Mutex<Tunnel>>> =
+            self.0.tunnels.iter().map(|e| e.value().clone()).collect();
+        for tunnel in tunnels {
+            let mut t = tunnel.lock().await;
+            t.arq.set_max_retries(tuning.max_retries);
+            t.cc.set_rto_min_ms(tuning.rto_min_ms as f64);
+        }
+    }
+
+    /// Log one `stats:` line per `every` while there is traffic (and at least
+    /// once a minute otherwise), with interval counters and the mean
+    /// smoothed RTT / RTT variance of tunnels that have an RTT sample.
+    /// The line format is parsed by the panel's monitor; keep it stable.
+    pub fn spawn_stats_reporter(&self, every: Duration) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(every);
+            iv.tick().await;
+            let mut last_log = Instant::now();
+            loop {
+                iv.tick().await;
+                let snap = this.0.stats.take();
+                let tunnels: Vec<Arc<Mutex<Tunnel>>> =
+                    this.0.tunnels.iter().map(|e| e.value().clone()).collect();
+                let n = tunnels.len();
+                let (mut srtt, mut var, mut k) = (0.0, 0.0, 0u32);
+                for tunnel in tunnels {
+                    let t = tunnel.lock().await;
+                    if t.state == TunnelState::Established {
+                        if let Some((s, v)) = t.cc.rtt.sample() {
+                            srtt += s;
+                            var += v;
+                            k += 1;
+                        }
+                    }
+                }
+                if snap.is_idle() && n == 0 && last_log.elapsed() < Duration::from_secs(60) {
+                    continue;
+                }
+                last_log = Instant::now();
+                let tn = this.current_tuning();
+                let (srtt_s, var_s) = if k > 0 {
+                    (format!("{:.1}", srtt / k as f64), format!("{:.1}", var / k as f64))
+                } else {
+                    ("-".to_string(), "-".to_string())
+                };
+                log::info!(
+                    "stats: tunnels={} sent={} retx_timeout={} retx_nack={} gave_up={} \
+                     rtt_samples={} srtt_ms={} rttvar_ms={} rto_min_ms={} max_retries={} interval_s={}",
+                    n, snap.data_sent, snap.retx_timeout, snap.retx_nack, snap.gave_up,
+                    snap.rtt_samples, srtt_s, var_s, tn.rto_min_ms, tn.max_retries,
+                    every.as_secs()
+                );
+            }
+        });
     }
 
     // ── Status helpers ────────────────────────────────────────────────────────
@@ -553,6 +633,7 @@ impl TunnelManager {
             let mut t = tunnel.lock().await;
             t.make_data_packet(payload)
         };
+        self.0.stats.add_sent(1);
         self.tx_data(pkt).await
     }
 

@@ -25,6 +25,9 @@ struct SendSlot {
     packet:      ShadowPacket,
     sent_at:     Instant,
     retry_count: u32,
+    /// Set once the slot has used every allowed retransmission and timed out
+    /// again, so it is counted in [`SrArq::take_gave_up`] exactly once.
+    exhausted:   bool,
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -47,6 +50,10 @@ pub struct SrArq {
     /// Maximum retransmissions before a packet is dropped (configurable; the
     /// default matches [`MAX_RETRIES`]).
     max_retries: u32,
+
+    /// Packets abandoned after exhausting `max_retries` since the last
+    /// [`SrArq::take_gave_up`] call.
+    gave_up: u64,
 }
 
 impl SrArq {
@@ -63,6 +70,7 @@ impl SrArq {
             recv_buf:  HashMap::new(),
             rto:       DEFAULT_RTO,
             max_retries: MAX_RETRIES,
+            gave_up:   0,
         }
     }
 
@@ -90,6 +98,7 @@ impl SrArq {
             packet:      pkt.clone(),
             sent_at:     Instant::now(),
             retry_count: 0,
+            exhausted:   false,
         });
         self.send_next = self.send_next.wrapping_add(1);
         seq
@@ -120,7 +129,11 @@ impl SrArq {
     pub fn process_nack(&mut self, seq: u32) -> Option<ShadowPacket> {
         let slot = self.send_buf.get_mut(&seq)?;
         if slot.retry_count >= self.max_retries {
-            log::warn!("ARQ: seq {} exceeded max retries – dropping", seq);
+            if !slot.exhausted {
+                slot.exhausted = true;
+                self.gave_up += 1;
+                log::warn!("ARQ: seq {} exceeded max retries – dropping", seq);
+            }
             return None;
         }
         slot.retry_count += 1;
@@ -140,10 +153,18 @@ impl SrArq {
                     slot.retry_count += 1;
                     slot.sent_at = now;
                     expired.push(slot.packet.clone());
+                } else if !slot.exhausted {
+                    slot.exhausted = true;
+                    self.gave_up += 1;
                 }
             }
         }
         expired
+    }
+
+    /// Number of packets abandoned after `max_retries` since the last call.
+    pub fn take_gave_up(&mut self) -> u64 {
+        std::mem::take(&mut self.gave_up)
     }
 
     // ── Receiver ──────────────────────────────────────────────────────────────
@@ -262,6 +283,19 @@ mod tests {
         assert!(arq.process_nack(seq).is_some());
         assert!(arq.process_nack(seq).is_some());
         assert!(arq.process_nack(seq).is_none());
+    }
+
+    #[test]
+    fn exhausted_packet_is_counted_once() {
+        let mut arq = SrArq::new(0, 0);
+        arq.set_max_retries(1);
+        let mut p = data_pkt(0);
+        let seq = arq.enqueue(&mut p);
+        assert!(arq.process_nack(seq).is_some());
+        assert!(arq.process_nack(seq).is_none());
+        assert!(arq.process_nack(seq).is_none());
+        assert_eq!(arq.take_gave_up(), 1);
+        assert_eq!(arq.take_gave_up(), 0);
     }
 
     #[test]

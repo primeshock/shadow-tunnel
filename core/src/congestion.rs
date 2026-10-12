@@ -76,6 +76,11 @@ impl RttEstimator {
     pub fn srtt_ms(&self) -> f64 {
         self.srtt_ms.unwrap_or(1000.0)
     }
+
+    /// `(srtt_ms, rttvar_ms)` once at least one RTT sample exists.
+    pub fn sample(&self) -> Option<(f64, f64)> {
+        self.srtt_ms.map(|s| (s, self.rttvar_ms))
+    }
 }
 
 impl Default for RttEstimator {

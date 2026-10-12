@@ -32,11 +32,19 @@ struct Args {
     /// without opening any sockets.  Exit code 0 means the config is accepted.
     #[arg(long)]
     check_config: bool,
+    /// Print the runtime features this binary supports (one per line) and
+    /// exit.  The panel checks this before relying on live reload.
+    #[arg(long)]
+    capabilities: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.capabilities {
+        println!("live-tuning\nstats");
+        return Ok(());
+    }
 
     // Initialise logging.
     let level = args
@@ -61,6 +69,7 @@ async fn main() -> Result<()> {
             "Shadow Spoof client starting | transport=tcp | real={} peer={}:{}",
             cfg.real_ip, cfg.peer_real_ip, cfg.data_port
         );
+        spawn_reload_handler(None, args.config.clone(), true, cfg.clone());
         return shadow_spoof::tcp::run_tcp_client(cfg).await;
     }
 
@@ -92,6 +101,8 @@ async fn main() -> Result<()> {
         is_server:   false,
     };
     let manager = TunnelManager::new(sender, peer_addr, cfg.clone());
+    manager.spawn_stats_reporter(Duration::from_secs(10));
+    spawn_reload_handler(Some(manager.clone()), args.config.clone(), true, cfg.clone());
 
     // ── Background task: process incoming packets ─────────────────────────────
     let mgr2 = manager.clone();
@@ -126,4 +137,38 @@ async fn main() -> Result<()> {
     run_socks5(cfg, manager).await?;
 
     Ok(())
+}
+
+/// Reload tuning knobs on SIGHUP without dropping tunnels.  Installing the
+/// handler also stops SIGHUP from terminating the process (its default
+/// action), so a stray `systemctl reload`/`kill -HUP` is harmless.
+fn spawn_reload_handler(manager: Option<TunnelManager>, path: String, client: bool, current: Arc<Config>) {
+    tokio::spawn(async move {
+        let mut hup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => { log::warn!("reload: cannot install SIGHUP handler: {}", e); return; }
+        };
+        let mut current = current;
+        while hup.recv().await.is_some() {
+            let Some(mgr) = manager.as_ref() else {
+                log::info!("reload: the tcp transport has no live-tunable settings; restart to apply changes");
+                continue;
+            };
+            match Config::load(&path, client) {
+                Ok(new) => {
+                    let t = new.tuning();
+                    mgr.apply_tuning(t).await;
+                    log::info!("reload: tuning applied max_retries={} rto_min_ms={}", t.max_retries, t.rto_min_ms);
+                    if !current.differs_only_in_tuning(&new) {
+                        log::warn!("reload: settings other than max_retries/rto_min_ms changed; they take effect after a restart");
+                    }
+                    let mut keep = (*current).clone();
+                    keep.max_retries = new.max_retries;
+                    keep.rto_min_ms = new.rto_min_ms;
+                    current = Arc::new(keep);
+                }
+                Err(e) => log::warn!("reload: config rejected, keeping current tuning: {}", e),
+            }
+        }
+    });
 }
