@@ -11,8 +11,9 @@
 //! and then splices bytes in both directions.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -21,9 +22,93 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::Config;
 use crate::packet::ShadowPacket;
+use crate::stats::Stats;
 
 const MAX_FRAME: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+// ── stats (same `stats:` line format the monitor parses) ───────────────────
+
+/// Interval byte counters plus a gauge of currently-relayed sessions.
+#[derive(Debug, Default)]
+pub struct TcpStats {
+    stats:  Stats,
+    active: AtomicU64,
+}
+
+/// Decrements the active-session gauge when a relayed session ends.
+struct ActiveGuard(Arc<TcpStats>);
+
+impl ActiveGuard {
+    fn new(st: &Arc<TcpStats>) -> Self {
+        st.active.fetch_add(1, Relaxed);
+        Self(st.clone())
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) { self.0.active.fetch_sub(1, Relaxed); }
+}
+
+fn spawn_stats_reporter(st: Arc<TcpStats>, every: Duration) {
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(every);
+        iv.tick().await;
+        let mut last_log = Instant::now();
+        loop {
+            iv.tick().await;
+            let snap = st.stats.take();
+            let active = st.active.load(Relaxed);
+            if snap.is_idle() && active == 0 && last_log.elapsed() < Duration::from_secs(60) {
+                continue;
+            }
+            last_log = Instant::now();
+            // rto_min_ms/max_retries are 0: the kernel's TCP handles retransmission here.
+            log::info!(
+                "stats: tunnels={} sent=0 retx_timeout=0 retx_nack=0 gave_up=0 rtt_samples=0 \
+                 srtt_ms=- rttvar_ms=- rto_min_ms=0 max_retries=0 interval_s={} \
+                 established={} rx_pkts={} bytes_tx={} bytes_rx={} transport=tcp",
+                active, every.as_secs(), active, snap.rx_pkts, snap.bytes_tx, snap.bytes_rx
+            );
+        }
+    });
+}
+
+/// Relay bytes both ways, counting them. `peer` is the tunnel side: bytes read
+/// from it are received from the peer, bytes written to it are sent to it.
+/// Each direction shuts its write half on EOF, like `copy_bidirectional`.
+async fn relay_counted(peer: TcpStream, other: TcpStream, st: Arc<TcpStats>) {
+    let (mut pr, mut pw) = peer.into_split();
+    let (mut or, mut ow) = other.into_split();
+    let (s1, s2) = (st.clone(), st);
+    let from_peer = async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match pr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if ow.write_all(&buf[..n]).await.is_err() { break; }
+                    s1.stats.add_bytes_rx(n as u64);
+                }
+            }
+        }
+        let _ = ow.shutdown().await;
+    };
+    let to_peer = async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match or.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if pw.write_all(&buf[..n]).await.is_err() { break; }
+                    s2.stats.add_bytes_tx(n as u64);
+                }
+            }
+        }
+        let _ = pw.shutdown().await;
+    };
+    tokio::join!(from_peer, to_peer);
+}
 
 // ── length-prefixed authenticated frames (session setup only) ──────────────
 
@@ -76,19 +161,22 @@ pub async fn run_tcp_client(cfg: Arc<Config>) -> Result<()> {
         "SOCKS5 (tcp transport) listening on {} -> {}:{}",
         bind, cfg.peer_real_ip, cfg.data_port
     );
+    let st = Arc::new(TcpStats::default());
+    spawn_stats_reporter(st.clone(), Duration::from_secs(10));
     loop {
         let (stream, peer) = listener.accept().await?;
         let cfg = cfg.clone();
         let key = key.clone();
+        let st = st.clone();
         tokio::spawn(async move {
-            if let Err(e) = client_conn(stream, cfg, key).await {
+            if let Err(e) = client_conn(stream, cfg, key, st).await {
                 log::debug!("tcp client [{}]: {}", peer, e);
             }
         });
     }
 }
 
-async fn client_conn(mut local: TcpStream, cfg: Arc<Config>, key: Vec<u8>) -> Result<()> {
+async fn client_conn(mut local: TcpStream, cfg: Arc<Config>, key: Vec<u8>, st: Arc<TcpStats>) -> Result<()> {
     let (host, port) = socks5_accept(&mut local).await?;
     log::info!("tcp CONNECT -> {}:{}", host, port);
 
@@ -103,13 +191,16 @@ async fn client_conn(mut local: TcpStream, cfg: Arc<Config>, key: Vec<u8>) -> Re
     let reply = tokio::time::timeout(HANDSHAKE_TIMEOUT, recv_ctrl(&mut up, &key))
         .await
         .context("timeout waiting for the server reply")??;
+    // An authenticated reply arrived: the server is alive, whatever it said.
+    st.stats.add_rx_pkt();
     if reply != "OK" {
         socks5_reply(&mut local, 0x01).await?; // general failure
         bail!("server refused: {}", reply);
     }
     socks5_reply(&mut local, 0x00).await?; // success
 
-    tokio::io::copy_bidirectional(&mut local, &mut up).await.ok();
+    let _active = ActiveGuard::new(&st);
+    relay_counted(up, local, st.clone()).await;
     Ok(())
 }
 
@@ -124,6 +215,8 @@ pub async fn run_tcp_server(cfg: Arc<Config>) -> Result<()> {
         .await
         .with_context(|| format!("bind tcp transport port {}", cfg.data_port))?;
     log::info!("tcp transport server listening on {}", bind);
+    let st = Arc::new(TcpStats::default());
+    spawn_stats_reporter(st.clone(), Duration::from_secs(10));
     loop {
         let (stream, peer) = listener.accept().await?;
         let src = match peer {
@@ -139,24 +232,26 @@ pub async fn run_tcp_server(cfg: Arc<Config>) -> Result<()> {
         }
         let cfg = cfg.clone();
         let key = key.clone();
+        let st = st.clone();
         tokio::spawn(async move {
-            if let Err(e) = server_conn(stream, cfg, key).await {
+            if let Err(e) = server_conn(stream, cfg, key, st).await {
                 log::debug!("tcp server [{}]: {}", peer, e);
             }
         });
     }
 }
 
-async fn server_conn(mut client: TcpStream, _cfg: Arc<Config>, key: Vec<u8>) -> Result<()> {
+async fn server_conn(mut client: TcpStream, _cfg: Arc<Config>, key: Vec<u8>, st: Arc<TcpStats>) -> Result<()> {
     client.set_nodelay(true).ok();
     let meta = tokio::time::timeout(HANDSHAKE_TIMEOUT, recv_ctrl(&mut client, &key))
         .await
         .context("timeout waiting for CONNECT meta")??;
+    st.stats.add_rx_pkt();
     let (host, port) = parse_connect_meta(&meta)?;
     log::info!("tcp forwarding to {}:{}", host, port);
 
     let target = format!("{}:{}", host, port);
-    let mut up = match TcpStream::connect(&target).await {
+    let up = match TcpStream::connect(&target).await {
         Ok(s) => s,
         Err(e) => {
             send_ctrl(&mut client, &key, &format!("ERR {}", e)).await.ok();
@@ -166,7 +261,8 @@ async fn server_conn(mut client: TcpStream, _cfg: Arc<Config>, key: Vec<u8>) -> 
     up.set_nodelay(true).ok();
     send_ctrl(&mut client, &key, "OK").await?;
 
-    tokio::io::copy_bidirectional(&mut client, &mut up).await.ok();
+    let _active = ActiveGuard::new(&st);
+    relay_counted(client, up, st.clone()).await;
     Ok(())
 }
 

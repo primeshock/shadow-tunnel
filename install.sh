@@ -53,7 +53,7 @@ readonly MIN_RUSTC=1.85.0
 # live inside THIS install.sh, independent of the Rust core commit). Bump it
 # on every change to install.sh so operators can see whether an update applied.
 # Must match PANEL_VERSION in the embedded Python panel below.
-readonly SHADOW_RELEASE=2.4.1
+readonly SHADOW_RELEASE=2.5.0
 
 REPO_URL=${SHADOW_REPO_URL:-https://github.com/primeshock/shadow-tunnel.git}
 REPO_REF=${SHADOW_REF:-$DEFAULT_REF}
@@ -1330,7 +1330,7 @@ SVC_USER = "shadow-spoof"
 # installer above; both are bumped together on every install.sh change. This is
 # the version actually executing now (not what build-info last recorded), so the
 # Update tab can show whether a restart picked up new panel code.
-PANEL_VERSION = "2.4.1"
+PANEL_VERSION = "2.5.0"
 
 CONF_MAIN = os.path.join(ETC, "config.toml")
 TUNNELS = os.path.join(ETC, "tunnels")
@@ -1900,7 +1900,7 @@ def parse_stats_line(msg):
         try:
             d[k] = float(v) if "." in v else int(v)
         except ValueError:
-            return None
+            d[k] = v   # non-numeric fields (e.g. transport=spoof) stay as strings
     for k in ("tunnels", "sent", "retx_timeout", "retx_nack", "gave_up", "rto_min_ms", "max_retries"):
         if not isinstance(d.get(k), (int, float)):
             return None
@@ -1929,6 +1929,7 @@ class Monitor(object):
         self.throttle_win = {}
         self.clear_seen = 0.0
         self.arq = {}
+        self.bytes_total = {}
         self.arq_samples = defaultdict(lambda: deque(maxlen=90))
         self.clk = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
         os.makedirs(os.path.dirname(EVENTS_FILE), exist_ok=True)
@@ -2105,6 +2106,15 @@ class Monitor(object):
                     d["ts"] = ts or now
                     self.arq[name] = d
                     self.arq_samples[name].append(d)
+                    # Liveness is symmetric: the core logs rx_pkts>0 on BOTH
+                    # ends whenever authenticated packets arrive from the peer,
+                    # and established>0 while a tunnel session is up. Either
+                    # proves the link works, so refresh the handshake clock on
+                    # the server side too (it only ever logged "established" on
+                    # the client, which is why the Iran side showed "no
+                    # handshake" while the tunnel was fine).
+                    if (d.get("rx_pkts") or 0) > 0 or (d.get("established") or 0) > 0:
+                        self.last_est[name] = ts or now
                 continue
             self.window.append((ts or now, name, lvl, kind))
             if kind:
@@ -2171,12 +2181,35 @@ class Monitor(object):
             cfg = inst.cfg()
             st = unit_status(inst, props)
             cpu, rss = self.proc_metrics(st["pid"])
-            n_conn = self.conns(inst, cfg, st["pid"])
+            fa0 = self._fresh_arq(inst.name)
+            # The core's `established` gauge (active sessions) is symmetric and
+            # needs no /proc access, so it works on the server too, where the
+            # hardened sandbox hides the tunnel pid from ss/_conns_via_fd and
+            # left the count stuck at 0. Fall back to the socket probe only
+            # when the core hasn't reported yet (older build / just started).
+            if fa0 and isinstance(fa0.get("established"), (int, float)):
+                n_conn = int(fa0["established"])
+            else:
+                n_conn = self.conns(inst, cfg, st["pid"])
             iface = cfg.get("interface", "")
             if iface in ("", "auto") or not iface:
                 iface = self.iface_cache.get(inst.name) or detect_iface(cfg.get("real_ip", "")) or ""
                 self.iface_cache[inst.name] = iface
-            rx, tx, rx_tot, tx_tot = self.net_rate(iface) if iface else (0, 0, 0, 0)
+            # Per-tunnel traffic from the core's own byte counters (the
+            # interface rate is shared by every tunnel on that device, so with
+            # several tunnels it wrongly credited one tunnel with another's
+            # traffic). Fall back to the interface rate only when the core has
+            # not reported bytes yet (older build / just started).
+            if fa0 and isinstance(fa0.get("bytes_tx"), (int, float)) and isinstance(fa0.get("bytes_rx"), (int, float)):
+                iv = fa0.get("interval_s") or SAMPLE_SEC
+                iv = iv if iv and iv > 0 else SAMPLE_SEC
+                tx = int(fa0["bytes_tx"] / iv)
+                rx = int(fa0["bytes_rx"] / iv)
+                tot = self.bytes_total.setdefault(inst.name, {"rx": 0, "tx": 0})
+                tot["tx"] += int(fa0["bytes_tx"]); tot["rx"] += int(fa0["bytes_rx"])
+                rx_tot, tx_tot = tot["rx"], tot["tx"]
+            else:
+                rx, tx, rx_tot, tx_tot = self.net_rate(iface) if iface else (0, 0, 0, 0)
             listening = None
             if inst.role == "client" and cfg.get("socks5_port"):
                 listening = port_listening(cfg["socks5_port"], True)
@@ -2403,6 +2436,46 @@ def api_overview(req):
     }
 
 
+def suggest_tunnel_defaults():
+    """Random, non-colliding data_port / icmp_id / socks5_port for a NEW tunnel,
+    so two tunnels on one host never clash (which otherwise shows up as a
+    confusing 'already uses this peer with the same data port' error or a
+    silent SOCKS bind conflict). The operator can still change any of them."""
+    insts = instances()
+    used_dp = set()
+    used_icmp = set()
+    used_socks = set()
+    for i in insts:
+        try:
+            c = i.cfg()
+        except Exception:
+            continue
+        if c.get("data_port"):
+            used_dp.add(int(c["data_port"]))
+        if c.get("icmp_id") is not None:
+            used_icmp.add(int(c["icmp_id"]))
+        if c.get("socks5_port"):
+            used_socks.add(int(c["socks5_port"]))
+
+    def pick_port(used):
+        # Ephemeral-ish high range, away from common service ports.
+        for _ in range(200):
+            p = secrets.randbelow(45001) + 20000   # 20000-65000
+            if p not in used and not port_listening(p):
+                return p
+        p = secrets.randbelow(45001) + 20000
+        return p
+
+    dp = pick_port(used_dp)
+    sk = pick_port(used_socks | {dp})
+    icmp = secrets.randbelow(65535) + 1
+    for _ in range(200):
+        if icmp not in used_icmp:
+            break
+        icmp = secrets.randbelow(65535) + 1
+    return dp, icmp, sk
+
+
 def api_meta(req):
     info = {}
     for line in read_text(BUILD_INFO).splitlines():
@@ -2410,11 +2483,12 @@ def api_meta(req):
         info[k] = v
     info["running_panel_version"] = PANEL_VERSION
     info["ui_build"] = ui_version()
+    dp, icmp, sk = suggest_tunnel_defaults()
     return {"role": get_role(), "detect_ip": detect_ip(), "ifaces": list_ifaces(), "build": info,
-            "tls": bool(load_panel().get("tls")), "defaults": {"transport": "spoof", "data_port": 51820, "tunnel_count": 4, "mtu": 1380,
-                                                              "initial_cwnd": 10, "socks5_port": 1080,
+            "tls": bool(load_panel().get("tls")), "defaults": {"transport": "spoof", "data_port": dp, "tunnel_count": 4, "mtu": 1380,
+                                                              "initial_cwnd": 10, "socks5_port": sk,
                                                               "max_retries": 8, "rto_min_ms": 200, "auto_restart": "on-failure", "restart_sec": 5,
-                                                              "icmp_id": secrets.randbelow(65536)}}
+                                                              "icmp_id": icmp}}
 
 
 def api_keygen(req):
@@ -4493,7 +4567,7 @@ try{matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{i
 /* ---------- i18n ---------- */
 const TR = {
 en: {
- ev_tab:'Events', upd_failed:'update failed - see the log below', ui_title:'Appearance & UI', ui_hint:'Visual preferences for this browser only (saved locally). Changes apply instantly.', ui_theme:'Theme', ui_pal:'Colour palette', ui_blur:'Menu & header blur', ui_cblur:'Box (card) blur', ui_glass:'Glass opacity', ui_bg:'Background colour strength', ui_radius:'Corner roundness', ui_speed:'Background motion speed', ui_anim:'Animate background', ui_grid:'Show grid', ui_compact:'Compact cards', ui_reset:'Reset to defaults', th_dark:'Dark', th_light:'Light', th_auto:'Auto (system)', pal_default:'Blue', pal_pink:'Pink / Purple', pal_ocean:'Ocean', pal_emerald:'Emerald', pal_sunset:'Sunset', pal_mono:'Mono', sp_slow:'Slow', sp_norm:'Normal', sp_fast:'Fast', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', via_tunnel:'via tunnel', via_proxy:'via proxy', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', panel_ver:'Panel version', core_commit:'Core commit', upd_built:'Built', ver_stale:'Installed build-info shows %s - the panel process may not have restarted after the last update; click Restart Panel in the top bar.', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
+ ev_tab:'Events', upd_failed:'update failed - see the log below', ui_title:'Appearance & UI', ui_hint:'Visual preferences for this browser only (saved locally). Changes apply instantly.', ui_theme:'Theme', ui_pal:'Colour palette', ui_blur:'Menu & header blur', ui_cblur:'Box (card) blur', ui_glass:'Glass opacity', ui_bg:'Background colour strength', ui_radius:'Corner roundness', ui_speed:'Background motion speed', ui_anim:'Animate background', ui_grid:'Show grid', ui_compact:'Compact cards', ui_reset:'Reset to defaults', th_dark:'Dark', th_light:'Light', th_auto:'Auto (system)', pal_default:'Blue', pal_pink:'Pink / Purple', pal_ocean:'Ocean', pal_emerald:'Emerald', pal_sunset:'Sunset', pal_mono:'Mono', sp_slow:'Slow', sp_norm:'Normal', sp_fast:'Fast', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', link_host_only:'peer host up, tunnel not established', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', via_tunnel:'via tunnel', via_proxy:'via proxy', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', panel_ver:'Panel version', core_commit:'Core commit', upd_built:'Built', ver_stale:'Installed build-info shows %s - the panel process may not have restarted after the last update; click Restart Panel in the top bar.', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
  restart_panel:'Restart Panel', restart_core:'Restart Core', restart_panel_warn:'Restart the web panel now? You will be disconnected for a few seconds.', restart_core_warn:'Restart every tunnel now? Active connections on all tunnels will drop briefly.', restart_core_ok:'all tunnels restarted', restart_core_part:'some tunnels failed to restart - check Diagnose',
  tab_general:'General', tab_appearance:'Appearance', tab_panel:'Web Panel', tab_peer:'Peer Sync', tab_security:'Security', tab_update:'Update',
  panel_path:'Custom URL path (optional)', panel_path_ph:'leave empty for none', panel_path_hint:'Serve the panel under an extra secret path, e.g. https://host:port/thispath — harder to find by scanning. Empty = served at the root, as now.',
@@ -4504,7 +4578,7 @@ en: {
  c_off:'Off', c_not_applicable:'Not needed (TCP)', c_observe_only:'Observe only', c_service_down:'Service down', c_restart_loop:'Restart loop', c_paused:'Paused', c_settling:'Settling', c_no_metrics:'No data yet', c_idle:'Idle', c_peer_unresponsive:'Peer not answering', c_stable:'Stable', c_jitter:'Jitter', c_packet_loss:'Packet loss', c_resource_pressure:'CPU pressure', c_healthy:'Healthy', c_verifying:'Verifying', c_applied:'Applied', c_verified:'Verified', c_rollback:'Rolled back', c_manual:'Manual change', c_reset:'Reset', c_settings:'Settings', c_error:'Error',
  sy_synced:'Synced', sy_failed:'Peer sync failed', sy_conflict:'Sync conflict', sy_unpaired:'Not paired', sy_pending:'Sync pending',
  cert_title:'Custom SSL certificate', cert_hint:'Use a real certificate for your domain (e.g. a Let’s Encrypt cert) instead of the self-signed one, so browsers stop warning about it. Give the paths to the files as already uploaded on this server — they are copied into place and TLS is turned on. The files must be readable by root and not live under /root or /home (the panel service cannot read those two directories).', cert_path:'Certificate file path (.crt / .pem / fullchain)', cert_path_ph:'/etc/letsencrypt/live/yourdomain/fullchain.pem', key_path:'Private key file path', key_path_ph:'/etc/letsencrypt/live/yourdomain/privkey.pem', cert_apply:'Apply certificate & restart panel', cert_both_required:'Both the certificate and the key path are required.',
- diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
+ diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', diag_for:'Tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX', cavg:'AVG', cpeak:'PEAK', traffic:'Traffic', overall_speed:'live', overall_label:'Overall speed', upload:'Upload', download:'Download', sent:'Sent', received:'Received', conn_stats:'Connection Stats', conn_local:'local', conn_sessions:'sessions', open_sockets:'open sockets', client:'client', server:'server',
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
  events:'Recent events', none:'Nothing yet', details:'Details', start:'Start', stop:'Stop', restart:'Restart', del:'Delete', edit:'Edit', test:'Link test', key:'Key & link', link:'Setup link',
@@ -4521,7 +4595,7 @@ en: {
  note_key:'The pre-shared key authenticates every packet (HMAC). Both sides must use the identical key.', srv_test_hint:'Listens for client packets for 10 s. Press Run here, then run the test on the client at the same time.', no_tunnels:'No tunnels yet.', warnings:'Warnings'
 },
 fa: {
- ev_tab:'رویدادها', upd_failed:'آپدیت ناموفق بود - لاگ را ببین', ui_title:'ظاهر و رابط کاربری', ui_hint:'تنظیمات ظاهری فقط برای همین مرورگر (به‌صورت محلی ذخیره می‌شود). تغییرات فوراً اعمال می‌شود.', ui_theme:'تم', ui_pal:'پالت رنگ', ui_blur:'بلور منو و هدر', ui_cblur:'بلور باکس‌ها (کارت‌ها)', ui_glass:'شفافیت شیشه', ui_bg:'شدت رنگ بک‌گراند', ui_radius:'گردی گوشه‌ها', ui_speed:'سرعت حرکت بک‌گراند', ui_anim:'بک‌گراند متحرک', ui_grid:'نمایش شبکه', ui_compact:'کارت‌های فشرده', ui_reset:'بازگشت به پیش‌فرض', th_dark:'تیره', th_light:'روشن', th_auto:'خودکار (سیستم)', pal_default:'آبی', pal_pink:'صورتی / بنفش', pal_ocean:'اقیانوسی', pal_emerald:'زمردی', pal_sunset:'غروب', pal_mono:'تک‌رنگ', sp_slow:'آهسته', sp_norm:'معمولی', sp_fast:'سریع', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', via_tunnel:'از طریق تانل', via_proxy:'از طریق پروکسی', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', panel_ver:'نسخهٔ پنل', core_commit:'کامیت هسته', upd_built:'ساخته‌شده', ver_stale:'build-info نسخهٔ %s را نشان می‌دهد - احتمالاً پروسهٔ پنل بعد از آخرین آپدیت ری‌استارت نشده؛ از نوار بالا «ری‌استارت پنل» را بزن.', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
+ ev_tab:'رویدادها', upd_failed:'آپدیت ناموفق بود - لاگ را ببین', ui_title:'ظاهر و رابط کاربری', ui_hint:'تنظیمات ظاهری فقط برای همین مرورگر (به‌صورت محلی ذخیره می‌شود). تغییرات فوراً اعمال می‌شود.', ui_theme:'تم', ui_pal:'پالت رنگ', ui_blur:'بلور منو و هدر', ui_cblur:'بلور باکس‌ها (کارت‌ها)', ui_glass:'شفافیت شیشه', ui_bg:'شدت رنگ بک‌گراند', ui_radius:'گردی گوشه‌ها', ui_speed:'سرعت حرکت بک‌گراند', ui_anim:'بک‌گراند متحرک', ui_grid:'نمایش شبکه', ui_compact:'کارت‌های فشرده', ui_reset:'بازگشت به پیش‌فرض', th_dark:'تیره', th_light:'روشن', th_auto:'خودکار (سیستم)', pal_default:'آبی', pal_pink:'صورتی / بنفش', pal_ocean:'اقیانوسی', pal_emerald:'زمردی', pal_sunset:'غروب', pal_mono:'تک‌رنگ', sp_slow:'آهسته', sp_norm:'معمولی', sp_fast:'سریع', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', link_host_only:'هاست طرف مقابل بالاست، تانل برقرار نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', via_tunnel:'از طریق تانل', via_proxy:'از طریق پروکسی', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', panel_ver:'نسخهٔ پنل', core_commit:'کامیت هسته', upd_built:'ساخته‌شده', ver_stale:'build-info نسخهٔ %s را نشان می‌دهد - احتمالاً پروسهٔ پنل بعد از آخرین آپدیت ری‌استارت نشده؛ از نوار بالا «ری‌استارت پنل» را بزن.', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
  restart_panel:'ری‌استارت پنل', restart_core:'ری‌استارت Core', restart_panel_warn:'وب‌پنل همین حالا ری‌استارت شود؟ چند ثانیه قطع می‌شوی.', restart_core_warn:'همهٔ تونل‌ها همین حالا ری‌استارت شوند؟ اتصال‌های فعال روی همهٔ تونل‌ها لحظه‌ای قطع می‌شود.', restart_core_ok:'همهٔ تونل‌ها ری‌استارت شدند', restart_core_part:'ری‌استارت بعضی تونل‌ها ناموفق بود - Diagnose را ببین',
  tab_general:'عمومی', tab_appearance:'ظاهر', tab_panel:'وب‌پنل', tab_peer:'سینک طرف مقابل', tab_security:'امنیت', tab_update:'آپدیت',
  panel_path:'مسیر سفارشی لینک (اختیاری)', panel_path_ph:'برای نداشتن مسیر خالی بگذار', panel_path_hint:'پنل را زیر یک مسیر مخفیِ اضافه سرو کن، مثلاً https://host:port/thispath — پیداکردنش با اسکن سخت‌تر می‌شود. خالی = مثل الان روی ریشه.',
@@ -4532,7 +4606,7 @@ fa: {
  c_off:'خاموش', c_not_applicable:'لازم نیست (TCP)', c_observe_only:'فقط مشاهده', c_service_down:'سرویس خاموش', c_restart_loop:'حلقهٔ ری‌استارت', c_paused:'متوقف', c_settling:'در حال پایدار شدن', c_no_metrics:'هنوز داده‌ای نیست', c_idle:'بی‌کار', c_peer_unresponsive:'طرف مقابل جواب نمی‌دهد', c_stable:'پایدار', c_jitter:'جیتر', c_packet_loss:'از دست رفتن پکت', c_resource_pressure:'فشار CPU', c_healthy:'سالم', c_verifying:'در حال تأیید', c_applied:'اعمال شد', c_verified:'تأیید شد', c_rollback:'برگشت داده شد', c_manual:'تغییر دستی', c_reset:'ریست', c_settings:'تنظیمات', c_error:'خطا',
  sy_synced:'سینک شد', sy_failed:'سینک ناموفق', sy_conflict:'تعارض سینک', sy_unpaired:'جفت نشده', sy_pending:'در انتظار سینک',
  cert_title:'سرتیفیکیت SSL اختصاصی', cert_hint:'به‌جای سرتیفیکیت خودامضا، یک سرتیفیکیت واقعی برای دامنه‌ات (مثلاً سرتیفیکیت Let’s Encrypt) استفاده کن تا مرورگرها دیگه هشدار ندن. مسیر فایل‌هایی که از قبل روی همین سرور آپلود کردی رو بده — کپی می‌شن و TLS روشن می‌شه. فایل‌ها باید توسط root قابل خوندن باشن و زیر /root یا /home نباشن (سرویس پنل اجازهٔ خوندن اون دو مسیر رو نداره).', cert_path:'مسیر فایل سرتیفیکیت (.crt / .pem / fullchain)', cert_path_ph:'/etc/letsencrypt/live/yourdomain/fullchain.pem', key_path:'مسیر فایل کلید خصوصی', key_path_ph:'/etc/letsencrypt/live/yourdomain/privkey.pem', cert_apply:'اعمال سرتیفیکیت و ری‌استارت پنل', cert_both_required:'هم مسیر سرتیفیکیت و هم مسیر کلید لازمه.',
- diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
+ diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', diag_for:'تانل:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار سیستم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال', cavg:'میانگین', cpeak:'اوج', traffic:'ترافیک', overall_speed:'لحظه‌ای', overall_label:'سرعت کلی', upload:'آپلود', download:'دانلود', sent:'ارسال‌شده', received:'دریافت‌شده', conn_stats:'وضعیت اتصال', conn_local:'محلی', conn_sessions:'نشست‌ها', open_sockets:'سوکت باز', client:'کلاینت', server:'سرور',
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
  events:'رویدادهای اخیر', none:'هنوز چیزی نیست', details:'جزئیات', start:'شروع', stop:'توقف', restart:'ری‌استارت', del:'حذف', edit:'ویرایش', test:'تست لینک', key:'کلید و لینک', link:'لینک راه‌اندازی',
@@ -4655,9 +4729,28 @@ function showView(){
   if(S.view==='health') return viewHealth(m);
   if(S.view==='diagnose') return viewDiagnose(m);
   if(S.view==='settings') return viewSettings(m);
-  const tick=async()=>{ if(S.modal) return; try{S.ov=await api('GET','/api/overview')}catch(e){return} refreshPings(); if(S.view==='tunnels') refreshAgent(); const fe=document.activeElement; if(fe&&m.contains(fe)&&/^(SELECT|INPUT|TEXTAREA)$/.test(fe.tagName)&&fe.type!=='checkbox') return; const sy=window.scrollY; (S.view==='tunnels'?viewTunnels:S.view==='events'?viewEvents:viewOverview)(m); window.scrollTo(0,sy)};
+  // One refresh loop per view: callers (actions, edits, tabs) re-enter here, so
+  // clear the previous interval first or every call would add another one.
+  stopTimers();
+  const tick=async()=>{
+    if(S.modal||S.ticking) return;
+    S.ticking=1;
+    try{
+      try{S.ov=await api('GET','/api/overview')}catch(e){return}
+      refreshPings(); if(S.view==='tunnels') refreshAgent();
+      const fe=document.activeElement;
+      if(fe&&m.contains(fe)&&/^(SELECT|INPUT|TEXTAREA)$/.test(fe.tagName)&&fe.type!=='checkbox') return;
+      // Never swap the DOM under a pressed mouse/finger: the click would land on
+      // a replaced button and never fire.
+      if(S.press&&Date.now()-S.press<4000) return;
+      const sy=window.scrollY; (S.view==='tunnels'?viewTunnels:S.view==='events'?viewEvents:viewOverview)(m); window.scrollTo(0,sy);
+    }finally{S.ticking=0}
+  };
   tick();S.timer=setInterval(tick,3000);
 }
+document.addEventListener('pointerdown',()=>{S.press=Date.now()},true);
+document.addEventListener('pointerup',()=>{setTimeout(()=>{S.press=0},250)},true);
+document.addEventListener('pointercancel',()=>{S.press=0},true);
 
 /* ---------- overview ---------- */
 let CHART_UID=0;
@@ -4764,13 +4857,20 @@ function refreshPings(){
 }
 function linkBox(x){
   const pg=PING[x.name],now=S.ov.now,hs=x.last_established;
+  const q=x.arq||{};
   const chip=(c,txt)=>h('span',{class:'pill sm '+c,text:txt});
   if(!pg) return h('div',{class:'linkbox'},chip('warn',t('link_check')));
-  const reach=pg.ping_ms!=null||pg.tcp_ms!=null||(hs&&now-hs<600);
-  const parts=[chip(reach?'ok':'bad',reach?t('link_ok'):t('link_down')),
-    chip(pg.ping_ms!=null?'ok':'warn',pg.ping_ms!=null?'ping '+pg.ping_ms+' ms':'ping —')];
+  // The tunnel is genuinely LIVE only when authenticated packets are flowing:
+  // a fresh handshake (last_established, refreshed on both ends from the core's
+  // rx_pkts) or the core reporting an active session. Pinging the peer HOST
+  // proves the host is up, NOT that the tunnel works, so it no longer counts
+  // as "link OK" on its own - that was the false "active" on an unconnected peer.
+  const live=(hs&&now-hs<60)||(q.established||0)>0||(q.rx_pkts||0)>0;
+  const hostUp=pg.ping_ms!=null||pg.tcp_ms!=null;
+  const parts=[chip(live?'ok':(hostUp?'warn':'bad'), live?t('link_ok'):(hostUp?t('link_host_only'):t('link_down')))];
+  parts.push(chip(pg.ping_ms!=null?'ok':'warn',pg.ping_ms!=null?'ping '+pg.ping_ms+' ms':'ping —'));
   if(pg.tcp_ms!=null) parts.push(chip('','tcp '+pg.tcp_ms+' ms'));
-  parts.push(chip(hs?'ok':'warn',hs?t('hs')+' '+fmtD(now-hs)+' '+t('ago'):t('no_hs')));
+  parts.push(chip(hs&&now-hs<60?'ok':'warn',hs?t('hs')+' '+fmtD(now-hs)+' '+t('ago'):t('no_hs')));
   if(pg.peer_panel){const pp=pg.peer_panel;const via=pp.via?(pp.via==='direct'?'':' · '+(pp.via.indexOf('tunnel')===0?t('via_tunnel'):t('via_proxy'))):'';parts.push(chip(pp.ok?'dim':'bad',t('peer_panel')+(pp.ok?' '+pp.ms+' ms'+via:' ✕')));}
   return h('div',{class:'linkbox'},parts);
 }
@@ -4872,9 +4972,10 @@ function tc(x,full){
       x.listening===false&&x.active==='active'&&h('div',{class:'pill bad sm',text:t('not_listening')}),
       h('div',{class:'row'},h('button',{class:'btn sm',onclick:()=>{S.view='tunnels';renderShell()},text:t('tunnels')})));
   }
+  const busy=(S.pending||{})[x.name];
   const acts=[
-    h('button',{class:'btn sm',onclick:()=>act(x.name,x.active==='active'?'restart':'start'),text:x.active==='active'?t('restart'):t('start')}),
-    x.active==='active'&&h('button',{class:'btn sm',onclick:()=>act(x.name,'stop'),text:t('stop')}),
+    h('button',{class:'btn sm',disabled:!!busy,onclick:()=>act(x.name,x.active==='active'?'restart':'start'),text:busy&&busy!=='stop'?t('working'):(x.active==='active'?t('restart'):t('start'))}),
+    x.active==='active'&&h('button',{class:'btn sm',disabled:!!busy,onclick:()=>act(x.name,'stop'),text:busy==='stop'?t('working'):t('stop')}),
     h('button',{class:'btn sm',onclick:()=>{S.logs.name=x.name;S.view='logs';renderShell()},text:t('logs')}),
     h('button',{class:'btn sm',onclick:()=>formModal('edit',x),text:t('edit')}),
     h('button',{class:'btn sm',onclick:()=>linkModal(x),text:t('link')}),
@@ -4892,14 +4993,23 @@ function tc(x,full){
     h('div',{class:'subgrid'},trafficBox(x),connBox(x),agentBox(x)),
     h('div',{class:'row acts'},acts));
 }
-async function act(name,a){try{await api('POST',`/api/tunnels/${name}/${a}`);toast('OK');S.ov=await api('GET','/api/overview');showView()}catch(e){if(!e.handled)toast(e.message,1)}}
+async function act(name,a){
+  S.pending=S.pending||{};
+  if(S.pending[name]) return;
+  S.pending[name]=a;showView();
+  try{
+    const r=await api('POST',`/api/tunnels/${name}/${a}`);
+    toast(t('act_'+a+'_ok').replace('%s',name)+(r.active?' ('+t(r.active)+')':''));
+  }catch(e){if(!e.handled)toast(e.message,1)}
+  finally{delete S.pending[name];S.ov=await api('GET','/api/overview').catch(()=>S.ov);showView()}
+}
 async function del(x){if(!confirm(t('confirm_del').replace('%s',x.name)))return;try{await api('DELETE','/api/tunnels/'+x.name);toast('OK');showView()}catch(e){if(!e.handled)toast(e.message,1)}}
 
 /* ---------- tunnels ---------- */
 function viewTunnels(m){
   const o=S.ov;
   m.replaceChildren(
-    h('div',{class:'toolbar'},h('button',{class:'btn pri',onclick:()=>formModal('create'),text:'+ '+t('create')}),h('button',{class:'btn',onclick:importModal,text:t('import')})),
+    h('div',{class:'toolbar'},h('button',{class:'btn pri',onclick:async()=>{try{const m=await api('GET','/api/meta');if(m&&m.defaults)S.meta.defaults=m.defaults}catch(e){}formModal('create')},text:'+ '+t('create')}),h('button',{class:'btn',onclick:importModal,text:t('import')})),
     h('div',{class:'grid wide'},o.tunnels.length?o.tunnels.map(x=>tc(x,true)):h('div',{class:'card',text:t('no_tunnels')})));
 }
 function fieldDefs(role){
@@ -5071,10 +5181,12 @@ function viewDiagnose(m){
   const sev={ok:'\u2713',warn:'!',fail:'\u2715',info:'i'};
   const link=h('input',{class:'mono',placeholder:'shadowspoof://\u2026',autocapitalize:'off',autocomplete:'off',spellcheck:'false'});
   const out=h('div',{class:'card'});
+  const tnames=(S.ov&&S.ov.tunnels||[]).map(x=>x.name); if(!tnames.length) tnames.push('main');
+  const tsel=h('select',{},tnames.map(n=>h('option',{value:n,text:n})));
   const run=async()=>{
     out.replaceChildren(h('div',{class:'lbl',text:t('running')}));
     try{
-      const r=await api('POST','/api/diagnose',{name:'main',link:(link.value||'').trim()});
+      const r=await api('POST','/api/diagnose',{name:tsel.value||'main',link:(link.value||'').trim()});
       const s=r.summary||{};
       const head=h('div',{class:'dhead'},
         h('span',{class:'pill '+(s.fail?'bad':s.warn?'warn':'ok'),text:(s.fail||0)+' \u2715'}),
@@ -5090,8 +5202,6 @@ function viewDiagnose(m){
     }catch(e){if(!e.handled)out.replaceChildren(h('div',{class:'err',text:e.message}))}
   };
   const mout=h('div',{class:'hint'});
-  const tnames=(S.ov&&S.ov.tunnels||[]).map(x=>x.name); if(!tnames.length) tnames.push('main');
-  const tsel=h('select',{},tnames.map(n=>h('option',{value:n,text:n})));
   const mtu=async()=>{
     mout.textContent=t('running');
     const nm=tsel.value||'main';
@@ -5106,12 +5216,10 @@ function viewDiagnose(m){
     h('div',{class:'card'},
       h('b',{text:t('diag_title')}),
       h('div',{class:'hint',text:t('diag_hint')}),
+      h('div',{class:'row'},h('span',{class:'lbl',text:t('diag_for')}),tsel),
       h('label',{class:'f'},h('span',{text:t('peer_link')}),link),
       h('div',{class:'row'},
-        h('button',{class:'btn pri',onclick:run,text:t('run_diag')})),
-      h('div',{class:'lbl',text:'\u00a0'}),
-      h('div',{class:'row'},
-        h('span',{class:'lbl',text:t('mtu_for')}),tsel,
+        h('button',{class:'btn pri',onclick:run,text:t('run_diag')}),
         h('button',{class:'btn',onclick:mtu,text:t('mtu_test')})),
       mout),
     h('div',{class:'lbl',text:'\u00a0'}),

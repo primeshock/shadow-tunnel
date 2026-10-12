@@ -284,6 +284,10 @@ impl TunnelManager {
         src_ip: Ipv4Addr,
         pkt:    ShadowPacket,
     ) -> Result<Option<(ShadowPacket, Ipv4Addr)>> {
+        // RawReceiver only delivers packets that authenticated with our key,
+        // so every packet here is proof the peer is alive.
+        self.0.stats.add_rx_pkt();
+
         // SYN packets are not handled internally – hand them back to the caller.
         if pkt.kind == PacketKind::Syn {
             return Ok(Some((pkt, src_ip)));
@@ -358,6 +362,7 @@ impl TunnelManager {
                 drop(t);
 
                 for payload in deliverable {
+                    self.0.stats.add_bytes_rx(payload.len() as u64);
                     if app_tx.send(payload).await.is_err() {
                         self.close_tunnel(tid).await;
                         return Ok(None);
@@ -501,10 +506,11 @@ impl TunnelManager {
                 let tunnels: Vec<Arc<Mutex<Tunnel>>> =
                     this.0.tunnels.iter().map(|e| e.value().clone()).collect();
                 let n = tunnels.len();
-                let (mut srtt, mut var, mut k) = (0.0, 0.0, 0u32);
+                let (mut srtt, mut var, mut k, mut est) = (0.0, 0.0, 0u32, 0usize);
                 for tunnel in tunnels {
                     let t = tunnel.lock().await;
                     if t.state == TunnelState::Established {
+                        est += 1;
                         if let Some((s, v)) = t.cc.rtt.sample() {
                             srtt += s;
                             var += v;
@@ -524,10 +530,11 @@ impl TunnelManager {
                 };
                 log::info!(
                     "stats: tunnels={} sent={} retx_timeout={} retx_nack={} gave_up={} \
-                     rtt_samples={} srtt_ms={} rttvar_ms={} rto_min_ms={} max_retries={} interval_s={}",
+                     rtt_samples={} srtt_ms={} rttvar_ms={} rto_min_ms={} max_retries={} interval_s={} \
+                     established={} rx_pkts={} bytes_tx={} bytes_rx={} transport=spoof",
                     n, snap.data_sent, snap.retx_timeout, snap.retx_nack, snap.gave_up,
                     snap.rtt_samples, srtt_s, var_s, tn.rto_min_ms, tn.max_retries,
-                    every.as_secs()
+                    every.as_secs(), est, snap.rx_pkts, snap.bytes_tx, snap.bytes_rx
                 );
             }
         });
@@ -634,6 +641,7 @@ impl TunnelManager {
             t.make_data_packet(payload)
         };
         self.0.stats.add_sent(1);
+        self.0.stats.add_bytes_tx(pkt.payload.len() as u64);
         self.tx_data(pkt).await
     }
 
