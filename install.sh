@@ -53,7 +53,7 @@ readonly MIN_RUSTC=1.85.0
 # live inside THIS install.sh, independent of the Rust core commit). Bump it
 # on every change to install.sh so operators can see whether an update applied.
 # Must match PANEL_VERSION in the embedded Python panel below.
-readonly SHADOW_RELEASE=2.1.0
+readonly SHADOW_RELEASE=2.2.0
 
 REPO_URL=${SHADOW_REPO_URL:-https://github.com/primeshock/shadow-tunnel.git}
 REPO_REF=${SHADOW_REF:-$DEFAULT_REF}
@@ -1317,7 +1317,7 @@ SVC_USER = "shadow-spoof"
 # installer above; both are bumped together on every install.sh change. This is
 # the version actually executing now (not what build-info last recorded), so the
 # Update tab can show whether a restart picked up new panel code.
-PANEL_VERSION = "2.1.0"
+PANEL_VERSION = "2.2.0"
 
 CONF_MAIN = os.path.join(ETC, "config.toml")
 TUNNELS = os.path.join(ETC, "tunnels")
@@ -2594,7 +2594,7 @@ def api_tunnel_ping(req, name):
         t0 = time.time()
         try:
             _peer_request("GET", "/api/sync/overview", timeout=3)
-            out["peer_panel"] = {"ok": True, "ms": round((time.time() - t0) * 1000)}
+            out["peer_panel"] = {"ok": True, "ms": round((time.time() - t0) * 1000), "via": peer_last_route()}
         except ApiError as e:
             out["peer_panel"] = {"ok": False, "error": e.msg}
     return out
@@ -3297,13 +3297,71 @@ def _http_over_socket(sock, method, host, path, headers, body, timeout):
     return status, body_buf
 
 
+_PEER_LAST_ROUTE = {"route": "", "at": 0}
+
+
+def peer_last_route():
+    r = _PEER_LAST_ROUTE
+    return r["route"] if r["at"] and time.time() - r["at"] < 120 else ""
+
+
+def _peer_once(proxy, host, port, https, method, req_path, headers, data, timeout):
+    """One connection attempt. `proxy` is (host, port) for a SOCKS5 hop, or None
+    for a direct connection. Returns (status, raw_body); raises on a
+    connection/transport failure so the caller can fall back to another route."""
+    if proxy:
+        sock = _socks5_connect(proxy[0], proxy[1], host, port, timeout)
+    else:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    try:
+        if https:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE  # panels usually use self-signed certs
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+        return _http_over_socket(sock, method, "%s:%s" % (host, port), req_path, headers, data, timeout)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _peer_routes(p):
+    """Ordered list of (label, proxy_or_None) to reach the peer panel, by the
+    operator's requested priority:
+      1. direct panel-to-panel;
+      2. through a local tunnel's own SOCKS5 proxy (only this node's client
+         tunnels that are actually listening) - works when the two panels
+         can't reach each other directly but a tunnel still carries traffic;
+      3. through the SOCKS5 proxy configured in Settings (last resort).
+    Only panel-sync HTTP uses this; tunnel data never touches it."""
+    routes = [("direct", None)]
+    for inst in instances():
+        if inst.role != "client":
+            continue
+        try:
+            sp = int(inst.cfg().get("socks5_port") or 0)
+        except (TypeError, ValueError):
+            sp = 0
+        if sp and port_listening(sp, True):
+            routes.append(("tunnel:%s" % inst.name, ("127.0.0.1", sp)))
+    proxy = str(p.get("sync_proxy") or "").strip()
+    if proxy:
+        ph, _, pp = proxy.partition(":")
+        try:
+            routes.append(("proxy", (ph, int(pp or "1080"))))
+        except ValueError:
+            pass
+    return routes
+
+
 def _peer_request(method, path, body=None, timeout=8):
     p = load_panel()
     base = str(p.get("peer_url") or "").rstrip("/")
     tok = str(p.get("sync_token") or "")
     if not base or not tok:
         raise ApiError(400, "peer not paired - set the peer URL and a shared token in Settings")
-    proxy = str(p.get("sync_proxy") or "").strip()
     data = json.dumps(body).encode() if body is not None else None
     u = urllib.parse.urlparse(base)
     https = u.scheme == "https"
@@ -3311,35 +3369,27 @@ def _peer_request(method, path, body=None, timeout=8):
     port = u.port or (443 if https else 80)
     req_path = (u.path.rstrip("/") + path) if u.path else path
     headers = {"X-Sync-Token": tok, "Content-Type": "application/json"}
-    try:
-        if proxy:
-            ph, _, pp = proxy.partition(":")
-            sock = _socks5_connect(ph, int(pp or "1080"), host, port, timeout)
-        else:
-            sock = socket.create_connection((host, port), timeout=timeout)
+    # Per-attempt timeout, bounded so the whole fallback chain can't stack up
+    # into a long stall when several routes are down.
+    per = max(2, min(int(timeout), 6))
+    errors = []
+    for label, proxy in _peer_routes(p):
         try:
-            if https:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE  # panels usually use self-signed certs
-                sock = ctx.wrap_socket(sock, server_hostname=host)
-            status, raw = _http_over_socket(sock, method, "%s:%s" % (host, port), req_path, headers, data, timeout)
-        finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
-    except ApiError:
-        raise
-    except Exception as e:
-        raise ApiError(502, "peer unreachable%s: %s" % (" via proxy" if proxy else "", e))
-    try:
-        parsed = json.loads(raw.decode()) if raw else {}
-    except ValueError:
-        parsed = {}
-    if status >= 400:
-        raise ApiError(502, "peer: %s" % (parsed.get("error") or ("HTTP %d" % status)))
-    return parsed
+            status, raw = _peer_once(proxy, host, port, https, method, req_path, headers, data, per)
+        except Exception as e:
+            errors.append("%s: %s" % (label, e))
+            continue
+        # A real HTTP response (even an error status) means the peer was
+        # reached - do not fall through to another route.
+        _PEER_LAST_ROUTE.update(route=label, at=time.time())
+        try:
+            parsed = json.loads(raw.decode()) if raw else {}
+        except ValueError:
+            parsed = {}
+        if status >= 400:
+            raise ApiError(502, "peer: %s" % (parsed.get("error") or ("HTTP %d" % status)))
+        return parsed
+    raise ApiError(502, "peer unreachable (tried %d route(s): %s)" % (len(errors), "; ".join(errors) or "none"))
 
 
 def api_sync_overview(req):
@@ -4108,7 +4158,7 @@ html[data-theme=light] .verbox{background:rgba(20,30,70,.035)}
 .stabs button:hover{color:var(--tx)}
 .stabs button.on{color:var(--acc2);border-bottom-color:var(--acc2)}
 .btn{background:#1b2338;border:1px solid var(--line);padding:8px 13px;border-radius:11px;cursor:pointer;font-weight:600}
-.btn:hover{border-color:#3c4c78}.btn:active{transform:translateY(1px)}.btn.pri{background:var(--grad);color:#fff;border-color:transparent;box-shadow:0 2px 10px -6px var(--acc)}.btn.pri:hover{filter:brightness(1.07)}.btn.dng{color:var(--bad)}.btn.dng:hover{border-color:var(--bad)}.btn.sm{padding:5px 10px;font-size:12px}
+.btn:hover{border-color:#3c4c78}.btn:active{transform:translateY(1px)}.btn.pri{background:var(--grad);color:#fff;border-color:transparent;box-shadow:0 2px 10px -6px var(--acc)}.btn.pri:hover{filter:brightness(1.07)}.btn.dng{color:var(--bad)}.btn.dng:hover{border-color:var(--bad)}.btn.sm{padding:5px 10px;font-size:12px}.btn.xs{padding:1px 7px;font-size:11px;margin-inline-start:8px;vertical-align:middle}
 .btn:disabled{opacity:.5;cursor:default}
 input,select{background:#0c1119;border:1px solid var(--line);border-radius:11px;padding:9px 11px;width:100%}
 input:focus,select:focus{outline:none;box-shadow:var(--ring);border-color:var(--acc)}
@@ -4432,11 +4482,11 @@ try{matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{i
 /* ---------- i18n ---------- */
 const TR = {
 en: {
- ev_tab:'Events', upd_failed:'update failed - see the log below', ui_title:'Appearance & UI', ui_hint:'Visual preferences for this browser only (saved locally). Changes apply instantly.', ui_theme:'Theme', ui_pal:'Colour palette', ui_blur:'Menu & header blur', ui_cblur:'Box (card) blur', ui_glass:'Glass opacity', ui_bg:'Background colour strength', ui_radius:'Corner roundness', ui_speed:'Background motion speed', ui_anim:'Animate background', ui_grid:'Show grid', ui_compact:'Compact cards', ui_reset:'Reset to defaults', th_dark:'Dark', th_light:'Light', th_auto:'Auto (system)', pal_default:'Blue', pal_pink:'Pink / Purple', pal_ocean:'Ocean', pal_emerald:'Emerald', pal_sunset:'Sunset', pal_mono:'Mono', sp_slow:'Slow', sp_norm:'Normal', sp_fast:'Fast', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', panel_ver:'Panel version', core_commit:'Core commit', upd_built:'Built', ver_stale:'Installed build-info shows %s - the panel process may not have restarted after the last update; click Restart Panel in the top bar.', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
+ ev_tab:'Events', upd_failed:'update failed - see the log below', ui_title:'Appearance & UI', ui_hint:'Visual preferences for this browser only (saved locally). Changes apply instantly.', ui_theme:'Theme', ui_pal:'Colour palette', ui_blur:'Menu & header blur', ui_cblur:'Box (card) blur', ui_glass:'Glass opacity', ui_bg:'Background colour strength', ui_radius:'Corner roundness', ui_speed:'Background motion speed', ui_anim:'Animate background', ui_grid:'Show grid', ui_compact:'Compact cards', ui_reset:'Reset to defaults', th_dark:'Dark', th_light:'Light', th_auto:'Auto (system)', pal_default:'Blue', pal_pink:'Pink / Purple', pal_ocean:'Ocean', pal_emerald:'Emerald', pal_sunset:'Sunset', pal_mono:'Mono', sp_slow:'Slow', sp_norm:'Normal', sp_fast:'Fast', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', via_tunnel:'via tunnel', via_proxy:'via proxy', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', panel_ver:'Panel version', core_commit:'Core commit', upd_built:'Built', ver_stale:'Installed build-info shows %s - the panel process may not have restarted after the last update; click Restart Panel in the top bar.', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
  restart_panel:'Restart Panel', restart_core:'Restart Core', restart_panel_warn:'Restart the web panel now? You will be disconnected for a few seconds.', restart_core_warn:'Restart every tunnel now? Active connections on all tunnels will drop briefly.', restart_core_ok:'all tunnels restarted', restart_core_part:'some tunnels failed to restart - check Diagnose',
  tab_general:'General', tab_appearance:'Appearance', tab_panel:'Web Panel', tab_peer:'Peer Sync', tab_security:'Security', tab_update:'Update',
  panel_path:'Custom URL path (optional)', panel_path_ph:'leave empty for none', panel_path_hint:'Serve the panel under an extra secret path, e.g. https://host:port/thispath — harder to find by scanning. Empty = served at the root, as now.',
- sync_proxy:'Sync via SOCKS5 proxy (optional)', sync_proxy_ph:'e.g. 127.0.0.1:1080', sync_proxy_hint:'Routes only this panel’s sync calls to the peer panel through a SOCKS5 proxy (e.g. this node’s own tunnel SOCKS5 port) — never the tunnel data itself. Useful when the two panels can’t reach each other directly but a tunnel can. Empty = connect directly.',
+ sync_proxy:'Sync via SOCKS5 proxy (optional)', sync_proxy_ph:'e.g. 127.0.0.1:1080', sync_proxy_hint:'Last-resort SOCKS5 proxy for panel-to-panel sync only (never tunnel data). The panels try to reach each other in this order: 1) directly, 2) through a local tunnel’s own SOCKS5 proxy, 3) through this proxy. Set it for a path that still works when both the direct link and the tunnels are down. Empty = only direct and tunnel are tried.',
  clear_events:'Clear', clear_events_confirm:'Clear all recent events? This cannot be undone.',
  ag_title:'Smart agent', ag_on:'On', ag_dir:'Tunes here', ag_up:'upload (client → server)', ag_down:'download (server → client)', ag_retx:'Retransmit rate', ag_retx_hist:'Retransmit rate (last 30 min)', ag_jitter:'Jitter', ag_gaveup:'Gave up', ag_now:'Now', ag_base:'baseline', ag_strategy:'Strategy', ag_log:'Decisions', ag_reset:'Reset to baseline', ag_reset_confirm:'Restore the settings the agent started from and pause it for 30 minutes?', ag_need_core:'The installed core cannot apply settings live yet - run Update so the agent can act (until then it only observes).', ag_saved_synced:'Saved and synced with the peer panel', ag_saved_local:'Saved (no peer panel paired)', ag_saved_unsynced:'Saved here, but the peer panel did not confirm',
  st_balanced:'Balanced', st_reliability:'Reliability first', st_low_latency:'Low latency',
@@ -4450,7 +4500,7 @@ en: {
  create:'Create tunnel', import:'Import link', cancel:'Cancel', save:'Save', close:'Close', confirm_del:'Delete tunnel "%s"? Its service and config are removed.',
  f_name:'Tunnel name', f_transport:'Transport', h_transport:'spoof = UDP+ICMP forged source · tcp = standard non-spoofed TCP', f_real:'Real IP', f_spoof:'Spoofed IP', f_pool:'Spoofed IP pool (comma-separated, optional)', f_peerpool:'Peer spoofed IP pool (optional)',
  h_peerpool:'Every pool address the peer may use, otherwise its packets are dropped (allowed_peers).', f_iface:'Interface', f_port:'Data port', f_icmp:'ICMP ID (0-65535 or 0x..)',
- f_socks:'SOCKS5 port', f_tun:'Tunnel count', f_mtu:'MTU', f_cwnd:'Initial CWND', f_retries:'Max retries', h_retries:'retransmits before giving up (1-100)', f_rto:'Min RTO (ms)', h_rto:'retransmit-timeout floor; raise on lossy/high-latency links (10-60000)', f_key:'Pre-shared key (blank = generate)', gen:'Generate', server:'server', client:'client',
+ f_socks:'SOCKS5 port', socks_edit:'Change SOCKS5 port', socks_hint:'The local SOCKS5 proxy port apps connect to (127.0.0.1). Saving restarts this tunnel, so active connections drop for a moment.', f_tun:'Tunnel count', f_mtu:'MTU', f_cwnd:'Initial CWND', f_retries:'Max retries', h_retries:'retransmits before giving up (1-100)', f_rto:'Min RTO (ms)', h_rto:'retransmit-timeout floor; raise on lossy/high-latency links (10-60000)', f_key:'Pre-shared key (blank = generate)', gen:'Generate', server:'server', client:'client',
  auto:'auto-detect', saved:'Saved', created:'Tunnel created', link_hint:'Give this link to the other side: Tunnels > Import link.', fp:'Fingerprint', show:'Show',
  paste_link:'Paste a shadowspoof:// link', apply:'Apply', pw_confirm:'Enter the panel password to reveal the key', reveal:'Reveal',
  level:'Level', search:'Search', lines:'Lines', auto_refresh:'Auto-refresh', run:'Run check', host:'Host', port:'Port', running:'Running...', avg:'Average', handshake_ok:'handshakes OK',
@@ -4460,11 +4510,11 @@ en: {
  note_key:'The pre-shared key authenticates every packet (HMAC). Both sides must use the identical key.', srv_test_hint:'Listens for client packets for 10 s. Press Run here, then run the test on the client at the same time.', no_tunnels:'No tunnels yet.', warnings:'Warnings'
 },
 fa: {
- ev_tab:'رویدادها', upd_failed:'آپدیت ناموفق بود - لاگ را ببین', ui_title:'ظاهر و رابط کاربری', ui_hint:'تنظیمات ظاهری فقط برای همین مرورگر (به‌صورت محلی ذخیره می‌شود). تغییرات فوراً اعمال می‌شود.', ui_theme:'تم', ui_pal:'پالت رنگ', ui_blur:'بلور منو و هدر', ui_cblur:'بلور باکس‌ها (کارت‌ها)', ui_glass:'شفافیت شیشه', ui_bg:'شدت رنگ بک‌گراند', ui_radius:'گردی گوشه‌ها', ui_speed:'سرعت حرکت بک‌گراند', ui_anim:'بک‌گراند متحرک', ui_grid:'نمایش شبکه', ui_compact:'کارت‌های فشرده', ui_reset:'بازگشت به پیش‌فرض', th_dark:'تیره', th_light:'روشن', th_auto:'خودکار (سیستم)', pal_default:'آبی', pal_pink:'صورتی / بنفش', pal_ocean:'اقیانوسی', pal_emerald:'زمردی', pal_sunset:'غروب', pal_mono:'تک‌رنگ', sp_slow:'آهسته', sp_norm:'معمولی', sp_fast:'سریع', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', panel_ver:'نسخهٔ پنل', core_commit:'کامیت هسته', upd_built:'ساخته‌شده', ver_stale:'build-info نسخهٔ %s را نشان می‌دهد - احتمالاً پروسهٔ پنل بعد از آخرین آپدیت ری‌استارت نشده؛ از نوار بالا «ری‌استارت پنل» را بزن.', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
+ ev_tab:'رویدادها', upd_failed:'آپدیت ناموفق بود - لاگ را ببین', ui_title:'ظاهر و رابط کاربری', ui_hint:'تنظیمات ظاهری فقط برای همین مرورگر (به‌صورت محلی ذخیره می‌شود). تغییرات فوراً اعمال می‌شود.', ui_theme:'تم', ui_pal:'پالت رنگ', ui_blur:'بلور منو و هدر', ui_cblur:'بلور باکس‌ها (کارت‌ها)', ui_glass:'شفافیت شیشه', ui_bg:'شدت رنگ بک‌گراند', ui_radius:'گردی گوشه‌ها', ui_speed:'سرعت حرکت بک‌گراند', ui_anim:'بک‌گراند متحرک', ui_grid:'نمایش شبکه', ui_compact:'کارت‌های فشرده', ui_reset:'بازگشت به پیش‌فرض', th_dark:'تیره', th_light:'روشن', th_auto:'خودکار (سیستم)', pal_default:'آبی', pal_pink:'صورتی / بنفش', pal_ocean:'اقیانوسی', pal_emerald:'زمردی', pal_sunset:'غروب', pal_mono:'تک‌رنگ', sp_slow:'آهسته', sp_norm:'معمولی', sp_fast:'سریع', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', via_tunnel:'از طریق تانل', via_proxy:'از طریق پروکسی', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', panel_ver:'نسخهٔ پنل', core_commit:'کامیت هسته', upd_built:'ساخته‌شده', ver_stale:'build-info نسخهٔ %s را نشان می‌دهد - احتمالاً پروسهٔ پنل بعد از آخرین آپدیت ری‌استارت نشده؛ از نوار بالا «ری‌استارت پنل» را بزن.', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
  restart_panel:'ری‌استارت پنل', restart_core:'ری‌استارت Core', restart_panel_warn:'وب‌پنل همین حالا ری‌استارت شود؟ چند ثانیه قطع می‌شوی.', restart_core_warn:'همهٔ تونل‌ها همین حالا ری‌استارت شوند؟ اتصال‌های فعال روی همهٔ تونل‌ها لحظه‌ای قطع می‌شود.', restart_core_ok:'همهٔ تونل‌ها ری‌استارت شدند', restart_core_part:'ری‌استارت بعضی تونل‌ها ناموفق بود - Diagnose را ببین',
  tab_general:'عمومی', tab_appearance:'ظاهر', tab_panel:'وب‌پنل', tab_peer:'سینک طرف مقابل', tab_security:'امنیت', tab_update:'آپدیت',
  panel_path:'مسیر سفارشی لینک (اختیاری)', panel_path_ph:'برای نداشتن مسیر خالی بگذار', panel_path_hint:'پنل را زیر یک مسیر مخفیِ اضافه سرو کن، مثلاً https://host:port/thispath — پیداکردنش با اسکن سخت‌تر می‌شود. خالی = مثل الان روی ریشه.',
- sync_proxy:'سینک از طریق پراکسی SOCKS5 (اختیاری)', sync_proxy_ph:'مثلاً 127.0.0.1:1080', sync_proxy_hint:'فقط درخواست‌های سینکِ این پنل با پنلِ طرف مقابل را از یک پراکسی SOCKS5 (مثلاً پورت SOCKS5 تونل همین نود) عبور می‌دهد — نه ترافیک خود تونل را. وقتی دو پنل مستقیم به هم نمی‌رسند ولی یک تونل می‌رسد مفید است. خالی = اتصال مستقیم.',
+ sync_proxy:'سینک از طریق پراکسی SOCKS5 (اختیاری)', sync_proxy_ph:'مثلاً 127.0.0.1:1080', sync_proxy_hint:'پراکسی SOCKS5 به‌عنوان آخرین راه، فقط برای سینک پنل‌ها (نه ترافیک تونل). پنل‌ها به این ترتیب همدیگر را امتحان می‌کنند: ۱) مستقیم، ۲) از طریق پروکسی SOCKS5 خودِ یک تونل محلی، ۳) از طریق این پراکسی. برای زمانی بگذار که هم اتصال مستقیم و هم تونل‌ها قطع‌اند ولی این مسیر کار می‌کند. خالی = فقط مستقیم و تونل امتحان می‌شوند.',
  clear_events:'پاک کردن', clear_events_confirm:'همهٔ رویدادهای اخیر پاک شوند؟ این کار قابل بازگشت نیست.',
  ag_title:'ایجنت هوشمند', ag_on:'روشن', ag_dir:'اینجا تنظیم می‌کند', ag_up:'آپلود (کلاینت ← سرور)', ag_down:'دانلود (سرور ← کلاینت)', ag_retx:'نرخ ارسال مجدد', ag_retx_hist:'نرخ ارسال مجدد (۳۰ دقیقهٔ اخیر)', ag_jitter:'جیتر', ag_gaveup:'رهاشده', ag_now:'الان', ag_base:'پایه', ag_strategy:'استراتژی', ag_log:'تصمیم‌ها', ag_reset:'برگشت به تنظیمات پایه', ag_reset_confirm:'تنظیماتی که ایجنت از آن شروع کرده برگردد و ایجنت ۳۰ دقیقه متوقف شود؟', ag_need_core:'Core نصب‌شده هنوز نمی‌تواند تنظیمات را زنده اعمال کند - آپدیت بزن تا ایجنت بتواند عمل کند (تا آن موقع فقط مشاهده می‌کند).', ag_saved_synced:'ذخیره شد و با پنل طرف مقابل سینک شد', ag_saved_local:'ذخیره شد (پنل طرف مقابل جفت نشده)', ag_saved_unsynced:'اینجا ذخیره شد، ولی پنل طرف مقابل تأیید نکرد',
  st_balanced:'متعادل', st_reliability:'اولویت پایداری', st_low_latency:'تأخیر کم',
@@ -4478,7 +4528,7 @@ fa: {
  create:'ساخت تونل', import:'وارد کردن لینک', cancel:'انصراف', save:'ذخیره', close:'بستن', confirm_del:'تونل «%s» حذف شود؟ سرویس و کانفیگ آن پاک می‌شود.',
  f_name:'نام تونل', f_transport:'نوع انتقال', h_transport:'spoof = UDP+ICMP با منبع جعلی · tcp = TCP استاندارد بدون جعل', f_real:'IP واقعی', f_spoof:'IP جعلی', f_pool:'استخر IP جعلی (با کاما، اختیاری)', f_peerpool:'استخر IP جعلی طرف مقابل (اختیاری)',
  h_peerpool:'همهٔ IPهایی که طرف مقابل ممکن است استفاده کند؛ وگرنه بسته‌هایش دور ریخته می‌شود (allowed_peers).', f_iface:'اینترفیس', f_port:'پورت دیتا', f_icmp:'ICMP ID ‏(۰ تا ۶۵۵۳۵ یا 0x..)',
- f_socks:'پورت SOCKS5', f_tun:'تعداد تونل', f_mtu:'MTU', f_cwnd:'CWND اولیه', f_retries:'حداکثر تلاش مجدد', h_retries:'تعداد ارسال مجدد پیش از انصراف (۱ تا ۱۰۰)', f_rto:'حداقل RTO (ms)', h_rto:'کف زمان‌بندی ارسال مجدد؛ در شبکه‌های پرافت/پرتأخیر بالاتر بگذارید (۱۰ تا ۶۰۰۰۰)', f_key:'کلید pre-shared (خالی = ساخت خودکار)', gen:'ساخت', server:'سرور', client:'کلاینت',
+ f_socks:'پورت SOCKS5', socks_edit:'تغییر پورت SOCKS5', socks_hint:'پورت پروکسی SOCKS5 محلی که اپ‌ها بهش وصل می‌شوند (127.0.0.1). با ذخیره، این تونل ری‌استارت می‌شود و اتصال‌های فعال لحظه‌ای قطع می‌شوند.', f_tun:'تعداد تونل', f_mtu:'MTU', f_cwnd:'CWND اولیه', f_retries:'حداکثر تلاش مجدد', h_retries:'تعداد ارسال مجدد پیش از انصراف (۱ تا ۱۰۰)', f_rto:'حداقل RTO (ms)', h_rto:'کف زمان‌بندی ارسال مجدد؛ در شبکه‌های پرافت/پرتأخیر بالاتر بگذارید (۱۰ تا ۶۰۰۰۰)', f_key:'کلید pre-shared (خالی = ساخت خودکار)', gen:'ساخت', server:'سرور', client:'کلاینت',
  auto:'تشخیص خودکار', saved:'ذخیره شد', created:'تونل ساخته شد', link_hint:'این لینک را به طرف مقابل بدهید: تونل‌ها > وارد کردن لینک.', fp:'اثر انگشت', show:'نمایش',
  paste_link:'لینک shadowspoof:// را بچسبانید', apply:'اعمال', pw_confirm:'برای نمایش کلید، رمز پنل را وارد کنید', reveal:'نمایش',
  level:'سطح', search:'جستجو', lines:'تعداد خط', auto_refresh:'به‌روزرسانی خودکار', run:'اجرای بررسی', host:'هاست', port:'پورت', running:'در حال اجرا...', avg:'میانگین', handshake_ok:'هندشیک موفق',
@@ -4702,7 +4752,7 @@ function linkBox(x){
     chip(pg.ping_ms!=null?'ok':'warn',pg.ping_ms!=null?'ping '+pg.ping_ms+' ms':'ping —')];
   if(pg.tcp_ms!=null) parts.push(chip('','tcp '+pg.tcp_ms+' ms'));
   parts.push(chip(hs?'ok':'warn',hs?t('hs')+' '+fmtD(now-hs)+' '+t('ago'):t('no_hs')));
-  if(pg.peer_panel) parts.push(chip(pg.peer_panel.ok?'dim':'bad',t('peer_panel')+(pg.peer_panel.ok?' '+pg.peer_panel.ms+' ms':' ✕')));
+  if(pg.peer_panel){const pp=pg.peer_panel;const via=pp.via?(pp.via==='direct'?'':' · '+(pp.via.indexOf('tunnel')===0?t('via_tunnel'):t('via_proxy'))):'';parts.push(chip(pp.ok?'dim':'bad',t('peer_panel')+(pp.ok?' '+pp.ms+' ms'+via:' ✕')));}
   return h('div',{class:'linkbox'},parts);
 }
 function trafficBox(x){
@@ -4817,7 +4867,7 @@ function tc(x,full){
     h('div',{class:'kv'},
       kv(t('uptime'),fmtD(x.uptime)),kv(t('restarts'),x.restarts),
       kv(t('cpu'),(x.cpu??0)+'%'),kv(t('rss'),fmtB(x.rss)),
-      x.role==='client'?kv('SOCKS5','127.0.0.1:'+(c.socks5_port||'?')):kv(t('f_tun'),c.tunnel_count),
+      x.role==='client'?h('div',{},h('span',{class:'lbl',text:'SOCKS5'}),h('span',{class:'v'},'127.0.0.1:'+(c.socks5_port||'?'),h('button',{class:'btn xs',title:t('socks_edit'),onclick:()=>socksModal(x),text:'✎'}))):kv(t('f_tun'),c.tunnel_count),
       kv('log 5m',`${l5.info} / ${l5.warn} / ${l5.error}`)),
     x.listening===false&&x.active==='active'&&h('div',{class:'pill bad sm',text:t('not_listening')}),
     h('div',{class:'subgrid'},trafficBox(x),connBox(x),agentBox(x)),
@@ -4857,6 +4907,24 @@ function fieldDefs(role){
    {sec:'sec_sec'},
    {k:'pre_shared_key',l:t('f_key'),key:true}
   ].filter(Boolean);
+}
+function socksModal(x){
+  const cur=(x.config||{}).socks5_port||1080;
+  const inp=h('input',{value:cur,inputmode:'numeric'});
+  const err=h('div',{class:'err'});
+  const save=h('button',{class:'btn pri',text:t('apply'),onclick:async()=>{
+    err.textContent='';
+    const v=+inp.value;
+    if(!(Number.isInteger(v)&&v>=1024&&v<=65535)){err.textContent=t('f_socks')+': 1024-65535';return}
+    if(v===cur){closeModal();return}
+    try{await api('PUT','/api/tunnels/'+x.name,{socks5_port:v});toast(t('saved'));closeModal();S.ov=await api('GET','/api/overview').catch(()=>S.ov);showView()}
+    catch(e){if(!e.handled){err.textContent=(e.data&&e.data.errors&&e.data.errors.socks5_port)?e.data.errors.socks5_port:e.message}}
+  }});
+  openModal([h('h3',{text:t('f_socks')+' · '+x.name}),
+    h('div',{class:'hint',text:t('socks_hint')}),
+    h('label',{class:'f'},h('span',{text:t('f_socks')}),inp),err,
+    h('div',{class:'row'},save,h('button',{class:'btn',onclick:closeModal,text:t('cancel')}))]);
+  setTimeout(()=>{inp.focus();inp.select()},50);
 }
 function formModal(mode,x,prefill){
   const role=S.meta.role,defs=fieldDefs(role),d=S.meta.defaults,cfg=(x&&x.config)||{},inputs={},errs={};
