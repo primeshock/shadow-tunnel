@@ -53,7 +53,7 @@ readonly MIN_RUSTC=1.85.0
 # live inside THIS install.sh, independent of the Rust core commit). Bump it
 # on every change to install.sh so operators can see whether an update applied.
 # Must match PANEL_VERSION in the embedded Python panel below.
-readonly SHADOW_RELEASE=2.2.0
+readonly SHADOW_RELEASE=2.3.0
 
 REPO_URL=${SHADOW_REPO_URL:-https://github.com/primeshock/shadow-tunnel.git}
 REPO_REF=${SHADOW_REF:-$DEFAULT_REF}
@@ -1062,7 +1062,7 @@ ROLE=$(<"$ROLE_FILE")
 if [[ -t 0 ]]; then TTY=/dev/stdin; elif { : </dev/tty; } 2>/dev/null; then TTY=/dev/tty
 else echo "shadowtun needs a terminal; run 'shadowtun <command>' for scripting" >&2; exit 1; fi
 
-c_r=$'\e[38;5;203m'; c_c=$'\e[36m'; c_b=$'\e[1m'; c_g=$'\e[32m'; c_y=$'\e[33m'; c_d=$'\e[2m'; c_0=$'\e[0m'
+c_r=$'\e[38;5;39m'; c_c=$'\e[38;5;45m'; c_b=$'\e[1m'; c_g=$'\e[32m'; c_y=$'\e[33m'; c_d=$'\e[2m'; c_0=$'\e[0m'
 [[ -t 1 ]] || { c_r=; c_c=; c_b=; c_g=; c_y=; c_d=; c_0=; }
 
 ask()   { local p=$1 v=""; printf '%s' "$p" >&2; read -r v <"$TTY" || true; printf '%s' "$v"; }
@@ -1075,19 +1075,32 @@ cfgval(){ "$CTL" -t "$1" config 2>/dev/null | sed -n "s/^[[:space:]]*$2[[:space:
 panel_url() { command -v python3 >/dev/null && python3 /usr/local/lib/shadow-spoof/shadow-panel.py admin info 2>/dev/null || true; }
 
 banner() {
-  printf '%s' "$c_r"
-  cat <<'ART'
-   ███████ ██   ██  █████  ██████   ██████  ██     ██
-   ██      ██   ██ ██   ██ ██   ██ ██    ██ ██     ██
-   ███████ ███████ ███████ ██   ██ ██    ██ ██  █  ██
-        ██ ██   ██ ██   ██ ██   ██ ██    ██ ██ ███ ██
-   ███████ ██   ██ ██   ██ ██████   ██████   ███ ███
+  local hi=$'\e[38;5;39m' lo=$'\e[38;5;24m' z=$'\e[0m'
+  local cols; cols=$(tput cols 2>/dev/null || echo "${COLUMNS:-80}")
+  if (( cols >= 84 )); then
+    # ANSI-Shadow "SHADOW TUN": solid blocks in bright blue, the ╔╗╚╝║═ shadow
+    # edges in a dim blue for depth. The art is pre-tagged with ASCII tokens
+    # (@H@ block, @S@ shadow, @Z@ reset) so colouring is a locale-safe ASCII
+    # substitution - a UTF-8 character class in sed would split the multibyte
+    # blocks in a C locale. No colour (not a TTY): the tokens are just removed.
+    local sub
+    if [[ -t 1 ]]; then sub="s/@H@/${hi}/g; s/@S@/${lo}/g; s/@Z@/${z}/g"
+    else sub="s/@[HSZ]@//g"; fi
+    sed "$sub" <<'ART'
+ @H@███████@Z@@S@╗@Z@@H@██@Z@@S@╗@Z@  @H@██@Z@@S@╗@Z@ @H@█████@Z@@S@╗@Z@ @H@██████@Z@@S@╗@Z@  @H@██████@Z@@S@╗@Z@ @H@██@Z@@S@╗@Z@    @H@██@Z@@S@╗@Z@   @H@████████@Z@@S@╗@Z@@H@██@Z@@S@╗@Z@   @H@██@Z@@S@╗@Z@@H@███@Z@@S@╗@Z@   @H@██@Z@@S@╗@Z@
+ @H@██@Z@@S@╔════╝@Z@@H@██@Z@@S@║@Z@  @H@██@Z@@S@║@Z@@H@██@Z@@S@╔══@Z@@H@██@Z@@S@╗@Z@@H@██@Z@@S@╔══@Z@@H@██@Z@@S@╗@Z@@H@██@Z@@S@╔═══@Z@@H@██@Z@@S@╗@Z@@H@██@Z@@S@║@Z@    @H@██@Z@@S@║@Z@   @S@╚══@Z@@H@██@Z@@S@╔══╝@Z@@H@██@Z@@S@║@Z@   @H@██@Z@@S@║@Z@@H@████@Z@@S@╗@Z@  @H@██@Z@@S@║@Z@
+ @H@███████@Z@@S@╗@Z@@H@███████@Z@@S@║@Z@@H@███████@Z@@S@║@Z@@H@██@Z@@S@║@Z@  @H@██@Z@@S@║@Z@@H@██@Z@@S@║@Z@   @H@██@Z@@S@║@Z@@H@██@Z@@S@║@Z@ @H@█@Z@@S@╗@Z@ @H@██@Z@@S@║@Z@      @H@██@Z@@S@║@Z@   @H@██@Z@@S@║@Z@   @H@██@Z@@S@║@Z@@H@██@Z@@S@╔@Z@@H@██@Z@@S@╗@Z@ @H@██@Z@@S@║@Z@
+ @S@╚════@Z@@H@██@Z@@S@║@Z@@H@██@Z@@S@╔══@Z@@H@██@Z@@S@║@Z@@H@██@Z@@S@╔══@Z@@H@██@Z@@S@║@Z@@H@██@Z@@S@║@Z@  @H@██@Z@@S@║@Z@@H@██@Z@@S@║@Z@   @H@██@Z@@S@║@Z@@H@██@Z@@S@║@Z@@H@███@Z@@S@╗@Z@@H@██@Z@@S@║@Z@      @H@██@Z@@S@║@Z@   @H@██@Z@@S@║@Z@   @H@██@Z@@S@║@Z@@H@██@Z@@S@║╚@Z@@H@██@Z@@S@╗@Z@@H@██@Z@@S@║@Z@
+ @H@███████@Z@@S@║@Z@@H@██@Z@@S@║@Z@  @H@██@Z@@S@║@Z@@H@██@Z@@S@║@Z@  @H@██@Z@@S@║@Z@@H@██████@Z@@S@╔╝╚@Z@@H@██████@Z@@S@╔╝╚@Z@@H@███@Z@@S@╔@Z@@H@███@Z@@S@╔╝@Z@      @H@██@Z@@S@║@Z@   @S@╚@Z@@H@██████@Z@@S@╔╝@Z@@H@██@Z@@S@║@Z@ @S@╚@Z@@H@████@Z@@S@║@Z@
+ @S@╚══════╝╚═╝@Z@  @S@╚═╝╚═╝@Z@  @S@╚═╝╚═════╝@Z@  @S@╚═════╝@Z@  @S@╚══╝╚══╝@Z@       @S@╚═╝@Z@    @S@╚═════╝@Z@ @S@╚═╝@Z@  @S@╚═══╝@Z@
 ART
-  printf '%s' "$c_0"
+  else
+    printf '%s  SHADOW TUN%s\n' "$c_b$c_r" "$c_0"
+  fi
   printf '   %sShadow Spoof%s  %sv%s%s   role: %s%s%s\n' "$c_b" "$c_0" "$c_r" "$VERSION" "$c_0" "$c_g" "$ROLE" "$c_0"
   printf '   %sGitHub: https://github.com/primeshock/shadow-tunnel%s\n' "$c_d" "$c_0"
   local url; url=$(panel_url); [[ -n $url ]] && printf '   %spanel : %s%s\n' "$c_d" "$url" "$c_0"
-  printf '  %s%s%s\n\n' "$c_d" "──────────────────────────────────────────────────────" "$c_0"
+  printf '  %s%s%s\n\n' "$c_d" "────────────────────────────────────────────────────────────────────────────────" "$c_0"
 }
 
 state_tag() { local s=$1 col=$c_y; [[ $s == active ]] && col=$c_g; [[ $s == failed ]] && col=$c_r; printf '%s%s%s' "$col" "${s:-unknown}" "$c_0"; }
@@ -1317,7 +1330,7 @@ SVC_USER = "shadow-spoof"
 # installer above; both are bumped together on every install.sh change. This is
 # the version actually executing now (not what build-info last recorded), so the
 # Update tab can show whether a restart picked up new panel code.
-PANEL_VERSION = "2.2.0"
+PANEL_VERSION = "2.3.0"
 
 CONF_MAIN = os.path.join(ETC, "config.toml")
 TUNNELS = os.path.join(ETC, "tunnels")
