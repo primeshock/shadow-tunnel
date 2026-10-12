@@ -53,7 +53,7 @@ readonly MIN_RUSTC=1.85.0
 # live inside THIS install.sh, independent of the Rust core commit). Bump it
 # on every change to install.sh so operators can see whether an update applied.
 # Must match PANEL_VERSION in the embedded Python panel below.
-readonly SHADOW_RELEASE=2.4.0
+readonly SHADOW_RELEASE=2.4.1
 
 REPO_URL=${SHADOW_REPO_URL:-https://github.com/primeshock/shadow-tunnel.git}
 REPO_REF=${SHADOW_REF:-$DEFAULT_REF}
@@ -1330,7 +1330,7 @@ SVC_USER = "shadow-spoof"
 # installer above; both are bumped together on every install.sh change. This is
 # the version actually executing now (not what build-info last recorded), so the
 # Update tab can show whether a restart picked up new panel code.
-PANEL_VERSION = "2.4.0"
+PANEL_VERSION = "2.4.1"
 
 CONF_MAIN = os.path.join(ETC, "config.toml")
 TUNNELS = os.path.join(ETC, "tunnels")
@@ -4392,8 +4392,8 @@ html[data-theme=light] #bg::after{background-image:linear-gradient(rgba(30,40,80
 .mchart{width:100%;height:64px;display:block;overflow:visible}
 .mchart .mline{stroke:var(--acc2);stroke-width:2;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke}
 .mchart .marea{opacity:1}
-.mchart .gs1{stop-color:var(--acc);stop-opacity:.33}
-.mchart .gs2{stop-color:var(--acc);stop-opacity:0}
+.mchart .gs1{stop-color:var(--acc2);stop-opacity:.33}
+.mchart .gs2{stop-color:var(--acc2);stop-opacity:0}
 .mchart .mbase{stroke:var(--acc2);stroke-opacity:.22;stroke-width:1;stroke-dasharray:1 5;vector-effect:non-scaling-stroke}
 .mchart.up .mline{stroke:var(--acc2)}.mchart.up .gs1{stop-color:var(--acc2);stop-opacity:.3}.mchart.up .gs2{stop-color:var(--acc2);stop-opacity:0}
 .mchart.dn .mline{stroke:#2f6fe0}.mchart.dn .gs1{stop-color:#2f6fe0;stop-opacity:.3}.mchart.dn .gs2{stop-color:#2f6fe0;stop-opacity:0}
