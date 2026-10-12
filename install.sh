@@ -1756,6 +1756,8 @@ def ctl(*args):
 # ------------------------------------------------------------------ log parse --
 LEVEL_RE = re.compile(r"\b(ERROR|WARN|INFO|DEBUG|TRACE)\b")
 KINDS = [
+    ("stats", re.compile(r"\bstats: tunnels=")),
+    ("reload", re.compile(r"\breload: ")),
     ("connect", re.compile(r"SOCKS5 CONNECT")),
     ("forward", re.compile(r"forwarding to")),
     ("established", re.compile(r"tunnel \d+ established")),
@@ -1839,7 +1841,38 @@ def read_logs(inst, n=300, level=None, query=None, since=None):
 
 # -------------------------------------------------------------------- monitor --
 def _hist():
-    return {k: deque(maxlen=HIST_LEN) for k in ("cpu", "rss", "conns", "rx", "tx", "warn", "err")}
+    return {k: deque(maxlen=HIST_LEN) for k in ("cpu", "rss", "conns", "rx", "tx", "warn", "err", "retx", "srtt")}
+
+
+STATS_RE = re.compile(r"\bstats: (tunnels=.*)$")
+
+
+def parse_stats_line(msg):
+    """Parse a core `stats:` line into numbers; None if it isn't one.  The
+    retransmission rate is a loss proxy: real loss and spurious retransmits
+    (RTO tighter than the path's jitter) both raise it."""
+    m = STATS_RE.search(msg or "")
+    if not m:
+        return None
+    d = {}
+    for part in m.group(1).split():
+        k, _, v = part.partition("=")
+        if not k or not v:
+            continue
+        if v == "-":
+            d[k] = None
+            continue
+        try:
+            d[k] = float(v) if "." in v else int(v)
+        except ValueError:
+            return None
+    for k in ("tunnels", "sent", "retx_timeout", "retx_nack", "gave_up", "rto_min_ms", "max_retries"):
+        if not isinstance(d.get(k), (int, float)):
+            return None
+    retx = d["retx_timeout"] + d["retx_nack"]
+    d["retx"] = retx
+    d["retx_pct"] = round(100.0 * retx / d["sent"], 2) if d["sent"] else None
+    return d
 
 
 class Monitor(object):
@@ -1860,6 +1893,8 @@ class Monitor(object):
         self.events = deque(maxlen=200)
         self.throttle_win = {}
         self.clear_seen = 0.0
+        self.arq = {}
+        self.arq_samples = defaultdict(lambda: deque(maxlen=90))
         self.clk = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
         os.makedirs(os.path.dirname(EVENTS_FILE), exist_ok=True)
         for line in read_text(EVENTS_FILE).splitlines()[-200:]:
@@ -2029,6 +2064,13 @@ class Monitor(object):
             if not name:
                 continue
             lvl, kind = classify(msg, prio)
+            if kind == "stats":
+                d = parse_stats_line(msg)
+                if d:
+                    d["ts"] = ts or now
+                    self.arq[name] = d
+                    self.arq_samples[name].append(d)
+                continue
             self.window.append((ts or now, name, lvl, kind))
             if kind:
                 self.totals[name][kind] += 1
@@ -2043,6 +2085,14 @@ class Monitor(object):
             self.window.popleft()
 
     # -- one cycle
+    def _fresh_arq(self, name):
+        """Latest core stats for `name`, or None once they are >75s old (the
+        core reports every 10s while busy and at least once a minute)."""
+        d = self.arq.get(name)
+        if not d or time.time() - d.get("ts", 0) > 75:
+            return None
+        return d
+
     def check_clear_request(self):
         """The panel (a separate process) asks for Recent Events to be wiped
         by touching EVENTS_CLEAR_FILE; pick that up here since only this
@@ -2099,8 +2149,12 @@ class Monitor(object):
             out[inst.name] = dict(st, unit=inst.unit, role=inst.role, cpu=cpu, rss=rss, conns=n_conn, iface=iface,
                                   rx=rx, tx=tx, net_totals={"rx": rx_tot, "tx": tx_tot}, listening=listening,
                                   log5={"info": w["INFO"], "warn": w["WARN"], "error": w["ERROR"]},
-                                  totals=dict(self.totals[inst.name]), last_established=self.last_est.get(inst.name, 0))
+                                  totals=dict(self.totals[inst.name]), last_established=self.last_est.get(inst.name, 0),
+                                  arq=self._fresh_arq(inst.name))
             h = self.hist.setdefault(inst.name, _hist())
+            fa = out[inst.name]["arq"] or {}
+            for k, v in (("retx", fa.get("retx_pct")), ("srtt", fa.get("srtt_ms"))):
+                h[k].append(v)
             for k, v in (("cpu", cpu), ("rss", rss), ("conns", n_conn), ("rx", rx), ("tx", tx),
                          ("warn", w["WARN"]), ("err", w["ERROR"])):
                 h[k].append(v)
@@ -2127,6 +2181,7 @@ class Monitor(object):
         state = {
             "ts": time.time(), "role": role, "step": SAMPLE_SEC, "system": sysm, "instances": out,
             "history": {n: {k: list(v) for k, v in h.items()} for n, h in self.hist.items()},
+            "arq_samples": {n: list(v) for n, v in self.arq_samples.items()},
             "sys_history": {k: list(v) for k, v in self.sys_hist.items()},
             "events": list(self.events)[-60:],
         }
@@ -2272,7 +2327,7 @@ def describe(inst, props, st):
     m = (st or {}).get("instances", {}).get(inst.name, {})
     d = {"name": inst.name, "unit": inst.unit, "role": inst.role, "config": redact(cfg)}
     d.update(s)
-    for k in ("cpu", "rss", "conns", "iface", "rx", "tx", "net_totals", "listening", "log5", "totals", "last_established"):
+    for k in ("cpu", "rss", "conns", "iface", "rx", "tx", "net_totals", "listening", "log5", "totals", "last_established", "arq"):
         if k in m:
             d[k] = m[k]
     d["history"] = ((st or {}).get("history", {}) or {}).get(inst.name, {})
@@ -3417,6 +3472,541 @@ def _maybe_push_peer(inst):
         return {"ok": False, "error": str(e)}
 
 
+# ---------------------------------------------------------------- smart agent --
+# The smart agent watches each spoof-transport tunnel's measured retransmission
+# rate and RTT (the core's `stats:` lines) and nudges the two knobs the core can
+# apply live - rto_min_ms and max_retries - within bounds, with hysteresis,
+# cooldowns and a rate limit.  Each endpoint tunes only its own sending
+# direction (client: upload, server: download); the on/off switch and strategy
+# are kept in sync with the paired panel.  It never restarts services: crash
+# recovery stays with systemd and the watchdog timer, and the agent backs off
+# (and reverts to the operator's baseline) when it sees a restart loop.
+#
+# It is not FEC: the wire protocol has no redundancy/parity packets, so the
+# agent cannot recover lost data ahead of retransmission.  Adding parity would
+# also multiply the forged-source packets the spoof transport sends, which this
+# project deliberately does not do.
+AGENT_JSON = os.path.join(ETC, "agent.json")
+AGENT_STATE = os.path.join(RUN, "agent-state.json")
+AGENT_LOCK = threading.Lock()
+AGENT_EVAL_SEC = 30
+AGENT_WINDOW_SEC = 300
+AGENT_COOLDOWN_SEC = 600
+AGENT_MAX_CHANGES_PER_HOUR = 4
+AGENT_SETTLE_SEC = 120
+AGENT_VERIFY_SEC = 75
+AGENT_MIN_SENT = 200
+AGENT_BAD_STREAK = 3          # consecutive bad evaluations before acting (~90 s)
+AGENT_GOOD_STREAK = 20        # consecutive good evaluations before relaxing (~10 min)
+AGENT_LOOP_RESTARTS = 3       # automatic restarts within 15 min = restart loop
+AGENT_LOOP_PAUSE_SEC = 3600
+AGENT_RESET_PAUSE_SEC = 1800
+AGENT_STRATEGIES = {
+    # enter/exit: retransmission-rate thresholds (%) with a gap for hysteresis.
+    "balanced":    {"enter": 5.0, "exit": 1.5, "rto_cap": 2000, "retries_cap": 20, "jitter": 0.5},
+    "reliability": {"enter": 3.0, "exit": 1.0, "rto_cap": 3000, "retries_cap": 30, "jitter": 0.35},
+    "low_latency": {"enter": 8.0, "exit": 2.0, "rto_cap": 1000, "retries_cap": 12, "jitter": 0.7},
+}
+AGENT_DEFAULTS = {"enabled": False, "strategy": "balanced", "cpu_limit": 85, "rev": 0, "updated": 0, "by": ""}
+_AGENT_CAPS = {}
+
+
+def agent_settings_all():
+    try:
+        d = json.loads(read_text(AGENT_JSON) or "{}")
+    except ValueError:
+        d = {}
+    t = d.get("tunnels") if isinstance(d, dict) else None
+    return t if isinstance(t, dict) else {}
+
+
+def agent_settings(name):
+    s = dict(AGENT_DEFAULTS)
+    s.update(agent_settings_all().get(name) or {})
+    return s
+
+
+def _agent_save_settings(name, s):
+    allt = agent_settings_all()
+    allt[name] = {k: s.get(k, AGENT_DEFAULTS[k]) for k in AGENT_DEFAULTS}
+    atomic_write(AGENT_JSON, json.dumps({"tunnels": allt}, indent=2) + "\n", 0o600)
+
+
+def agent_check_settings(d):
+    """Validate the user-facing fields; returns the clean subset."""
+    out = {}
+    if "enabled" in d:
+        out["enabled"] = bool(d["enabled"])
+    if "strategy" in d:
+        if d["strategy"] not in AGENT_STRATEGIES:
+            raise ApiError(400, "strategy must be one of: %s" % ", ".join(AGENT_STRATEGIES))
+        out["strategy"] = d["strategy"]
+    if "cpu_limit" in d:
+        n = as_int(d["cpu_limit"], 30, 100)
+        if not n:
+            raise ApiError(400, "cpu_limit must be 30-100")
+        out["cpu_limit"] = n
+    return out
+
+
+def agent_state_all():
+    try:
+        d = json.loads(read_text(AGENT_STATE) or "{}")
+    except ValueError:
+        d = {}
+    return d if isinstance(d, dict) else {}
+
+
+def _agent_save_state(st):
+    try:
+        os.makedirs(RUN, exist_ok=True)
+        atomic_write(AGENT_STATE, json.dumps(st), 0o600)
+    except OSError as e:
+        sys.stderr.write("agent: cannot save state: %s\n" % e)
+
+
+def agent_live_capable(role):
+    """True when the installed core reloads tuning on SIGHUP.  Older binaries
+    have no handler, and SIGHUP would terminate them, so this gates every
+    signal the agent sends."""
+    binp = "/usr/local/bin/shadow-spoof-%s" % role
+    try:
+        mt = os.path.getmtime(binp)
+    except OSError:
+        return False
+    hit = _AGENT_CAPS.get(binp)
+    if hit and hit[0] == mt:
+        return hit[1]
+    rc, out, _ = run([binp, "--capabilities"], timeout=10)
+    ok = rc == 0 and "live-tuning" in (out or "").split()
+    _AGENT_CAPS[binp] = (mt, ok)
+    return ok
+
+
+def _agent_log(mem, now, kind, msg, metrics=None):
+    log = mem.setdefault("log", [])
+    log.append({"ts": now, "kind": kind, "msg": msg, "m": metrics or {}})
+    del log[:-50]
+
+
+def agent_window(samples, now):
+    """Aggregate the core's interval stats over the last AGENT_WINDOW_SEC."""
+    w = [x for x in samples or [] if now - x.get("ts", 0) <= AGENT_WINDOW_SEC]
+    if not w:
+        return None
+    sent = sum(x.get("sent") or 0 for x in w)
+    retx = sum(x.get("retx") or 0 for x in w)
+    srtts = [x["srtt_ms"] for x in w if isinstance(x.get("srtt_ms"), (int, float))]
+    vars_ = [x["rttvar_ms"] for x in w if isinstance(x.get("rttvar_ms"), (int, float))]
+    return {
+        "samples": len(w), "sent": sent, "retx": retx,
+        "gave_up": sum(x.get("gave_up") or 0 for x in w),
+        "rtt_samples": sum(x.get("rtt_samples") or 0 for x in w),
+        "retx_pct": round(100.0 * retx / sent, 2) if sent else None,
+        "srtt_ms": round(srtts[-1], 1) if srtts else None,
+        "rttvar_ms": round(vars_[-1], 1) if vars_ else None,
+        "latest_ts": max(x.get("ts", 0) for x in w),
+        "core_rto_min_ms": w[-1].get("rto_min_ms"), "core_max_retries": w[-1].get("max_retries"),
+    }
+
+
+def agent_decide(tuning, baseline, win, ctx, mem, strategy, now):
+    """Pure decision step.  Returns (condition, explanation, new_tuning|None);
+    updates the streak/cooldown bookkeeping in `mem`.  `tuning` and
+    `baseline` are {"rto_min_ms", "max_retries"} dicts."""
+    p = AGENT_STRATEGIES.get(strategy) or AGENT_STRATEGIES["balanced"]
+    if ctx.get("transport") == "tcp":
+        return "not_applicable", "the tcp transport retransmits in the kernel; there is nothing for the agent to tune", None
+    if not ctx.get("live_ok"):
+        return "observe_only", "the installed core cannot apply settings live - update it (shadowtun update) to let the agent act", None
+    if ctx.get("active") != "active":
+        mem["streak_bad"] = mem["streak_good"] = 0
+        return "service_down", "the tunnel service is not running; recovery is left to systemd and the watchdog", None
+
+    hist = [r for r in mem.get("restart_hist", []) if now - r[0] <= 900]
+    restarts = ctx.get("restarts", 0)
+    if not hist or hist[-1][1] != restarts:
+        hist.append([now, restarts])
+    mem["restart_hist"] = hist[-20:]
+    if len(hist) >= 2 and hist[-1][1] - hist[0][1] >= AGENT_LOOP_RESTARTS:
+        mem["paused_until"] = now + AGENT_LOOP_PAUSE_SEC
+        mem["streak_bad"] = mem["streak_good"] = 0
+        mem["restart_hist"] = [[now, restarts]]
+        if tuning != baseline:
+            return "restart_loop", "%d automatic restarts in 15 min - reverting to the baseline settings and pausing for 1 h" % (hist[-1][1] - hist[0][1]), dict(baseline)
+        return "restart_loop", "%d automatic restarts in 15 min - pausing for 1 h (settings are already at the baseline)" % (hist[-1][1] - hist[0][1]), None
+    if now < mem.get("paused_until", 0):
+        return "paused", "paused until %s" % time.strftime("%H:%M", time.localtime(mem["paused_until"])), None
+    if ctx.get("uptime", 0) < AGENT_SETTLE_SEC:
+        return "settling", "the service (re)started %ds ago; waiting for it to settle" % ctx.get("uptime", 0), None
+    if not win or now - win["latest_ts"] > 75:
+        return "no_metrics", "no recent statistics from the core yet", None
+    if win["sent"] < AGENT_MIN_SENT:
+        mem["streak_bad"] = mem["streak_good"] = 0
+        return "idle", "too little traffic in the last 5 min to judge (%d packets)" % win["sent"], None
+
+    rp, gave = win["retx_pct"] or 0.0, win["gave_up"]
+    srtt, var = win["srtt_ms"], win["rttvar_ms"]
+    if rp >= 50 and win["rtt_samples"] == 0:
+        mem["streak_bad"] = mem["streak_good"] = 0
+        return "peer_unresponsive", "%.0f%% of packets are retransmitted and no RTT replies arrive - the peer or the path is not answering; tuning cannot fix that (run the Tunnel doctor)" % rp, None
+
+    bad, good = rp >= p["enter"] or gave > 0, rp <= p["exit"] and gave == 0
+    if bad:
+        mem["streak_bad"] = mem.get("streak_bad", 0) + 1
+        mem["streak_good"] = 0
+    elif good:
+        mem["streak_good"] = mem.get("streak_good", 0) + 1
+        mem["streak_bad"] = 0
+    else:
+        mem["streak_bad"] = mem["streak_good"] = 0
+        return "stable", "retransmit rate %.1f%% is inside the hysteresis band (%.1f-%.1f%%); holding" % (rp, p["exit"], p["enter"]), None
+
+    pressured = ctx.get("cpu") is not None and ctx["cpu"] >= ctx.get("cpu_limit", 85)
+    changes = [c for c in mem.get("changes", []) if now - c <= 3600]
+    mem["changes"] = changes
+    blocked = None
+    if now < mem.get("cooldown_until", 0):
+        blocked = "cooldown until %s" % time.strftime("%H:%M", time.localtime(mem["cooldown_until"]))
+    elif len(changes) >= AGENT_MAX_CHANGES_PER_HOUR:
+        blocked = "hourly change limit reached"
+
+    if bad:
+        jittery = srtt and var is not None and var / srtt >= p["jitter"]
+        cond = "jitter" if jittery else "packet_loss"
+        detail = "retransmit rate %.1f%%, %d gave up, srtt %s ms, rttvar %s ms" % (rp, gave, srtt, var)
+        if pressured:
+            return "resource_pressure", "%s; CPU is at %s%% (limit %s%%) so the agent will not escalate" % (detail, ctx["cpu"], ctx.get("cpu_limit")), None
+        if mem["streak_bad"] < AGENT_BAD_STREAK:
+            return cond, "%s; confirming (%d/%d)" % (detail, mem["streak_bad"], AGENT_BAD_STREAK), None
+        new = dict(tuning)
+        why = []
+        if gave > 0 and tuning["max_retries"] < p["retries_cap"]:
+            new["max_retries"] = min(p["retries_cap"], tuning["max_retries"] + 4)
+            why.append("%d packets were abandoned -> max_retries %d->%d" % (gave, tuning["max_retries"], new["max_retries"]))
+        if jittery and tuning["rto_min_ms"] < p["rto_cap"]:
+            target = int(max(tuning["rto_min_ms"] * 1.5, srtt + 4 * var))
+            new["rto_min_ms"] = min(p["rto_cap"], target)
+            if new["rto_min_ms"] > tuning["rto_min_ms"]:
+                why.append("RTT variance is high, so retransmits are likely spurious -> rto_min_ms %d->%d" % (tuning["rto_min_ms"], new["rto_min_ms"]))
+            else:
+                new["rto_min_ms"] = tuning["rto_min_ms"]
+        if new == tuning:
+            if cond == "packet_loss":
+                return cond, "%s; this looks like real loss - the agent's knobs cannot add redundancy (no FEC in the protocol); try a lower MTU or check the path" % detail, None
+            return cond, "%s; already at the strategy's limits" % detail, None
+        if blocked:
+            return cond, "%s; would change (%s) but %s" % (detail, "; ".join(why), blocked), None
+        return cond, "; ".join(why), new
+
+    if mem["streak_good"] < AGENT_GOOD_STREAK or tuning == baseline:
+        return "healthy", "retransmit rate %.1f%%, srtt %s ms" % (rp, srtt), None
+    new = {
+        "rto_min_ms": max(baseline["rto_min_ms"], int(tuning["rto_min_ms"] * 0.75)),
+        "max_retries": max(baseline["max_retries"], tuning["max_retries"] - 2),
+    }
+    if abs(new["rto_min_ms"] - baseline["rto_min_ms"]) <= baseline["rto_min_ms"] * 0.1:
+        new["rto_min_ms"] = baseline["rto_min_ms"]
+    if blocked:
+        return "healthy", "healthy for 10 min; would relax toward the baseline but %s" % blocked, None
+    return "healthy", "healthy for 10 min (retransmit rate %.1f%%) -> stepping back toward the baseline" % rp, new
+
+
+def _agent_tuning(cfg):
+    return {"rto_min_ms": int(cfg.get("rto_min_ms", 200)), "max_retries": int(cfg.get("max_retries", 8))}
+
+
+def _agent_write_and_signal(inst, tuning, note):
+    """Write the two live-tunable fields and SIGHUP the running core.  Returns
+    the previous file content (for rollback) or raises ApiError."""
+    cur = inst.cfg()
+    clean, errs = validate(inst.role, dict(tuning), inst.name, cur)
+    if errs:
+        raise ApiError(400, "validation failed: %s" % errs)
+    clean.pop("_warn", None)
+    old = read_text(inst.path)
+    _write_inst(inst, inst.role, clean, "%s %s" % (note, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+    ok_cfg, detail = check_config_file(inst.role, inst.path)
+    if not ok_cfg:
+        atomic_write(inst.path, old, 0o640, SVC_USER)
+        raise ApiError(400, "the core rejected the settings: %s" % detail[:200])
+    pid = unit_status(inst, systemd_show([inst.unit]))["pid"]
+    if pid > 0:
+        try:
+            os.kill(pid, signal.SIGHUP)
+        except OSError as e:
+            atomic_write(inst.path, old, 0o640, SVC_USER)
+            raise ApiError(500, "could not signal the core: %s" % e)
+    return old
+
+
+def agent_tick_one(inst, settings, mem, ov_inst, samples, sysm, now):
+    """One evaluation for one tunnel.  Applies at most one change."""
+    cfg = inst.cfg()
+    tuning = _agent_tuning(cfg)
+    mem.setdefault("baseline", tuning)
+    win = agent_window(samples, now)
+
+    pend = mem.get("pending")
+    if pend:
+        if win and win["latest_ts"] > pend["at"] and win["core_rto_min_ms"] == pend["tuning"]["rto_min_ms"] \
+                and win["core_max_retries"] == pend["tuning"]["max_retries"]:
+            _agent_log(mem, now, "verified", "the core confirmed rto_min_ms=%d max_retries=%d" % (
+                pend["tuning"]["rto_min_ms"], pend["tuning"]["max_retries"]))
+            mem.pop("pending", None)
+        elif now > pend["deadline"]:
+            try:
+                atomic_write(inst.path, pend["old"], 0o640, SVC_USER)
+                pid = unit_status(inst, systemd_show([inst.unit]))["pid"]
+                if pid > 0:
+                    os.kill(pid, signal.SIGHUP)
+                _agent_log(mem, now, "rollback", "the core did not confirm the change within %ds - restored the previous settings" % AGENT_VERIFY_SEC)
+            except OSError as e:
+                _agent_log(mem, now, "error", "rollback failed: %s" % e)
+            mem.pop("pending", None)
+            mem["cooldown_until"] = now + AGENT_COOLDOWN_SEC
+        mem["last_seen"] = _agent_tuning(inst.cfg())
+        mem.update(condition="verifying", explanation="waiting for the core to confirm the last change",
+                   metrics=win, tuning=tuning, at=now)
+        return
+
+    if mem.get("last_seen") and mem["last_seen"] != tuning:
+        mem["baseline"] = tuning
+        mem["streak_bad"] = mem["streak_good"] = 0
+        _agent_log(mem, now, "manual", "settings changed outside the agent - new baseline rto_min_ms=%d max_retries=%d" % (
+            tuning["rto_min_ms"], tuning["max_retries"]))
+    mem["last_seen"] = tuning
+
+    ctx = {"transport": str(cfg.get("transport", "spoof")).lower(), "live_ok": agent_live_capable(inst.role),
+           "active": ov_inst.get("active"), "restarts": ov_inst.get("restarts", 0), "uptime": ov_inst.get("uptime", 0),
+           "cpu": (sysm or {}).get("cpu"), "cpu_limit": settings.get("cpu_limit", 85)}
+    cond, expl, new = agent_decide(tuning, mem["baseline"], win, ctx, mem, settings.get("strategy"), now)
+    if cond != mem.get("condition") or new:
+        _agent_log(mem, now, cond, expl, win)
+    mem.update(condition=cond, explanation=expl, metrics=win, tuning=tuning, at=now)
+    if not new or new == tuning:
+        return
+    try:
+        old = _agent_write_and_signal(inst, new, "tuned by the smart agent")
+    except ApiError as e:
+        _agent_log(mem, now, "error", "could not apply: %s" % e.msg)
+        mem["cooldown_until"] = now + AGENT_COOLDOWN_SEC
+        return
+    mem["pending"] = {"tuning": new, "old": old, "at": now, "deadline": now + AGENT_VERIFY_SEC}
+    mem["last_seen"] = new
+    mem["changes"] = mem.get("changes", []) + [now]
+    mem["cooldown_until"] = now + AGENT_COOLDOWN_SEC
+    mem["streak_bad"] = mem["streak_good"] = 0
+    _agent_log(mem, now, "applied", ", ".join("%s %d->%d" % (k, tuning[k], new[k]) for k in ("rto_min_ms", "max_retries")
+                                              if tuning[k] != new[k]) + " (sent SIGHUP; waiting for the core to confirm)")
+
+
+def agent_reset(name):
+    """Restore the operator's baseline tuning and pause the agent."""
+    inst = _inst_or_404(name)
+    with AGENT_LOCK:
+        st = agent_state_all()
+        mem = st.setdefault(name, {})
+        base = mem.get("baseline") or _agent_tuning(inst.cfg())
+        now = time.time()
+        mem.pop("pending", None)
+        if _agent_tuning(inst.cfg()) != base:
+            if not agent_live_capable(inst.role):
+                raise ApiError(409, "the installed core cannot apply settings live - edit the tunnel instead")
+            old = _agent_write_and_signal(inst, base, "reset to baseline by the operator")
+            mem["pending"] = {"tuning": base, "old": old, "at": now, "deadline": now + AGENT_VERIFY_SEC}
+        mem["last_seen"] = base
+        mem["paused_until"] = now + AGENT_RESET_PAUSE_SEC
+        mem["streak_bad"] = mem["streak_good"] = 0
+        mem.update(tuning=base, condition="paused", at=now,
+                   explanation="reset to the baseline by the operator; paused for 30 min")
+        _agent_log(mem, now, "reset", "operator reset to baseline rto_min_ms=%d max_retries=%d; paused 30 min" % (
+            base["rto_min_ms"], base["max_retries"]))
+        _agent_save_state(st)
+    return {"ok": True, "baseline": base}
+
+
+# -- sync of the on/off switch and strategy with the paired panel
+def _agent_payload(name, s):
+    return {"name": name, "settings": {k: s.get(k, AGENT_DEFAULTS[k]) for k in AGENT_DEFAULTS}}
+
+
+def agent_receive(name, incoming):
+    """Apply settings pushed by the peer.  Newer revision wins; an equal
+    revision with different content is a conflict both sides must see."""
+    inc = dict(AGENT_DEFAULTS)
+    inc.update({k: incoming.get(k) for k in AGENT_DEFAULTS if k in incoming})
+    inc.update(agent_check_settings({k: incoming[k] for k in ("enabled", "strategy", "cpu_limit") if k in incoming}))
+    inc["rev"] = as_int(incoming.get("rev"), 0, 2 ** 31) or 0
+    with AGENT_LOCK:
+        cur = agent_settings(name)
+        same = all(cur.get(k) == inc.get(k) for k in ("enabled", "strategy", "cpu_limit"))
+        if inc["rev"] > cur["rev"] or (inc["rev"] == cur["rev"] and same):
+            _agent_save_settings(name, inc)
+            st = agent_state_all()
+            st.setdefault(name, {})["sync"] = {"state": "synced", "at": time.time(), "peer_rev": inc["rev"]}
+            _agent_save_state(st)
+            return {"ok": True, "settings": inc}
+        return {"ok": False, "conflict": True, "settings": cur}
+
+
+def agent_push(name):
+    """Send this tunnel's agent settings to the paired panel and record the
+    outcome; the UI never reports 'synced' without the peer's acknowledgement."""
+    p = load_panel()
+    if not (p.get("peer_url") and p.get("sync_token")):
+        res = {"state": "unpaired", "at": time.time()}
+    else:
+        s = agent_settings(name)
+        try:
+            r = _peer_request("POST", "/api/sync/agent", _agent_payload(name, s), timeout=8)
+            if r.get("ok"):
+                res = {"state": "synced", "at": time.time(), "peer_rev": s["rev"]}
+            elif r.get("conflict"):
+                ps = r.get("settings") or {}
+                if (ps.get("rev") or 0) > s["rev"]:
+                    agent_receive(name, ps)
+                    res = {"state": "synced", "at": time.time(), "peer_rev": ps.get("rev"), "note": "adopted the peer's newer settings"}
+                else:
+                    res = {"state": "conflict", "at": time.time(), "error": "both panels changed this tunnel's agent settings; change it again on one side to resolve"}
+            else:
+                res = {"state": "failed", "at": time.time(), "error": str(r.get("error") or "rejected")}
+        except ApiError as e:
+            res = {"state": "failed", "at": time.time(), "error": e.msg}
+        except Exception as e:
+            res = {"state": "failed", "at": time.time(), "error": str(e)}
+    with AGENT_LOCK:
+        st = agent_state_all()
+        st.setdefault(name, {})["sync"] = res
+        _agent_save_state(st)
+    return res
+
+
+def agent_reconcile():
+    """Pull the peer's settings; adopt newer ones, push ours when newer."""
+    p = load_panel()
+    if not (p.get("peer_url") and p.get("sync_token")):
+        return
+    try:
+        remote = (_peer_request("GET", "/api/sync/agent", timeout=8) or {}).get("tunnels") or {}
+    except Exception:
+        return
+    for inst in instances():
+        mine, theirs = agent_settings(inst.name), remote.get(inst.name)
+        if not isinstance(theirs, dict):
+            if mine["rev"] > 0:
+                agent_push(inst.name)
+            continue
+        their_rev = theirs.get("rev") or 0
+        if their_rev > mine["rev"]:
+            agent_receive(inst.name, theirs)
+        elif their_rev < mine["rev"]:
+            agent_push(inst.name)
+        else:
+            same = all(mine.get(k) == theirs.get(k) for k in ("enabled", "strategy", "cpu_limit"))
+            res = ({"state": "synced", "at": time.time(), "peer_rev": their_rev} if same else
+                   {"state": "conflict", "at": time.time(), "peer_rev": their_rev,
+                    "error": "both panels hold different settings at the same revision; change it again on one side to resolve"})
+            with AGENT_LOCK:
+                st = agent_state_all()
+                if (st.get(inst.name, {}).get("sync") or {}).get("state") != res["state"]:
+                    st.setdefault(inst.name, {})["sync"] = res
+                    _agent_save_state(st)
+
+
+def agent_loop():
+    last_sync = 0
+    while True:
+        time.sleep(AGENT_EVAL_SEC)
+        try:
+            now = time.time()
+            if now - last_sync >= 60:
+                last_sync = now
+                agent_reconcile()
+            state = load_state() or {}
+            fresh = now - state.get("ts", 0) < SAMPLE_SEC * 4
+            insts = instances()
+            props = systemd_show([i.unit for i in insts]) if insts else {}
+            with AGENT_LOCK:
+                st = agent_state_all()
+                for inst in insts:
+                    s = agent_settings(inst.name)
+                    mem = st.setdefault(inst.name, {})
+                    if not s["enabled"]:
+                        if mem.get("condition") != "off":
+                            mem.update(condition="off", explanation="the agent is off for this tunnel", at=now)
+                        mem.pop("pending", None)
+                        continue
+                    if not fresh:
+                        mem.update(condition="no_metrics", explanation="the monitor service is not running", at=now)
+                        continue
+                    ovi = unit_status(inst, props)
+                    samples = (state.get("arq_samples") or {}).get(inst.name) or []
+                    try:
+                        agent_tick_one(inst, s, mem, ovi, samples, state.get("system"), now)
+                    except Exception as e:
+                        _agent_log(mem, now, "error", "evaluation failed: %s" % e)
+                _agent_save_state(st)
+        except Exception as e:
+            sys.stderr.write("agent loop error: %r\n" % (e,))
+
+
+def api_agent_get(req):
+    role = get_role()
+    st = agent_state_all()
+    out = {}
+    for inst in instances():
+        mem = st.get(inst.name, {})
+        out[inst.name] = {
+            "settings": agent_settings(inst.name),
+            "direction": "upload (client -> server)" if role == "client" else "download (server -> client)",
+            "transport": str(inst.cfg().get("transport", "spoof")).lower(),
+            "state": {k: mem.get(k) for k in ("condition", "explanation", "metrics", "tuning", "baseline", "pending",
+                                              "cooldown_until", "paused_until", "sync", "at")},
+            "log": (mem.get("log") or [])[-30:],
+        }
+        if out[inst.name]["state"].get("pending"):
+            out[inst.name]["state"]["pending"] = {"tuning": mem["pending"]["tuning"], "deadline": mem["pending"]["deadline"]}
+    return {"tunnels": out, "strategies": list(AGENT_STRATEGIES), "live_ok": agent_live_capable(role) if role else False}
+
+
+def api_agent_set(req, name):
+    inst = _inst_or_404(name)
+    d = agent_check_settings(req.json if isinstance(req.json, dict) else {})
+    if not d:
+        raise ApiError(400, "nothing to change")
+    with AGENT_LOCK:
+        s = agent_settings(name)
+        st = agent_state_all()
+        mem = st.setdefault(name, {})
+        peer_rev = ((mem.get("sync") or {}).get("peer_rev") or 0)
+        s.update(d)
+        s["rev"] = max(s["rev"], peer_rev) + 1
+        s["updated"] = time.time()
+        s["by"] = socket.gethostname()
+        if d.get("enabled"):
+            mem["baseline"] = _agent_tuning(inst.cfg())
+            mem["last_seen"] = mem["baseline"]
+            mem["streak_bad"] = mem["streak_good"] = 0
+            mem.pop("paused_until", None)
+        _agent_log(mem, time.time(), "settings", "agent %s, strategy %s, cpu limit %s%%" % (
+            "on" if s["enabled"] else "off", s["strategy"], s["cpu_limit"]))
+        _agent_save_settings(name, s)
+        _agent_save_state(st)
+    return {"ok": True, "settings": s, "sync": agent_push(name)}
+
+
+def api_sync_agent_get(req):
+    return {"tunnels": {i.name: agent_settings(i.name) for i in instances()}}
+
+
+def api_sync_agent_post(req):
+    d = req.json if isinstance(req.json, dict) else {}
+    name = str(d.get("name", ""))
+    _inst_or_404(name)
+    return agent_receive(name, d.get("settings") or {})
+
+
 # ---------------------------------------------------------------- http server --
 _UIV = []
 
@@ -3727,6 +4317,15 @@ html[data-theme=light] #bg::after{background-image:linear-gradient(rgba(30,40,80
 .tcard.compact .kv.mini .v{font-size:13px}
 .tcard.full .kv{margin:12px 0}
 .subgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0 2px}
+.subcard.agent{grid-column:1/-1}
+.agrow{margin:6px 0 4px}
+.agexp{margin:2px 0 6px;color:var(--tx);opacity:.85}
+.hint.warnt{color:var(--warn)}
+.agsw{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;cursor:pointer}
+.agsw input{width:auto;accent-color:var(--acc)}
+select.sm{width:auto;padding:4px 8px;font-size:12px}
+.aglog{max-height:60vh;overflow:auto;margin:8px 0}
+.aglog .ev .m{white-space:normal}
 .subcard{background:rgba(0,0,0,.18);border:1px solid var(--gl);border-radius:calc(var(--r) - 4px);padding:12px}
 html[data-theme=light] .subcard{background:rgba(20,30,70,.035)}
 .subhead{margin-bottom:2px}
@@ -3803,6 +4402,10 @@ en: {
  panel_path:'Custom URL path (optional)', panel_path_ph:'leave empty for none', panel_path_hint:'Serve the panel under an extra secret path, e.g. https://host:port/thispath — harder to find by scanning. Empty = served at the root, as now.',
  sync_proxy:'Sync via SOCKS5 proxy (optional)', sync_proxy_ph:'e.g. 127.0.0.1:1080', sync_proxy_hint:'Routes only this panel’s sync calls to the peer panel through a SOCKS5 proxy (e.g. this node’s own tunnel SOCKS5 port) — never the tunnel data itself. Useful when the two panels can’t reach each other directly but a tunnel can. Empty = connect directly.',
  clear_events:'Clear', clear_events_confirm:'Clear all recent events? This cannot be undone.',
+ ag_title:'Smart agent', ag_on:'On', ag_dir:'Tunes here', ag_up:'upload (client → server)', ag_down:'download (server → client)', ag_retx:'Retransmit rate', ag_retx_hist:'Retransmit rate (last 30 min)', ag_jitter:'Jitter', ag_gaveup:'Gave up', ag_now:'Now', ag_base:'baseline', ag_strategy:'Strategy', ag_log:'Decisions', ag_reset:'Reset to baseline', ag_reset_confirm:'Restore the settings the agent started from and pause it for 30 minutes?', ag_need_core:'The installed core cannot apply settings live yet - run Update so the agent can act (until then it only observes).', ag_saved_synced:'Saved and synced with the peer panel', ag_saved_local:'Saved (no peer panel paired)', ag_saved_unsynced:'Saved here, but the peer panel did not confirm',
+ st_balanced:'Balanced', st_reliability:'Reliability first', st_low_latency:'Low latency',
+ c_off:'Off', c_not_applicable:'Not needed (TCP)', c_observe_only:'Observe only', c_service_down:'Service down', c_restart_loop:'Restart loop', c_paused:'Paused', c_settling:'Settling', c_no_metrics:'No data yet', c_idle:'Idle', c_peer_unresponsive:'Peer not answering', c_stable:'Stable', c_jitter:'Jitter', c_packet_loss:'Packet loss', c_resource_pressure:'CPU pressure', c_healthy:'Healthy', c_verifying:'Verifying', c_applied:'Applied', c_verified:'Verified', c_rollback:'Rolled back', c_manual:'Manual change', c_reset:'Reset', c_settings:'Settings', c_error:'Error',
+ sy_synced:'Synced', sy_failed:'Peer sync failed', sy_conflict:'Sync conflict', sy_unpaired:'Not paired', sy_pending:'Sync pending',
  cert_title:'Custom SSL certificate', cert_hint:'Use a real certificate for your domain (e.g. a Let’s Encrypt cert) instead of the self-signed one, so browsers stop warning about it. Give the paths to the files as already uploaded on this server — they are copied into place and TLS is turned on. The files must be readable by root and not live under /root or /home (the panel service cannot read those two directories).', cert_path:'Certificate file path (.crt / .pem / fullchain)', cert_path_ph:'/etc/letsencrypt/live/yourdomain/fullchain.pem', key_path:'Private key file path', key_path_ph:'/etc/letsencrypt/live/yourdomain/privkey.pem', cert_apply:'Apply certificate & restart panel', cert_both_required:'Both the certificate and the key path are required.',
  diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX', cavg:'AVG', cpeak:'PEAK', traffic:'Traffic', overall_speed:'live', overall_label:'Overall speed', upload:'Upload', download:'Download', sent:'Sent', received:'Received', conn_stats:'Connection Stats', conn_local:'local', conn_sessions:'sessions', open_sockets:'open sockets', client:'client', server:'server',
@@ -3827,6 +4430,10 @@ fa: {
  panel_path:'مسیر سفارشی لینک (اختیاری)', panel_path_ph:'برای نداشتن مسیر خالی بگذار', panel_path_hint:'پنل را زیر یک مسیر مخفیِ اضافه سرو کن، مثلاً https://host:port/thispath — پیداکردنش با اسکن سخت‌تر می‌شود. خالی = مثل الان روی ریشه.',
  sync_proxy:'سینک از طریق پراکسی SOCKS5 (اختیاری)', sync_proxy_ph:'مثلاً 127.0.0.1:1080', sync_proxy_hint:'فقط درخواست‌های سینکِ این پنل با پنلِ طرف مقابل را از یک پراکسی SOCKS5 (مثلاً پورت SOCKS5 تونل همین نود) عبور می‌دهد — نه ترافیک خود تونل را. وقتی دو پنل مستقیم به هم نمی‌رسند ولی یک تونل می‌رسد مفید است. خالی = اتصال مستقیم.',
  clear_events:'پاک کردن', clear_events_confirm:'همهٔ رویدادهای اخیر پاک شوند؟ این کار قابل بازگشت نیست.',
+ ag_title:'ایجنت هوشمند', ag_on:'روشن', ag_dir:'اینجا تنظیم می‌کند', ag_up:'آپلود (کلاینت ← سرور)', ag_down:'دانلود (سرور ← کلاینت)', ag_retx:'نرخ ارسال مجدد', ag_retx_hist:'نرخ ارسال مجدد (۳۰ دقیقهٔ اخیر)', ag_jitter:'جیتر', ag_gaveup:'رهاشده', ag_now:'الان', ag_base:'پایه', ag_strategy:'استراتژی', ag_log:'تصمیم‌ها', ag_reset:'برگشت به تنظیمات پایه', ag_reset_confirm:'تنظیماتی که ایجنت از آن شروع کرده برگردد و ایجنت ۳۰ دقیقه متوقف شود؟', ag_need_core:'Core نصب‌شده هنوز نمی‌تواند تنظیمات را زنده اعمال کند - آپدیت بزن تا ایجنت بتواند عمل کند (تا آن موقع فقط مشاهده می‌کند).', ag_saved_synced:'ذخیره شد و با پنل طرف مقابل سینک شد', ag_saved_local:'ذخیره شد (پنل طرف مقابل جفت نشده)', ag_saved_unsynced:'اینجا ذخیره شد، ولی پنل طرف مقابل تأیید نکرد',
+ st_balanced:'متعادل', st_reliability:'اولویت پایداری', st_low_latency:'تأخیر کم',
+ c_off:'خاموش', c_not_applicable:'لازم نیست (TCP)', c_observe_only:'فقط مشاهده', c_service_down:'سرویس خاموش', c_restart_loop:'حلقهٔ ری‌استارت', c_paused:'متوقف', c_settling:'در حال پایدار شدن', c_no_metrics:'هنوز داده‌ای نیست', c_idle:'بی‌کار', c_peer_unresponsive:'طرف مقابل جواب نمی‌دهد', c_stable:'پایدار', c_jitter:'جیتر', c_packet_loss:'از دست رفتن پکت', c_resource_pressure:'فشار CPU', c_healthy:'سالم', c_verifying:'در حال تأیید', c_applied:'اعمال شد', c_verified:'تأیید شد', c_rollback:'برگشت داده شد', c_manual:'تغییر دستی', c_reset:'ریست', c_settings:'تنظیمات', c_error:'خطا',
+ sy_synced:'سینک شد', sy_failed:'سینک ناموفق', sy_conflict:'تعارض سینک', sy_unpaired:'جفت نشده', sy_pending:'در انتظار سینک',
  cert_title:'سرتیفیکیت SSL اختصاصی', cert_hint:'به‌جای سرتیفیکیت خودامضا، یک سرتیفیکیت واقعی برای دامنه‌ات (مثلاً سرتیفیکیت Let’s Encrypt) استفاده کن تا مرورگرها دیگه هشدار ندن. مسیر فایل‌هایی که از قبل روی همین سرور آپلود کردی رو بده — کپی می‌شن و TLS روشن می‌شه. فایل‌ها باید توسط root قابل خوندن باشن و زیر /root یا /home نباشن (سرویس پنل اجازهٔ خوندن اون دو مسیر رو نداره).', cert_path:'مسیر فایل سرتیفیکیت (.crt / .pem / fullchain)', cert_path_ph:'/etc/letsencrypt/live/yourdomain/fullchain.pem', key_path:'مسیر فایل کلید خصوصی', key_path_ph:'/etc/letsencrypt/live/yourdomain/privkey.pem', cert_apply:'اعمال سرتیفیکیت و ری‌استارت پنل', cert_both_required:'هم مسیر سرتیفیکیت و هم مسیر کلید لازمه.',
  diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار سیستم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال', cavg:'میانگین', cpeak:'اوج', traffic:'ترافیک', overall_speed:'لحظه‌ای', overall_label:'سرعت کلی', upload:'آپلود', download:'دانلود', sent:'ارسال‌شده', received:'دریافت‌شده', conn_stats:'وضعیت اتصال', conn_local:'محلی', conn_sessions:'نشست‌ها', open_sockets:'سوکت باز', client:'کلاینت', server:'سرور',
@@ -3959,7 +4566,7 @@ function showView(){
   if(S.view==='health') return viewHealth(m);
   if(S.view==='diagnose') return viewDiagnose(m);
   if(S.view==='settings') return viewSettings(m);
-  const tick=async()=>{ if(S.modal) return; try{S.ov=await api('GET','/api/overview')}catch(e){return} refreshPings(); const sy=window.scrollY; (S.view==='tunnels'?viewTunnels:S.view==='events'?viewEvents:viewOverview)(m); window.scrollTo(0,sy)};
+  const tick=async()=>{ if(S.modal) return; try{S.ov=await api('GET','/api/overview')}catch(e){return} refreshPings(); if(S.view==='tunnels') refreshAgent(); const fe=document.activeElement; if(fe&&m.contains(fe)&&/^(SELECT|INPUT|TEXTAREA)$/.test(fe.tagName)&&fe.type!=='checkbox') return; const sy=window.scrollY; (S.view==='tunnels'?viewTunnels:S.view==='events'?viewEvents:viewOverview)(m); window.scrollTo(0,sy)};
   tick();S.timer=setInterval(tick,3000);
 }
 
@@ -4083,6 +4690,68 @@ function connBox(x){
     h('div',{class:'chartwrap'},miniChart(hs.conns,{cls:'grn'})),
     chartStats(hs.conns));
 }
+let AGENT_AT=0;
+function refreshAgent(force){
+  const now=Date.now();
+  if(!force&&now-AGENT_AT<10000) return;
+  AGENT_AT=now;
+  api('GET','/api/agent').then(r=>{S.agent=r}).catch(()=>{});
+}
+const AGENT_PILL={healthy:'ok',stable:'ok',jitter:'warn',packet_loss:'warn',verifying:'warn',settling:'dim',idle:'dim',no_metrics:'dim',
+  restart_loop:'bad',peer_unresponsive:'bad',service_down:'bad',resource_pressure:'bad',off:'dim',not_applicable:'dim',observe_only:'warn',paused:'dim'};
+function agentSet(name,body){
+  return api('POST','/api/agent/'+name,body).then(r=>{
+    const sy=(r.sync||{}).state;
+    toast(sy==='synced'?t('ag_saved_synced'):sy==='unpaired'?t('ag_saved_local'):t('ag_saved_unsynced')+(r.sync&&r.sync.error?': '+r.sync.error:''),sy==='failed'||sy==='conflict');
+    AGENT_AT=0;refreshAgent(true);
+  }).catch(e=>{if(!e.handled)toast(e.message,1)});
+}
+function agentLogModal(name){
+  const a=((S.agent||{}).tunnels||{})[name]||{};
+  const rows=(a.log||[]).slice().reverse();
+  openModal([h('h3',{text:t('ag_log')+': '+name}),
+    rows.length?h('div',{class:'aglog'},rows.map(e=>h('div',{class:'ev'},h('time',{class:'mono',text:fmtT(e.ts)}),h('span',{class:'tag',text:t('c_'+e.kind)||e.kind}),h('span',{class:'m',text:e.msg})))):h('div',{class:'lbl',text:t('none')}),
+    h('div',{class:'row'},h('button',{class:'btn',onclick:closeModal,text:t('close')}))]);
+}
+function agentBox(x){
+  const all=S.agent||{},a=(all.tunnels||{})[x.name];
+  const hs=x.history||{},q=x.arq||{};
+  const pct=v=>v==null?'—':v.toFixed(1)+'%',ms=v=>v==null?'—':Math.round(v)+' ms';
+  const metrics=h('div',{class:'trow'},
+    h('div',{class:'titem'},h('span',{class:'lbl',text:t('ag_retx')}),h('span',{class:'v',text:pct(q.retx_pct)})),
+    h('div',{class:'titem'},h('span',{class:'lbl',text:'RTT'}),h('span',{class:'v',text:ms(q.srtt_ms)})),
+    h('div',{class:'titem'},h('span',{class:'lbl',text:t('ag_jitter')}),h('span',{class:'v',text:ms(q.rttvar_ms)})),
+    h('div',{class:'titem'},h('span',{class:'lbl',text:t('ag_gaveup')}),h('span',{class:'v',text:q.gave_up==null?'—':String(q.gave_up)})));
+  const head=h('div',{class:'row subhead'},h('b',{class:'subtitle',text:t('ag_title')}),h('div',{class:'sp'}));
+  if(!a){
+    return h('div',{class:'subcard agent'},head,h('div',{class:'lbl',text:t('running')}),metrics);
+  }
+  const st=a.settings||{},ss=a.state||{},sy=ss.sync||{},cond=st.enabled?(ss.condition||'no_metrics'):'off';
+  const sw=h('input',{type:'checkbox'});sw.checked=!!st.enabled;
+  sw.addEventListener('change',()=>agentSet(x.name,{enabled:sw.checked}));
+  const strat=h('select',{class:'sm'},(all.strategies||['balanced']).map(k=>h('option',{value:k,text:t('st_'+k)})));strat.value=st.strategy||'balanced';
+  strat.addEventListener('change',()=>agentSet(x.name,{strategy:strat.value}));
+  const syncCls={synced:'ok',failed:'bad',conflict:'bad',unpaired:'dim'}[sy.state]||'dim';
+  head.append(h('label',{class:'agsw'},sw,h('span',{text:t('ag_on')})));
+  const c=x.config||{},tun=ss.tuning||{rto_min_ms:c.rto_min_ms,max_retries:c.max_retries},base=ss.baseline||{};
+  const tuningTxt=tun.rto_min_ms?`rto_min_ms ${tun.rto_min_ms} · max_retries ${tun.max_retries}`+(base.rto_min_ms&&(base.rto_min_ms!==tun.rto_min_ms||base.max_retries!==tun.max_retries)?`  (${t('ag_base')}: ${base.rto_min_ms} / ${base.max_retries})`:''):'—';
+  return h('div',{class:'subcard agent'},head,
+    h('div',{class:'row agrow'},
+      h('span',{class:'pill sm '+(AGENT_PILL[cond]||'dim'),text:t('c_'+cond)}),
+      st.enabled&&h('span',{class:'pill sm '+syncCls,title:sy.error||'',text:t('sy_'+(sy.state||'pending'))}),
+      h('span',{class:'lbl',text:t('ag_dir')+': '+(x.role==='client'?t('ag_up'):t('ag_down'))})),
+    st.enabled&&ss.explanation&&h('div',{class:'hint agexp',text:ss.explanation}),
+    !all.live_ok&&(a.transport!=='tcp')&&h('div',{class:'hint warnt',text:t('ag_need_core')}),
+    metrics,
+    h('div',{class:'lbl ospeed',text:t('ag_retx_hist')}),
+    h('div',{class:'chartwrap'},miniChart(hs.retx,{cls:'up'})),
+    h('div',{class:'lbl'},t('ag_now')+': ',h('bdi',{class:'mono',dir:'ltr',text:tuningTxt})),
+    h('div',{class:'row acts'},
+      h('span',{class:'lbl',text:t('ag_strategy')}),strat,
+      h('div',{class:'sp'}),
+      h('button',{class:'btn sm',onclick:()=>agentLogModal(x.name),text:t('ag_log')}),
+      h('button',{class:'btn sm',onclick:async()=>{if(!confirm(t('ag_reset_confirm')))return;try{await api('POST','/api/agent/'+x.name+'/reset',{});toast(t('saved'));AGENT_AT=0;refreshAgent(true)}catch(e){if(!e.handled)toast(e.message,1)}},text:t('ag_reset')})));
+}
 function tc(x,full){
   const c=x.config||{},l5=x.log5||{info:0,warn:0,error:0};
   const kv=(k,v)=>h('div',{},h('span',{class:'lbl',text:k}),h('span',{class:'v',text:v}));
@@ -4115,7 +4784,7 @@ function tc(x,full){
       x.role==='client'?kv('SOCKS5','127.0.0.1:'+(c.socks5_port||'?')):kv(t('f_tun'),c.tunnel_count),
       kv('log 5m',`${l5.info} / ${l5.warn} / ${l5.error}`)),
     x.listening===false&&x.active==='active'&&h('div',{class:'pill bad sm',text:t('not_listening')}),
-    h('div',{class:'subgrid'},trafficBox(x),connBox(x)),
+    h('div',{class:'subgrid'},trafficBox(x),connBox(x),agentBox(x)),
     h('div',{class:'row acts'},acts));
 }
 async function act(name,a){try{await api('POST',`/api/tunnels/${name}/${a}`);toast('OK');S.ov=await api('GET','/api/overview');showView()}catch(e){if(!e.handled)toast(e.message,1)}}
@@ -4586,6 +5255,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(200, api_sync_overview(req)); return
                 if method == "POST" and path == "/api/sync/apply":
                     self._json(200, api_sync_apply(req)); return
+                if method == "GET" and path == "/api/sync/agent":
+                    self._json(200, api_sync_agent_get(req)); return
+                if method == "POST" and path == "/api/sync/agent":
+                    self._json(200, api_sync_agent_post(req)); return
                 self._json(404, {"error": "not found"}); return
             sess = get_session(req.token)
             if not sess:
@@ -4644,6 +5317,8 @@ class Handler(BaseHTTPRequestHandler):
                 return api_peer_status(req)
             if path == "/api/update/status":
                 return api_update_status(req)
+            if path == "/api/agent":
+                return api_agent_get(req)
             if path == "/api/settings/panel/prefix":
                 return {"path": str(load_panel().get("path") or "")}
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/logs$", path)
@@ -4687,6 +5362,12 @@ class Handler(BaseHTTPRequestHandler):
                 return api_core_restart(req)
             if path == "/api/events/clear":
                 return api_events_clear(req)
+            m = re.match(r"^/api/agent/([a-z0-9-]+)/reset$", path)
+            if m:
+                return agent_reset(m.group(1))
+            m = re.match(r"^/api/agent/([a-z0-9-]+)$", path)
+            if m:
+                return api_agent_set(req, m.group(1))
             if path == "/api/update":
                 return api_update_start(req)
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/(start|stop|restart)$", path)
@@ -4745,6 +5426,7 @@ def cmd_panel():
         srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
         srv.tls = True
     signal.signal(signal.SIGTERM, lambda *a: threading.Thread(target=srv.shutdown, daemon=True).start())
+    threading.Thread(target=agent_loop, name="smart-agent", daemon=True).start()
     sys.stderr.write("panel listening on %s://%s:%d\n" % ("https" if srv.tls else "http", bind, port))
     sys.stderr.flush()
     srv.serve_forever()

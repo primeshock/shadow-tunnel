@@ -184,6 +184,41 @@ that already agree produce no noise.
 Watchdog (periodic restart timer), change panel password, and node info
 (role, build commit, panel bind/port/TLS). Sign out.
 
+### Smart agent (per tunnel, Tunnels tab)
+
+An optional controller that tunes a spoof-transport tunnel from measured
+data. The core logs a `stats:` line every 10 s with first transmissions,
+retransmissions (timeout / NACK), packets abandoned after `max_retries`, and
+the smoothed RTT and RTT variance. The monitor turns these into the
+**retransmit rate** shown on the card.
+
+- **What it changes:** only `rto_min_ms` and `max_retries`. The core applies
+  both live on SIGHUP without dropping sessions. It never restarts services.
+- **Direction:** each endpoint tunes its own sending side. The client tunes
+  upload (client → server), the server tunes download (server → client).
+- **Sync:** the on/off switch, strategy and CPU limit are shared with the
+  paired panel (revisioned; newer wins; a same-revision disagreement is
+  shown as a conflict). The card shows "synced" only after the peer
+  acknowledges.
+- **When it acts:** high RTT variance with an elevated retransmit rate
+  (spurious retransmits) raises the RTO floor. Abandoned packets raise
+  `max_retries`. After 10 healthy minutes it steps back toward the baseline
+  (the values it started from, or your last manual edit). Each change is
+  confirmed against the core's next stats line, or rolled back.
+- **Safety limits:** 3 consecutive bad evaluations before acting (hysteresis
+  band between enter/exit thresholds), a 10-minute cooldown, at most 4
+  changes per hour, and per-strategy caps (Balanced / Reliability first /
+  Low latency). It does not escalate while CPU is above the limit. It pauses
+  for 2 minutes after a (re)start. It reverts to the baseline and pauses for
+  1 hour if it sees 3 automatic restarts within 15 minutes. **Reset to
+  baseline** restores the starting values and pauses it for 30 minutes.
+- **What it does not do:** it is not FEC. The protocol has no parity
+  packets, so real loss can only be retransmitted. In that case the agent
+  reports it rather than pretending to fix it. The TCP transport is left
+  alone because the kernel already handles retransmission. Cores older
+  than this release cannot reload live, so the agent only observes until
+  you update.
+
 ---
 
 ## Configuration reference
@@ -279,6 +314,10 @@ Mutating requests carry the CSRF token from `/api/session`.
 | POST | `/api/link/parse` | decode a `shadowspoof://` link into fields |
 | POST | `/api/diagnose` | **tunnel doctor** (optional `{link}` for peer cross-check) |
 | POST | `/api/settings/watchdog` · `/api/settings/password` | settings |
+| GET | `/api/agent` | smart-agent settings, state, decision log per tunnel |
+| POST | `/api/agent/<name>` | `{enabled, strategy, cpu_limit}`; pushed to the paired panel |
+| POST | `/api/agent/<name>/reset` | restore baseline tuning, pause 30 min |
+| GET/POST | `/api/sync/agent` | peer-to-peer agent settings (sync token, not a session) |
 
 ---
 
