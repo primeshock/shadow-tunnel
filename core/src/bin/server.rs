@@ -165,11 +165,23 @@ async fn handle_new_tunnel(
         target_port
     );
 
-    // Open TCP connection to the target.
+    // Open TCP connection to the target. A failure here reflects whatever
+    // destination the tunneled client asked for (often a third party's
+    // unreachable/offline service) rather than a fault in the tunnel itself,
+    // so it is logged at info level and does not surface as a "session
+    // error" warning - that classification is reserved for actual tunnel
+    // protocol problems (handshake/auth/framing).
     let target_addr = format!("{}:{}", target_host, target_port);
-    let tcp_stream = TcpStream::connect(&target_addr)
-        .await
-        .with_context(|| format!("connect to {}", target_addr))?;
+    let tcp_stream = match TcpStream::connect(&target_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::info!(
+                "tunnel {} could not reach requested destination {}: {}",
+                tunnel_id, target_addr, e
+            );
+            return Ok(());
+        }
+    };
 
     let (mut tcp_r, mut tcp_w) = tcp_stream.into_split();
     let mtu = cfg.mtu;

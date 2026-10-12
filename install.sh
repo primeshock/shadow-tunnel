@@ -3039,6 +3039,24 @@ def _restart_panel_soon():
     threading.Timer(1.0, lambda: run([CTL, "panel", "restart"], timeout=30)).start()
 
 
+def _install_custom_cert(cert_path, key_path):
+    """Validate and install an admin-supplied certificate/key pair (e.g. a
+    real domain's Let's Encrypt cert, already uploaded to the server),
+    replacing the self-signed one at ETC/panel.crt + ETC/panel.key so
+    browsers stop warning about an untrusted/self-signed certificate."""
+    for label, path in (("certificate", cert_path), ("private key", key_path)):
+        if not path or not os.path.isfile(path):
+            raise ApiError(400, "%s file not found: %s" % (label, path or "(empty)"))
+    try:
+        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert_path, key_path)
+    except ssl.SSLError as e:
+        raise ApiError(400, "invalid certificate/key pair: %s" % e)
+    except OSError as e:
+        raise ApiError(400, "could not read certificate/key: %s" % e)
+    atomic_write(os.path.join(ETC, "panel.crt"), read_text(cert_path), 0o644)
+    atomic_write(os.path.join(ETC, "panel.key"), read_text(key_path), 0o600)
+
+
 def api_panel_cfg(req):
     """Change the panel's own bind address / port / path / TLS, then restart it.
     The caller will have to reconnect on the new address."""
@@ -3062,11 +3080,20 @@ def api_panel_cfg(req):
         if path and not re.match(r"^[A-Za-z0-9_-]{1,64}$", path):
             raise ApiError(400, "path may only contain letters, digits, _ and -")
         p["path"] = path; changed.append("path")
+    custom_cert = "cert_path" in d or "key_path" in d
+    if custom_cert:
+        cert_path = str(d.get("cert_path", "")).strip()
+        key_path = str(d.get("key_path", "")).strip()
+        if not cert_path or not key_path:
+            raise ApiError(400, "both the certificate and private key paths are required")
+        _install_custom_cert(cert_path, key_path)
+        p["tls"] = True
+        changed += ["cert", "tls"]
     if not changed:
         raise ApiError(400, "nothing to change")
     save_panel(p)
-    if p.get("tls"):
-        run([CTL, "panel", "tls", "on"], timeout=30)  # ensures a cert exists
+    if p.get("tls") and not custom_cert:
+        run([CTL, "panel", "tls", "on"], timeout=30)  # ensures a (self-signed) cert exists
     _restart_panel_soon()
     url = panel_url(p)  # panel_url() already appends the path
     return {"ok": True, "changed": changed, "bind": p.get("bind"), "port": p.get("port"),
@@ -3775,6 +3802,7 @@ en: {
  panel_path:'Custom URL path (optional)', panel_path_ph:'leave empty for none', panel_path_hint:'Serve the panel under an extra secret path, e.g. https://host:port/thispath — harder to find by scanning. Empty = served at the root, as now.',
  sync_proxy:'Sync via SOCKS5 proxy (optional)', sync_proxy_ph:'e.g. 127.0.0.1:1080', sync_proxy_hint:'Routes only this panel’s sync calls to the peer panel through a SOCKS5 proxy (e.g. this node’s own tunnel SOCKS5 port) — never the tunnel data itself. Useful when the two panels can’t reach each other directly but a tunnel can. Empty = connect directly.',
  clear_events:'Clear', clear_events_confirm:'Clear all recent events? This cannot be undone.',
+ cert_title:'Custom SSL certificate', cert_hint:'Use a real certificate for your domain (e.g. a Let’s Encrypt cert) instead of the self-signed one, so browsers stop warning about it. Give the paths to the files as already uploaded on this server — they are copied into place and TLS is turned on. The files must be readable by root and not live under /root or /home (the panel service cannot read those two directories).', cert_path:'Certificate file path (.crt / .pem / fullchain)', cert_path_ph:'/etc/letsencrypt/live/yourdomain/fullchain.pem', key_path:'Private key file path', key_path_ph:'/etc/letsencrypt/live/yourdomain/privkey.pem', cert_apply:'Apply certificate & restart panel', cert_both_required:'Both the certificate and the key path are required.',
  diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
  cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX', cavg:'AVG', cpeak:'PEAK', traffic:'Traffic', overall_speed:'live', overall_label:'Overall speed', upload:'Upload', download:'Download', sent:'Sent', received:'Received', conn_stats:'Connection Stats', conn_local:'local', conn_sessions:'sessions', open_sockets:'open sockets', client:'client', server:'server',
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
@@ -3798,6 +3826,7 @@ fa: {
  panel_path:'مسیر سفارشی لینک (اختیاری)', panel_path_ph:'برای نداشتن مسیر خالی بگذار', panel_path_hint:'پنل را زیر یک مسیر مخفیِ اضافه سرو کن، مثلاً https://host:port/thispath — پیداکردنش با اسکن سخت‌تر می‌شود. خالی = مثل الان روی ریشه.',
  sync_proxy:'سینک از طریق پراکسی SOCKS5 (اختیاری)', sync_proxy_ph:'مثلاً 127.0.0.1:1080', sync_proxy_hint:'فقط درخواست‌های سینکِ این پنل با پنلِ طرف مقابل را از یک پراکسی SOCKS5 (مثلاً پورت SOCKS5 تونل همین نود) عبور می‌دهد — نه ترافیک خود تونل را. وقتی دو پنل مستقیم به هم نمی‌رسند ولی یک تونل می‌رسد مفید است. خالی = اتصال مستقیم.',
  clear_events:'پاک کردن', clear_events_confirm:'همهٔ رویدادهای اخیر پاک شوند؟ این کار قابل بازگشت نیست.',
+ cert_title:'سرتیفیکیت SSL اختصاصی', cert_hint:'به‌جای سرتیفیکیت خودامضا، یک سرتیفیکیت واقعی برای دامنه‌ات (مثلاً سرتیفیکیت Let’s Encrypt) استفاده کن تا مرورگرها دیگه هشدار ندن. مسیر فایل‌هایی که از قبل روی همین سرور آپلود کردی رو بده — کپی می‌شن و TLS روشن می‌شه. فایل‌ها باید توسط root قابل خوندن باشن و زیر /root یا /home نباشن (سرویس پنل اجازهٔ خوندن اون دو مسیر رو نداره).', cert_path:'مسیر فایل سرتیفیکیت (.crt / .pem / fullchain)', cert_path_ph:'/etc/letsencrypt/live/yourdomain/fullchain.pem', key_path:'مسیر فایل کلید خصوصی', key_path_ph:'/etc/letsencrypt/live/yourdomain/privkey.pem', cert_apply:'اعمال سرتیفیکیت و ری‌استارت پنل', cert_both_required:'هم مسیر سرتیفیکیت و هم مسیر کلید لازمه.',
  diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
  cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار سیستم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال', cavg:'میانگین', cpeak:'اوج', traffic:'ترافیک', overall_speed:'لحظه‌ای', overall_label:'سرعت کلی', upload:'آپلود', download:'دانلود', sent:'ارسال‌شده', received:'دریافت‌شده', conn_stats:'وضعیت اتصال', conn_local:'محلی', conn_sessions:'نشست‌ها', open_sockets:'سوکت باز', client:'کلاینت', server:'سرور',
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
@@ -4372,12 +4401,27 @@ async function viewSettings(m){
     const ptls=h('select',{},[['off','HTTP'],['on','HTTPS (TLS)']].map(a=>h('option',{value:a[0],text:a[1]})));ptls.value=st.tls?'on':'off';
     const psave=h('button',{class:'btn pri',text:t('panel_save'),onclick:async()=>{if(!confirm(t('panel_warn')))return;try{const r=await api('POST','/api/settings/panel',{bind:pbind.value.trim(),port:+pport.value,tls:ptls.value==='on',path:ppath.value.trim()});toast(r.note||t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
     const pdis=h('button',{class:'btn dng',text:t('panel_disable'),onclick:async()=>{if(!confirm(t('panel_dis_warn')))return;try{await api('POST','/api/settings/panel/toggle',{on:false});toast(t('panel_disabled'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+    const certp=h('input',{placeholder:t('cert_path_ph')});
+    const keyp=h('input',{placeholder:t('key_path_ph')});
+    const certerr=h('div',{class:'err'});
+    const certsave=h('button',{class:'btn pri',text:t('cert_apply'),onclick:async()=>{
+      certerr.textContent='';
+      if(!certp.value.trim()||!keyp.value.trim()){certerr.textContent=t('cert_both_required');return}
+      if(!confirm(t('panel_warn')))return;
+      try{const r=await api('POST','/api/settings/panel',{cert_path:certp.value.trim(),key_path:keyp.value.trim()});toast(r.note||t('saved'));certp.value=keyp.value=''}
+      catch(e){if(!e.handled) certerr.textContent=e.message}}});
     sections.push(
       h('div',{class:'card'},h('b',{text:t('panel_cfg')}),h('div',{class:'hint',text:t('panel_cfg_hint')}),
         h('div',{class:'two'},h('label',{class:'f'},h('span',{text:t('panel_bind')}),pbind),h('label',{class:'f'},h('span',{text:t('panel_port')}),pport)),
         h('label',{class:'f'},h('span',{text:t('panel_path')}),ppath,h('div',{class:'hint',text:t('panel_path_hint')})),
         h('label',{class:'f'},h('span',{text:'TLS'}),ptls),
-        h('div',{class:'row'},psave,pdis)));
+        h('div',{class:'row'},psave,pdis)),
+      h('div',{class:'lbl',text:' '}),
+      h('div',{class:'card'},h('b',{text:t('cert_title')}),h('div',{class:'hint',text:t('cert_hint')}),
+        h('label',{class:'f'},h('span',{text:t('cert_path')}),certp),
+        h('label',{class:'f'},h('span',{text:t('key_path')}),keyp),
+        certerr,
+        h('div',{class:'row'},certsave)));
   }
 
   if(S.setTab==='peer'){
