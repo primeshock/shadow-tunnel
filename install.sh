@@ -3466,6 +3466,7 @@ nav.dock button:hover{color:var(--tx)}
 nav.dock button.on{background:var(--grad);color:#fff;box-shadow:0 3px 10px -6px var(--acc)}
 h2{font-size:15px;margin:22px 0 10px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.6px}
 .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
+.stack{display:flex;flex-direction:column;gap:16px}
 .card{position:relative;background:linear-gradient(180deg,#1b2336cc,#131a28cc);border:1px solid #ffffff14;border-radius:var(--r);padding:16px;box-shadow:var(--shadow),inset 0 1px 0 #ffffff1f;backdrop-filter:blur(8px) saturate(140%);-webkit-backdrop-filter:blur(8px) saturate(140%)}
 .grid .card:hover{transform:translateY(-1px);border-color:#ffffff28;box-shadow:var(--shadow),inset 0 1px 0 #ffffff26}
 .big{font-size:28px;font-weight:800;letter-spacing:-.5px;background:linear-gradient(180deg,#fff,#b9c2d8);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.lbl{color:var(--mut);font-size:12px}
@@ -4383,7 +4384,6 @@ async function viewSettings(m){
     const wdBtn=h('button',{class:'btn',text:t('apply'),onclick:async()=>{try{await api('POST','/api/settings/watchdog',{value:wd.value});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
     sections.push(
       h('div',{class:'card'},h('b',{text:t('wd')}),h('div',{class:'hint',text:t('wd_hint')}),h('div',{class:'row'},wd,wdBtn)),
-      h('div',{class:'lbl',text:' '}),
       h('div',{class:'card'},h('div',{class:'kv'},
         h('div',{},h('span',{class:'lbl',text:t('role')}),h('span',{class:'v',text:S.meta.role})),
         h('div',{},h('span',{class:'lbl',text:t('build')}),h('span',{class:'v mono',text:(b.commit||'?').slice(0,12)})),
@@ -4416,7 +4416,6 @@ async function viewSettings(m){
         h('label',{class:'f'},h('span',{text:t('panel_path')}),ppath,h('div',{class:'hint',text:t('panel_path_hint')})),
         h('label',{class:'f'},h('span',{text:'TLS'}),ptls),
         h('div',{class:'row'},psave,pdis)),
-      h('div',{class:'lbl',text:' '}),
       h('div',{class:'card'},h('b',{text:t('cert_title')}),h('div',{class:'hint',text:t('cert_hint')}),
         h('label',{class:'f'},h('span',{text:t('cert_path')}),certp),
         h('label',{class:'f'},h('span',{text:t('key_path')}),keyp),
@@ -4472,7 +4471,7 @@ async function viewSettings(m){
       h('div',{class:'card'},h('b',{text:t('upd_title')}),h('div',{class:'hint',text:t('upd_hint')}),ubuild,h('div',{class:'row'},ubtn,ucheck),ulog));
   }
 
-  m.replaceChildren(topbar,tabbar,...sections);
+  m.replaceChildren(topbar,tabbar,h('div',{class:'stack'},...sections));
 }
 
 /* ---------- start ---------- */
