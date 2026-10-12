@@ -49,6 +49,11 @@ readonly TUNNELS_DIR=$ETC_DIR/tunnels
 readonly DEFAULT_ICMP_ID=17185   # 0x4321 - identical default on client and server
 readonly DEFAULT_REF=master
 readonly MIN_RUSTC=1.85.0
+# Human-readable release of the panel/CLI/installer (the UI and tooling that
+# live inside THIS install.sh, independent of the Rust core commit). Bump it
+# on every change to install.sh so operators can see whether an update applied.
+# Must match PANEL_VERSION in the embedded Python panel below.
+readonly SHADOW_RELEASE=2.1.0
 
 REPO_URL=${SHADOW_REPO_URL:-https://github.com/primeshock/shadow-tunnel.git}
 REPO_REF=${SHADOW_REF:-$DEFAULT_REF}
@@ -362,17 +367,29 @@ build_and_install() {
   ensure_toolchain
   info "Building (cargo build --release --bins) - this can take a few minutes"
   export CARGO_TARGET_DIR=$STATE_DIR/target
-  ( cd "$SRC" && cargo build --release --bins )
+  # A core build failure must NOT block the panel/CLI/UI update (they are pure
+  # Python/bash and need no compiler). On failure we keep the current binaries,
+  # let the rest of the install proceed, and report it at the very end with a
+  # non-zero exit so the panel's Update tab shows it clearly.
+  if ! ( cd "$SRC" && cargo build --release --bins ); then
+    BUILD_FAILED=1
+    warn "Rust core build FAILED - keeping the current binaries. The panel, CLI and UI are still being updated; fix the error above and run 'shadowtun update' again to rebuild the core."
+    return 0
+  fi
   local b src dst changed=0
   for b in client server; do
     src=$CARGO_TARGET_DIR/release/$b; dst=$BIN_DIR/shadow-spoof-$b
-    [[ -x $src ]] || die "build did not produce $src"
+    if [[ ! -x $src ]]; then
+      BUILD_FAILED=1
+      warn "build did not produce $src - keeping the current binaries"
+      return 0
+    fi
     if ! cmp -s "$src" "$dst" 2>/dev/null; then
       install -m 0755 -o root -g root "$src" "$dst.new" && mv -f "$dst.new" "$dst"; changed=1
     fi
   done
   BINARY_CHANGED=$changed
-  printf 'commit=%s\nbuilt=%s\nrole=%s\n' "$BUILD_REF" "$(date -u +%FT%TZ)" "$ROLE" >"$BUILD_INFO"
+  printf 'commit=%s\nbuilt=%s\nrole=%s\npanel_version=%s\n' "$BUILD_REF" "$(date -u +%FT%TZ)" "$ROLE" "$SHADOW_RELEASE" >"$BUILD_INFO"
   chmod 0644 "$BUILD_INFO"
   ok "Installed $BIN_DIR/shadow-spoof-{client,server}"
 }
@@ -1296,6 +1313,11 @@ SS = os.environ.get("SHADOW_SS", "ss")
 IPCMD = os.environ.get("SHADOW_IP", "ip")
 CTL = os.environ.get("SHADOW_CTL", "/usr/local/bin/shadowctl")
 SVC_USER = "shadow-spoof"
+# Running release of THIS panel code. Must match SHADOW_RELEASE in the bash
+# installer above; both are bumped together on every install.sh change. This is
+# the version actually executing now (not what build-info last recorded), so the
+# Update tab can show whether a restart picked up new panel code.
+PANEL_VERSION = "2.1.0"
 
 CONF_MAIN = os.path.join(ETC, "config.toml")
 TUNNELS = os.path.join(ETC, "tunnels")
@@ -2373,6 +2395,8 @@ def api_meta(req):
     for line in read_text(BUILD_INFO).splitlines():
         k, _, v = line.partition("=")
         info[k] = v
+    info["running_panel_version"] = PANEL_VERSION
+    info["ui_build"] = ui_version()
     return {"role": get_role(), "detect_ip": detect_ip(), "ifaces": list_ifaces(), "build": info,
             "tls": bool(load_panel().get("tls")), "defaults": {"transport": "spoof", "data_port": 51820, "tunnel_count": 4, "mtu": 1380,
                                                               "initial_cwnd": 10, "socks5_port": 1080,
@@ -3419,9 +3443,15 @@ def api_update_status(req):
     st = _update_state()
     log = read_text(UPDATE_LOG).splitlines()[-80:]
     failed = st.get("ActiveState") == "failed"
+    info = {}
+    for line in read_text(BUILD_INFO).splitlines():
+        k, _, v = line.partition("=")
+        info[k] = v
     return {"current": cur[:12], "latest": latest[:12], "error": err,
             "available": bool(latest and (not cur or (not latest.startswith(cur[:12]) and not cur.endswith(latest)))),
             "running": st.get("ActiveState") in ("active", "activating"),
+            "panel_version": PANEL_VERSION, "installed_panel_version": info.get("panel_version", ""),
+            "ui_build": ui_version(), "built": info.get("built", ""),
             "failed": failed, "exit": st.get("ExecMainStatus", ""), "log": "\n".join(log)}
 
 
@@ -3440,6 +3470,7 @@ def api_update_start(req):
                         "--setenv=HOME=/root", "--setenv=TERM=dumb", "--setenv=LANG=C.UTF-8",
                         "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                         "-p", "StandardOutput=file:" + UPDATE_LOG,
+                        "-p", "StandardError=append:" + UPDATE_LOG,
                         CTL, "update", "-y"], timeout=15)
     if rc:
         raise ApiError(500, "systemd-run failed: %s" % (err or out or "no output").strip()[:300])
@@ -4057,6 +4088,11 @@ nav.dock button.on{background:var(--grad);color:#fff;box-shadow:0 3px 10px -6px 
 h2{font-size:15px;margin:22px 0 10px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.6px}
 .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
 .stack{display:flex;flex-direction:column;gap:16px}
+.verbox{margin:8px 0 10px;padding:10px 12px;border:1px solid var(--gl);border-radius:calc(var(--r) - 6px);background:rgba(0,0,0,.14);display:flex;flex-direction:column;gap:4px}
+html[data-theme=light] .verbox{background:rgba(20,30,70,.035)}
+.verbox .vrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px}
+.verbox .vrow .lbl{min-width:96px}
+.verbox b{font-size:15px}
 .card{position:relative;background:linear-gradient(180deg,#1b2336cc,#131a28cc);border:1px solid #ffffff14;border-radius:var(--r);padding:16px;box-shadow:var(--shadow),inset 0 1px 0 #ffffff1f;backdrop-filter:blur(8px) saturate(140%);-webkit-backdrop-filter:blur(8px) saturate(140%)}
 .grid .card:hover{transform:translateY(-1px);border-color:#ffffff28;box-shadow:var(--shadow),inset 0 1px 0 #ffffff26}
 .big{font-size:28px;font-weight:800;letter-spacing:-.5px;background:linear-gradient(180deg,#fff,#b9c2d8);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}.lbl{color:var(--mut);font-size:12px}
@@ -4396,7 +4432,7 @@ try{matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{i
 /* ---------- i18n ---------- */
 const TR = {
 en: {
- ev_tab:'Events', upd_failed:'update failed - see the log below', ui_title:'Appearance & UI', ui_hint:'Visual preferences for this browser only (saved locally). Changes apply instantly.', ui_theme:'Theme', ui_pal:'Colour palette', ui_blur:'Menu & header blur', ui_cblur:'Box (card) blur', ui_glass:'Glass opacity', ui_bg:'Background colour strength', ui_radius:'Corner roundness', ui_speed:'Background motion speed', ui_anim:'Animate background', ui_grid:'Show grid', ui_compact:'Compact cards', ui_reset:'Reset to defaults', th_dark:'Dark', th_light:'Light', th_auto:'Auto (system)', pal_default:'Blue', pal_pink:'Pink / Purple', pal_ocean:'Ocean', pal_emerald:'Emerald', pal_sunset:'Sunset', pal_mono:'Mono', sp_slow:'Slow', sp_norm:'Normal', sp_fast:'Fast', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
+ ev_tab:'Events', upd_failed:'update failed - see the log below', ui_title:'Appearance & UI', ui_hint:'Visual preferences for this browser only (saved locally). Changes apply instantly.', ui_theme:'Theme', ui_pal:'Colour palette', ui_blur:'Menu & header blur', ui_cblur:'Box (card) blur', ui_glass:'Glass opacity', ui_bg:'Background colour strength', ui_radius:'Corner roundness', ui_speed:'Background motion speed', ui_anim:'Animate background', ui_grid:'Show grid', ui_compact:'Compact cards', ui_reset:'Reset to defaults', th_dark:'Dark', th_light:'Light', th_auto:'Auto (system)', pal_default:'Blue', pal_pink:'Pink / Purple', pal_ocean:'Ocean', pal_emerald:'Emerald', pal_sunset:'Sunset', pal_mono:'Mono', sp_slow:'Slow', sp_norm:'Normal', sp_fast:'Fast', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', panel_ver:'Panel version', core_commit:'Core commit', upd_built:'Built', ver_stale:'Installed build-info shows %s - the panel process may not have restarted after the last update; click Restart Panel in the top bar.', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
  restart_panel:'Restart Panel', restart_core:'Restart Core', restart_panel_warn:'Restart the web panel now? You will be disconnected for a few seconds.', restart_core_warn:'Restart every tunnel now? Active connections on all tunnels will drop briefly.', restart_core_ok:'all tunnels restarted', restart_core_part:'some tunnels failed to restart - check Diagnose',
  tab_general:'General', tab_appearance:'Appearance', tab_panel:'Web Panel', tab_peer:'Peer Sync', tab_security:'Security', tab_update:'Update',
  panel_path:'Custom URL path (optional)', panel_path_ph:'leave empty for none', panel_path_hint:'Serve the panel under an extra secret path, e.g. https://host:port/thispath — harder to find by scanning. Empty = served at the root, as now.',
@@ -4424,7 +4460,7 @@ en: {
  note_key:'The pre-shared key authenticates every packet (HMAC). Both sides must use the identical key.', srv_test_hint:'Listens for client packets for 10 s. Press Run here, then run the test on the client at the same time.', no_tunnels:'No tunnels yet.', warnings:'Warnings'
 },
 fa: {
- ev_tab:'رویدادها', upd_failed:'آپدیت ناموفق بود - لاگ را ببین', ui_title:'ظاهر و رابط کاربری', ui_hint:'تنظیمات ظاهری فقط برای همین مرورگر (به‌صورت محلی ذخیره می‌شود). تغییرات فوراً اعمال می‌شود.', ui_theme:'تم', ui_pal:'پالت رنگ', ui_blur:'بلور منو و هدر', ui_cblur:'بلور باکس‌ها (کارت‌ها)', ui_glass:'شفافیت شیشه', ui_bg:'شدت رنگ بک‌گراند', ui_radius:'گردی گوشه‌ها', ui_speed:'سرعت حرکت بک‌گراند', ui_anim:'بک‌گراند متحرک', ui_grid:'نمایش شبکه', ui_compact:'کارت‌های فشرده', ui_reset:'بازگشت به پیش‌فرض', th_dark:'تیره', th_light:'روشن', th_auto:'خودکار (سیستم)', pal_default:'آبی', pal_pink:'صورتی / بنفش', pal_ocean:'اقیانوسی', pal_emerald:'زمردی', pal_sunset:'غروب', pal_mono:'تک‌رنگ', sp_slow:'آهسته', sp_norm:'معمولی', sp_fast:'سریع', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
+ ev_tab:'رویدادها', upd_failed:'آپدیت ناموفق بود - لاگ را ببین', ui_title:'ظاهر و رابط کاربری', ui_hint:'تنظیمات ظاهری فقط برای همین مرورگر (به‌صورت محلی ذخیره می‌شود). تغییرات فوراً اعمال می‌شود.', ui_theme:'تم', ui_pal:'پالت رنگ', ui_blur:'بلور منو و هدر', ui_cblur:'بلور باکس‌ها (کارت‌ها)', ui_glass:'شفافیت شیشه', ui_bg:'شدت رنگ بک‌گراند', ui_radius:'گردی گوشه‌ها', ui_speed:'سرعت حرکت بک‌گراند', ui_anim:'بک‌گراند متحرک', ui_grid:'نمایش شبکه', ui_compact:'کارت‌های فشرده', ui_reset:'بازگشت به پیش‌فرض', th_dark:'تیره', th_light:'روشن', th_auto:'خودکار (سیستم)', pal_default:'آبی', pal_pink:'صورتی / بنفش', pal_ocean:'اقیانوسی', pal_emerald:'زمردی', pal_sunset:'غروب', pal_mono:'تک‌رنگ', sp_slow:'آهسته', sp_norm:'معمولی', sp_fast:'سریع', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', panel_ver:'نسخهٔ پنل', core_commit:'کامیت هسته', upd_built:'ساخته‌شده', ver_stale:'build-info نسخهٔ %s را نشان می‌دهد - احتمالاً پروسهٔ پنل بعد از آخرین آپدیت ری‌استارت نشده؛ از نوار بالا «ری‌استارت پنل» را بزن.', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
  restart_panel:'ری‌استارت پنل', restart_core:'ری‌استارت Core', restart_panel_warn:'وب‌پنل همین حالا ری‌استارت شود؟ چند ثانیه قطع می‌شوی.', restart_core_warn:'همهٔ تونل‌ها همین حالا ری‌استارت شوند؟ اتصال‌های فعال روی همهٔ تونل‌ها لحظه‌ای قطع می‌شود.', restart_core_ok:'همهٔ تونل‌ها ری‌استارت شدند', restart_core_part:'ری‌استارت بعضی تونل‌ها ناموفق بود - Diagnose را ببین',
  tab_general:'عمومی', tab_appearance:'ظاهر', tab_panel:'وب‌پنل', tab_peer:'سینک طرف مقابل', tab_security:'امنیت', tab_update:'آپدیت',
  panel_path:'مسیر سفارشی لینک (اختیاری)', panel_path_ph:'برای نداشتن مسیر خالی بگذار', panel_path_hint:'پنل را زیر یک مسیر مخفیِ اضافه سرو کن، مثلاً https://host:port/thispath — پیداکردنش با اسکن سخت‌تر می‌شود. خالی = مثل الان روی ریشه.',
@@ -5055,6 +5091,7 @@ async function viewSettings(m){
       h('div',{class:'card'},h('b',{text:t('wd')}),h('div',{class:'hint',text:t('wd_hint')}),h('div',{class:'row'},wd,wdBtn)),
       h('div',{class:'card'},h('div',{class:'kv'},
         h('div',{},h('span',{class:'lbl',text:t('role')}),h('span',{class:'v',text:S.meta.role})),
+        h('div',{},h('span',{class:'lbl',text:t('panel_ver')}),h('span',{class:'v mono',text:(b.running_panel_version||'?')+' · '+(b.ui_build||'')})),
         h('div',{},h('span',{class:'lbl',text:t('build')}),h('span',{class:'v mono',text:(b.commit||'?').slice(0,12)})),
         h('div',{},h('span',{class:'lbl',text:'Panel'}),h('span',{class:'v',text:`${st.bind||'?'}:${st.port||'?'} ${st.tls?'TLS':'HTTP'}${st.path?'/'+st.path:''}`})))));
   }
@@ -5119,6 +5156,7 @@ async function viewSettings(m){
   }
 
   if(S.setTab==='update'){
+    const uver=h('div',{class:'verbox'});
     const ubuild=h('div',{class:'hint',text:t('running')});
     const ulog=h('pre',{class:'log ulog'});
     const ubtn=h('button',{class:'btn pri',text:t('upd_now')});
@@ -5127,7 +5165,11 @@ async function viewSettings(m){
       try{
         const r=await api('GET','/api/update/status'+(chk===false?'?check=0':''));
         const stx=r.running?t('upd_running'):r.failed?(t('upd_failed')+' (exit '+(r.exit||'?')+')'):r.error?r.error:r.available?t('upd_avail'):t('upd_latest');
-        ubuild.textContent=t('upd_cur')+': '+(r.current||'?')+(r.latest?'  ·  '+t('upd_new')+': '+r.latest:'')+'  ·  '+stx;
+        fill(uver,
+          h('div',{class:'vrow'},h('span',{class:'lbl',text:t('panel_ver')}),h('b',{class:'mono',text:r.panel_version||'?'}),h('span',{class:'tag mono',text:'UI '+(r.ui_build||'')})),
+          h('div',{class:'vrow'},h('span',{class:'lbl',text:t('core_commit')}),h('span',{class:'v mono',text:(r.current||'?')})),
+          r.built&&h('div',{class:'vrow'},h('span',{class:'lbl',text:t('upd_built')}),h('span',{class:'v mono',text:r.built})));
+        ubuild.textContent=(r.latest?t('upd_new')+' '+t('core_commit')+': '+r.latest+'  ·  ':'')+stx;
         ulog.textContent=r.log||'';ulog.scrollTop=ulog.scrollHeight;
         ubtn.disabled=(!r.available&&!r.failed)||!!r.running;
         if(r.running){clearInterval(S.timer);S.timer=setInterval(()=>uref(false),3000)} else if(S.timer){clearInterval(S.timer);S.timer=null}
@@ -5137,7 +5179,7 @@ async function viewSettings(m){
     ucheck.onclick=()=>uref(true);
     uref(true);
     sections.push(
-      h('div',{class:'card'},h('b',{text:t('upd_title')}),h('div',{class:'hint',text:t('upd_hint')}),ubuild,h('div',{class:'row'},ubtn,ucheck),ulog));
+      h('div',{class:'card'},h('b',{text:t('upd_title')}),h('div',{class:'hint',text:t('upd_hint')}),uver,ubuild,h('div',{class:'row'},ubtn,ucheck),ulog));
   }
 
   m.replaceChildren(topbar,tabbar,h('div',{class:'stack'},...sections));
@@ -5777,6 +5819,12 @@ SHADOW_PANEL_PY_EOF
   if ! cmp -s "$PANEL_PY.new" "$PANEL_PY" 2>/dev/null; then PANEL_CHANGED=1; fi
   mv -f "$PANEL_PY.new" "$PANEL_PY"
   python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' || die "python >= 3.8 is required"
+  # Record the panel/UI release so the Update tab reflects it even when a later
+  # core build fails (build-info's commit= is only rewritten on a good build).
+  if [[ -f $BUILD_INFO ]]; then
+    { grep -v '^panel_version=' "$BUILD_INFO" 2>/dev/null; printf 'panel_version=%s\n' "$SHADOW_RELEASE"; } >"$BUILD_INFO.tmp" && mv -f "$BUILD_INFO.tmp" "$BUILD_INFO"
+    chmod 0644 "$BUILD_INFO"
+  fi
 }
 
 link_prefill() { # let the operator paste the setup link produced by the other side
@@ -6100,6 +6148,14 @@ main() {
   setup_panel
   summary
   final_report
+  if (( ${BUILD_FAILED:-0} )); then
+    warn "=================================================================="
+    warn "Core build FAILED. The panel, CLI and UI WERE updated (version $SHADOW_RELEASE),"
+    warn "but the tunnel keeps running the previous core binary. Fix the error"
+    warn "shown above and run 'shadowtun update' again to rebuild the core."
+    warn "=================================================================="
+    exit 1
+  fi
 }
 
 if [[ -z ${BASH_SOURCE[0]-} || ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
