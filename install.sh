@@ -1921,20 +1921,24 @@ class Monitor(object):
         return s
 
     def net_rate(self, iface):
+        """Returns (rx_rate, tx_rate, rx_total, tx_total) for `iface`. The totals
+        are the kernel's lifetime (since-boot) byte counters for that interface;
+        if several tunnels share one interface, these totals are the interface's,
+        not an individual tunnel's."""
         rx = tx = None
         for line in read_text("/proc/net/dev").splitlines():
             if line.strip().startswith(iface + ":"):
                 f = line.split(":", 1)[1].split()
                 rx, tx = int(f[0]), int(f[8])
         if rx is None:
-            return 0, 0
+            return 0, 0, 0, 0
         now = time.time()
         prev = self.prev_net.get(iface)
         self.prev_net[iface] = (rx, tx, now)
         if not prev or now - prev[2] <= 0:
-            return 0, 0
+            return 0, 0, rx, tx
         dt = now - prev[2]
-        return max(0, int((rx - prev[0]) / dt)), max(0, int((tx - prev[1]) / dt))
+        return max(0, int((rx - prev[0]) / dt)), max(0, int((tx - prev[1]) / dt)), rx, tx
 
     def proc_metrics(self, pid):
         if pid <= 0:
@@ -1963,7 +1967,36 @@ class Monitor(object):
         if pid <= 0:
             return 0
         rc, out, _ = run([SS, "-H", "-tnp", "state", "established"])
-        return len([l for l in out.splitlines() if "pid=%d," % pid in l])
+        n = len([l for l in out.splitlines() if "pid=%d," % pid in l])
+        if n == 0:
+            n = max(n, self._conns_via_fd(pid))
+        return n
+
+    @staticmethod
+    def _conns_via_fd(pid):
+        """Fallback used when `ss`'s pid= annotation misses a process (seen on some
+        iproute2/kernel combinations): cross-reference the process's open socket fds
+        against /proc/net/tcp's own established (state 01) entries."""
+        try:
+            fds = os.listdir("/proc/%d/fd" % pid)
+        except OSError:
+            return 0
+        inodes = set()
+        for fd in fds:
+            try:
+                tgt = os.readlink("/proc/%d/fd/%s" % (pid, fd))
+            except OSError:
+                continue
+            if tgt.startswith("socket:["):
+                inodes.add(tgt[8:-1])
+        if not inodes:
+            return 0
+        n = 0
+        for line in read_text("/proc/net/tcp").splitlines()[1:]:
+            f = line.split()
+            if len(f) > 9 and f[3] == "01" and f[9] in inodes:
+                n += 1
+        return n
 
     # -- journal
     def read_journal(self, role):
@@ -2022,13 +2055,13 @@ class Monitor(object):
             if iface in ("", "auto") or not iface:
                 iface = self.iface_cache.get(inst.name) or detect_iface(cfg.get("real_ip", "")) or ""
                 self.iface_cache[inst.name] = iface
-            rx, tx = self.net_rate(iface) if iface else (0, 0)
+            rx, tx, rx_tot, tx_tot = self.net_rate(iface) if iface else (0, 0, 0, 0)
             listening = None
             if inst.role == "client" and cfg.get("socks5_port"):
                 listening = port_listening(cfg["socks5_port"], True)
             w = win[inst.name]
             out[inst.name] = dict(st, unit=inst.unit, role=inst.role, cpu=cpu, rss=rss, conns=n_conn, iface=iface,
-                                  rx=rx, tx=tx, listening=listening,
+                                  rx=rx, tx=tx, net_totals={"rx": rx_tot, "tx": tx_tot}, listening=listening,
                                   log5={"info": w["INFO"], "warn": w["WARN"], "error": w["ERROR"]},
                                   totals=dict(self.totals[inst.name]), last_established=self.last_est.get(inst.name, 0))
             h = self.hist.setdefault(inst.name, _hist())
@@ -2203,7 +2236,7 @@ def describe(inst, props, st):
     m = (st or {}).get("instances", {}).get(inst.name, {})
     d = {"name": inst.name, "unit": inst.unit, "role": inst.role, "config": redact(cfg)}
     d.update(s)
-    for k in ("cpu", "rss", "conns", "iface", "rx", "tx", "listening", "log5", "totals", "last_established"):
+    for k in ("cpu", "rss", "conns", "iface", "rx", "tx", "net_totals", "listening", "log5", "totals", "last_established"):
         if k in m:
             d[k] = m[k]
     d["history"] = ((st or {}).get("history", {}) or {}).get(inst.name, {})
@@ -2952,7 +2985,7 @@ def _restart_panel_soon():
 
 
 def api_panel_cfg(req):
-    """Change the panel's own bind address / port / TLS, then restart it.
+    """Change the panel's own bind address / port / path / TLS, then restart it.
     The caller will have to reconnect on the new address."""
     d = req.json if isinstance(req.json, dict) else {}
     p = load_panel()
@@ -2969,15 +3002,37 @@ def api_panel_cfg(req):
         p["bind"] = b; changed.append("bind")
     if "tls" in d:
         p["tls"] = bool(d.get("tls")); changed.append("tls")
+    if "path" in d:
+        path = str(d.get("path", "")).strip().strip("/")
+        if path and not re.match(r"^[A-Za-z0-9_-]{1,64}$", path):
+            raise ApiError(400, "path may only contain letters, digits, _ and -")
+        p["path"] = path; changed.append("path")
     if not changed:
         raise ApiError(400, "nothing to change")
     save_panel(p)
     if p.get("tls"):
         run([CTL, "panel", "tls", "on"], timeout=30)  # ensures a cert exists
     _restart_panel_soon()
+    url = panel_url(p)  # panel_url() already appends the path
     return {"ok": True, "changed": changed, "bind": p.get("bind"), "port": p.get("port"),
-            "tls": bool(p.get("tls")),
-            "note": "panel is restarting - reconnect on %s:%s" % (p.get("bind"), p.get("port"))}
+            "tls": bool(p.get("tls")), "path": p.get("path", ""),
+            "note": "panel is restarting - reconnect on %s" % url}
+
+
+def api_panel_restart_now(req):
+    """Restart the panel process itself, unconditionally (no config change)."""
+    _restart_panel_soon()
+    return {"ok": True, "note": "panel is restarting"}
+
+
+def api_core_restart(req):
+    """Restart every tunnel instance's systemd unit (the Rust client/server
+    process) - not the panel. Mirrors candyctl/shadowctl 'restart' for all."""
+    results = []
+    for inst in instances():
+        rc, out, err = ctl("restart", inst.unit)
+        results.append({"name": inst.name, "ok": rc == 0, "error": (err or out).strip()[:200] if rc else ""})
+    return {"ok": all(r["ok"] for r in results), "results": results}
 
 
 def api_panel_toggle(req):
@@ -2995,29 +3050,135 @@ def api_panel_toggle(req):
 
 # ── peer sync (two panels paired by a shared token) ─────────────────────────
 
+def _socks5_connect(proxy_host, proxy_port, dest_host, dest_port, timeout):
+    """Open `dest_host:dest_port` through a SOCKS5 CONNECT via `proxy_host:proxy_port`
+    (no auth). Used only for the panel-to-panel sync HTTP call below - never for
+    tunnel data, which the Rust core handles entirely on its own."""
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(b"\x05\x01\x00")                      # ver5, 1 method, no-auth
+        resp = _recv_exact(sock, 2)
+        if resp[0:1] != b"\x05" or resp[1:2] != b"\x00":
+            raise OSError("SOCKS5 proxy refused no-auth (reply %r)" % resp)
+        host_b = dest_host.encode()
+        req = b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + struct.pack(">H", dest_port)
+        sock.sendall(req)
+        head = _recv_exact(sock, 4)
+        if head[1:2] != b"\x00":
+            raise OSError("SOCKS5 CONNECT failed (code %d)" % head[1])
+        atyp = head[3]
+        if atyp == 1:
+            _recv_exact(sock, 4 + 2)
+        elif atyp == 4:
+            _recv_exact(sock, 16 + 2)
+        elif atyp == 3:
+            n = _recv_exact(sock, 1)[0]
+            _recv_exact(sock, n + 2)
+        else:
+            raise OSError("SOCKS5 CONNECT: bad address type %d" % atyp)
+        return sock
+    except Exception:
+        sock.close()
+        raise
+
+
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("SOCKS5 proxy closed the connection")
+        buf += chunk
+    return buf
+
+
+def _http_over_socket(sock, method, host, path, headers, body, timeout):
+    """Minimal HTTP/1.1 client over an already-connected socket. Both ends of a
+    sync call are this same panel, which always sends an explicit Content-Length
+    (never chunked), so a full RFC-compliant client is not needed."""
+    sock.settimeout(timeout)
+    hdr = {"Host": host, "Connection": "close"}
+    hdr.update(headers or {})
+    if body is not None:
+        hdr["Content-Length"] = str(len(body))
+    lines = ["%s %s HTTP/1.1" % (method, path)]
+    lines += ["%s: %s" % (k, v) for k, v in hdr.items()]
+    req = ("\r\n".join(lines) + "\r\n\r\n").encode()
+    sock.sendall(req + (body or b""))
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise OSError("connection closed before headers were received")
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    lines = head.decode("iso-8859-1").split("\r\n")
+    status = int(lines[0].split()[1])
+    clen = None
+    for line in lines[1:]:
+        if line.lower().startswith("content-length:"):
+            clen = int(line.split(":", 1)[1].strip())
+    body_buf = rest
+    if clen is not None:
+        while len(body_buf) < clen:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            body_buf += chunk
+        body_buf = body_buf[:clen]
+    else:
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            body_buf += chunk
+    return status, body_buf
+
+
 def _peer_request(method, path, body=None, timeout=8):
     p = load_panel()
     base = str(p.get("peer_url") or "").rstrip("/")
     tok = str(p.get("sync_token") or "")
     if not base or not tok:
         raise ApiError(400, "peer not paired - set the peer URL and a shared token in Settings")
+    proxy = str(p.get("sync_proxy") or "").strip()
     data = json.dumps(body).encode() if body is not None else None
-    r = urllib.request.Request(base + path, data=data, method=method,
-                               headers={"X-Sync-Token": tok, "Content-Type": "application/json"})
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE  # panels usually use self-signed certs
+    u = urllib.parse.urlparse(base)
+    https = u.scheme == "https"
+    host = u.hostname or ""
+    port = u.port or (443 if https else 80)
+    req_path = (u.path.rstrip("/") + path) if u.path else path
+    headers = {"X-Sync-Token": tok, "Content-Type": "application/json"}
     try:
-        with urllib.request.urlopen(r, timeout=timeout, context=ctx) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
+        if proxy:
+            ph, _, pp = proxy.partition(":")
+            sock = _socks5_connect(ph, int(pp or "1080"), host, port, timeout)
+        else:
+            sock = socket.create_connection((host, port), timeout=timeout)
         try:
-            msg = json.loads(e.read().decode()).get("error", str(e))
-        except Exception:
-            msg = "HTTP %s" % e.code
-        raise ApiError(502, "peer: %s" % msg)
+            if https:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE  # panels usually use self-signed certs
+                sock = ctx.wrap_socket(sock, server_hostname=host)
+            status, raw = _http_over_socket(sock, method, "%s:%s" % (host, port), req_path, headers, data, timeout)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    except ApiError:
+        raise
     except Exception as e:
-        raise ApiError(502, "peer unreachable: %s" % e)
+        raise ApiError(502, "peer unreachable%s: %s" % (" via proxy" if proxy else "", e))
+    try:
+        parsed = json.loads(raw.decode()) if raw else {}
+    except ValueError:
+        parsed = {}
+    if status >= 400:
+        raise ApiError(502, "peer: %s" % (parsed.get("error") or ("HTTP %d" % status)))
+    return parsed
 
 
 def api_sync_overview(req):
@@ -3052,7 +3213,8 @@ def api_sync_apply(req):
 
 def api_peer_get(req):
     p = load_panel()
-    return {"peer_url": p.get("peer_url", ""), "paired": bool(p.get("sync_token"))}
+    return {"peer_url": p.get("peer_url", ""), "paired": bool(p.get("sync_token")),
+            "sync_proxy": p.get("sync_proxy", "")}
 
 
 def api_peer_set(req):
@@ -3067,6 +3229,13 @@ def api_peer_set(req):
         if u and not (u.startswith("http://") or u.startswith("https://")):
             raise ApiError(400, "peer_url must start with http:// or https://")
         p["peer_url"] = u
+    if "sync_proxy" in d:
+        sp = str(d.get("sync_proxy", "")).strip()
+        if sp:
+            host, _, port = sp.partition(":")
+            if not host or not port.isdigit() or not (1 <= int(port) <= 65535):
+                raise ApiError(400, "sync_proxy must look like host:port")
+        p["sync_proxy"] = sp
     reveal = None
     if d.get("generate"):
         reveal = secrets.token_urlsafe(32); p["sync_token"] = reveal
@@ -3074,7 +3243,7 @@ def api_peer_set(req):
         p["sync_token"] = str(d.get("sync_token")).strip()
     save_panel(p)
     return {"ok": True, "paired": bool(p.get("sync_token")), "peer_url": p.get("peer_url", ""),
-            "sync_token": reveal}
+            "sync_proxy": p.get("sync_proxy", ""), "sync_token": reveal}
 
 
 UPDATE_LOG = os.path.join(STATE, "update.log")
@@ -3224,6 +3393,11 @@ h2{font-size:15px;margin:22px 0 10px;color:var(--mut);font-weight:600;text-trans
 .pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;border:1px solid var(--line);color:var(--mut)}
 .pill.ok{color:var(--ok);border-color:#1f5b44;background:#12301f}.pill.warn{color:var(--warn);border-color:#6b4f17;background:#2a2110}.pill.bad{color:var(--bad);border-color:#6b2530;background:#2c1118}
 .tag{font-size:11px;padding:1px 7px;border-radius:6px;background:#202942;color:var(--acc2)}
+.settop{margin-bottom:14px}
+.stabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:16px;padding-bottom:0;border-bottom:1px solid var(--line)}
+.stabs button{background:none;border:0;border-bottom:2px solid transparent;padding:9px 12px;color:var(--mut);cursor:pointer;font-weight:600;font-size:13px}
+.stabs button:hover{color:var(--tx)}
+.stabs button.on{color:var(--acc2);border-bottom-color:var(--acc2)}
 .btn{background:#1b2338;border:1px solid var(--line);padding:8px 13px;border-radius:11px;cursor:pointer;font-weight:600}
 .btn:hover{border-color:#3c4c78;transform:translateY(-1px)}.btn:active{transform:translateY(0)}.btn.pri{background:var(--grad);color:#fff;border-color:transparent;box-shadow:0 8px 20px -8px var(--acc)}.btn.pri:hover{filter:brightness(1.07)}.btn.dng{color:var(--bad)}.btn.dng:hover{border-color:var(--bad)}.btn.sm{padding:5px 10px;font-size:12px}
 .btn:disabled{opacity:.5;cursor:default}
@@ -3435,32 +3609,74 @@ input[type=range],input[type=checkbox],.login .rem input{accent-color:var(--acc)
 .modal{backdrop-filter:blur(calc(var(--ubc,30px)*1.2)) saturate(170%);-webkit-backdrop-filter:blur(calc(var(--ubc,30px)*1.2)) saturate(170%)}
 
 /* ===== v13: crisp shapes behind the boxes so the frosted blur is actually visible ===== */
-#bg .o{position:absolute;border-radius:50%;opacity:calc(.6*var(--ushape,1));background:linear-gradient(135deg,var(--oa,#3b82f6),var(--ob,#7dd3fc));will-change:transform;animation-play-state:var(--uplay,running)}
-#bg .o1{width:190px;height:190px;left:11%;top:15%;animation:fl1 28s ease-in-out infinite;animation-duration:calc(28s*var(--uspd,1))}
-#bg .o2{width:120px;height:120px;right:15%;top:34%;animation:fl2 34s ease-in-out infinite;animation-duration:calc(34s*var(--uspd,1))}
-#bg .o3{width:240px;height:240px;left:34%;bottom:6%;animation:fl3 40s ease-in-out infinite;animation-duration:calc(40s*var(--uspd,1))}
-#bg .o4{width:100px;height:100px;right:28%;bottom:24%;animation:fl2 30s ease-in-out infinite reverse;animation-duration:calc(30s*var(--uspd,1))}
-#bg .rg{position:absolute;border-radius:50%;border:2px solid rgba(255,255,255,.22);opacity:var(--ushape,1);animation-play-state:var(--uplay,running)}
-#bg .g1{width:430px;height:430px;left:-70px;top:40%;animation:fl3 46s ease-in-out infinite;animation-duration:calc(46s*var(--uspd,1))}
-#bg .g2{width:300px;height:300px;right:7%;top:-80px;animation:fl1 36s ease-in-out infinite;animation-duration:calc(36s*var(--uspd,1))}
-@keyframes fl1{0%,100%{transform:translate(0,0)}50%{transform:translate(46px,-38px)}}
-@keyframes fl2{0%,100%{transform:translate(0,0)}50%{transform:translate(-52px,34px)}}
-@keyframes fl3{0%,100%{transform:translate(0,0)}33%{transform:translate(34px,30px)}66%{transform:translate(-30px,-26px)}}
-html[data-theme=light] #bg .o{opacity:calc(.32*var(--ushape,1))}
-html[data-theme=light] #bg .rg{border-color:rgba(30,40,80,.16)}
 #bg::after{background-image:linear-gradient(rgba(255,255,255,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.045) 1px,transparent 1px)}
 html[data-theme=light] #bg::after{background-image:linear-gradient(rgba(30,40,80,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(30,40,80,.022) 1px,transparent 1px)}
-@media(prefers-reduced-motion:reduce){#bg .o,#bg .rg{animation:none}}
+
+/* ===== v14: redesigned stat/tunnel cards, charts, heartbeat, responsive tuning ===== */
+.card.stat{display:flex;flex-direction:column;gap:2px}
+.lbl.sub{min-height:14px}
+.chartwrap{margin:8px 0 2px}
+.chartwrap.dual{display:flex;flex-direction:column;gap:2px;margin:6px 0 2px}
+.chartwrap.dual .mchart{height:26px}
+.mchart{width:100%;height:46px;display:block;overflow:visible}
+.mchart .mline{stroke:var(--acc2);stroke-width:1.6;vector-effect:non-scaling-stroke}
+.mchart .marea{opacity:.9}
+.mchart .gs1{stop-color:var(--acc2);stop-opacity:.34}
+.mchart .gs2{stop-color:var(--acc2);stop-opacity:0}
+.mchart.pink .mline{stroke:var(--acc)}.mchart.pink .gs1{stop-color:var(--acc);stop-opacity:.34}.mchart.pink .gs2{stop-color:var(--acc);stop-opacity:0}
+.mchart.grn .mline{stroke:var(--ok)}.mchart.grn .gs1{stop-color:var(--ok);stop-opacity:.3}.mchart.grn .gs2{stop-color:var(--ok);stop-opacity:0}
+.mchart.up .mline{stroke:var(--acc)}.mchart.up .gs1{stop-color:var(--acc);stop-opacity:.3}.mchart.up .gs2{stop-color:var(--acc);stop-opacity:0}
+.mchart.dn .mline{stroke:var(--acc2)}.mchart.dn .gs1{stop-color:var(--acc2);stop-opacity:.3}.mchart.dn .gs2{stop-color:var(--acc2);stop-opacity:0}
+.mchart .mflat{stroke:var(--line);stroke-width:1;stroke-dasharray:3 4}
+.cstats{display:flex;justify-content:space-between;font-size:11px;color:var(--mut);letter-spacing:.3px;margin-top:2px}
+.loadrow{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin:6px 0 4px;text-align:center}
+.loaditem{padding:4px 0}
+.big.sm{font-size:19px}
+.pill.beat{display:inline-flex;align-items:center;gap:6px}
+.pill .hb{position:relative;width:6px;height:6px;border-radius:50%;background:currentColor;flex:0 0 auto}
+.pill .hb::after{content:'';position:absolute;inset:-4px;border-radius:50%;border:1.4px solid currentColor;opacity:.65;animation:hbring 1.7s ease-out infinite}
+@keyframes hbring{0%{transform:scale(.3);opacity:.7}100%{transform:scale(2.1);opacity:0}}
+@media(prefers-reduced-motion:reduce){.pill .hb::after{animation:none;display:none}}
+.pill.sm{font-size:11px;padding:1px 8px}
+.linkbox{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 2px}
+.tcard .addr{margin:3px 0 0}
+.tcard.compact .kv.mini{grid-template-columns:1fr 1fr;gap:4px 12px;margin:8px 0 6px}
+.tcard.compact .kv.mini .v{font-size:13px}
+.tcard.full .kv{margin:12px 0}
+.subgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0 2px}
+.subcard{background:rgba(0,0,0,.18);border:1px solid var(--gl);border-radius:calc(var(--r) - 4px);padding:12px}
+html[data-theme=light] .subcard{background:rgba(20,30,70,.035)}
+.subhead{margin-bottom:2px}
+.subtitle{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut)}
+.trow{display:flex;gap:16px;margin:4px 0}
+.trow.sm{margin-top:8px;padding-top:8px;border-top:1px dashed var(--gl)}
+.titem{display:flex;flex-direction:column;gap:1px}
+.titem .v{font-weight:700;font-size:15px}
+.titem .v.sm{font-size:12px;font-weight:600;color:var(--mut)}
+.lbl.up{color:var(--acc)}.lbl.dn{color:var(--acc2)}
+.lbl.ospeed{margin-top:6px;font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.row.acts{margin-top:14px;gap:6px}
+.grid.wide{grid-template-columns:repeat(auto-fill,minmax(360px,1fr))}
+/* ---- responsive v14 ---- */
+@media(max-width:760px){
+  .subgrid{grid-template-columns:1fr}
+  .grid.wide{grid-template-columns:1fr}
+  .loadrow{gap:2px}
+}
+@media(max-width:420px){
+  .trow{gap:10px}
+  .row.acts .btn{flex:1 1 auto}
+}
 </style>
 </head>
 <body>
-<div id="bg" aria-hidden="true"><i class="b1"></i><i class="b2"></i><i class="b3"></i><i class="b4"></i><b class="o o1"></b><b class="o o2"></b><b class="o o3"></b><b class="o o4"></b><b class="rg g1"></b><b class="rg g2"></b></div>
+<div id="bg" aria-hidden="true"><i class="b1"></i><i class="b2"></i><i class="b3"></i><i class="b4"></i></div>
 <div id="app"></div>
 <script nonce="__NONCE__">
 'use strict';
 const UIV='__UIV__';
 /* ---------- user UI preferences (stored in this browser) ---------- */
-const UI_DEF={theme:'dark',pal:'default',blur:30,cblur:30,shapes:true,glass:100,bg:100,anim:true,speed:1,grid:true,radius:16,compact:false};
+const UI_DEF={theme:'dark',pal:'default',blur:30,cblur:30,glass:100,bg:100,anim:true,speed:1,grid:true,radius:16,compact:false};
 let UI=Object.assign({},UI_DEF);
 try{const j=JSON.parse(localStorage.getItem('ui')||'null');if(j&&typeof j==='object'){Object.assign(UI,j);if(j.cblur==null&&j.blur!=null)UI.cblur=j.blur}else{const th=localStorage.getItem('theme');if(th==='light'||th==='dark')UI.theme=th}}catch(e){}
 const PAL={
@@ -3484,8 +3700,6 @@ function applyUI(){
   pal.c.forEach((c,i)=>st.setProperty('--c'+(i+1),c));
   st.setProperty('--ub',UI.blur+'px');
   st.setProperty('--ubc',UI.cblur+'px');
-  st.setProperty('--ushape',UI.shapes?'1':'0');
-  st.setProperty('--oa',pal.g[0]);st.setProperty('--ob',pal.g[1]);
   const gl=GLASS[th],f=UI.glass/100,rg=a=>'rgba('+a[0]+','+a[1]+','+a[2]+','+Math.max(.12,Math.min(.98,a[3]*f)).toFixed(3)+')';
   st.setProperty('--g1',rg(gl.g1));st.setProperty('--g2',rg(gl.g2));
   st.setProperty('--ubg',(UI.bg/100).toFixed(2));
@@ -3500,9 +3714,13 @@ try{matchMedia('(prefers-color-scheme: light)').addEventListener('change',()=>{i
 /* ---------- i18n ---------- */
 const TR = {
 en: {
- ev_tab:'Events', upd_failed:'update failed - see the log below', ui_title:'Appearance & UI', ui_hint:'Visual preferences for this browser only (saved locally). Changes apply instantly.', ui_theme:'Theme', ui_pal:'Colour palette', ui_blur:'Menu & header blur', ui_cblur:'Box (card) blur', ui_glass:'Glass opacity', ui_bg:'Background colour strength', ui_radius:'Corner roundness', ui_speed:'Background motion speed', ui_anim:'Animate background', ui_shapes:'Glass shapes behind boxes', ui_grid:'Show grid', ui_compact:'Compact cards', ui_reset:'Reset to defaults', th_dark:'Dark', th_light:'Light', th_auto:'Auto (system)', pal_default:'Blue', pal_pink:'Pink / Purple', pal_ocean:'Ocean', pal_emerald:'Emerald', pal_sunset:'Sunset', pal_mono:'Mono', sp_slow:'Slow', sp_norm:'Normal', sp_fast:'Fast', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
+ ev_tab:'Events', upd_failed:'update failed - see the log below', ui_title:'Appearance & UI', ui_hint:'Visual preferences for this browser only (saved locally). Changes apply instantly.', ui_theme:'Theme', ui_pal:'Colour palette', ui_blur:'Menu & header blur', ui_cblur:'Box (card) blur', ui_glass:'Glass opacity', ui_bg:'Background colour strength', ui_radius:'Corner roundness', ui_speed:'Background motion speed', ui_anim:'Animate background', ui_grid:'Show grid', ui_compact:'Compact cards', ui_reset:'Reset to defaults', th_dark:'Dark', th_light:'Light', th_auto:'Auto (system)', pal_default:'Blue', pal_pink:'Pink / Purple', pal_ocean:'Ocean', pal_emerald:'Emerald', pal_sunset:'Sunset', pal_mono:'Mono', sp_slow:'Slow', sp_norm:'Normal', sp_fast:'Fast', remember:'Keep me signed in on this device (30 days)', sec_general:'General', sec_addr:'Addresses', sec_port:'Ports & interface', sec_perf:'Performance', sec_rel:'Reliability & restart', sec_sec:'Security', f_autorestart:'Auto-restart', h_autorestart:'What systemd does if the tunnel process exits', ar_fail:'On failure (default)', ar_always:'Always', ar_no:'Never', f_restartsec:'Restart delay (seconds)', link_check:'checking link…', link_ok:'link OK', link_down:'peer unreachable', hs:'handshake', no_hs:'no handshake yet', peer_panel:'peer panel', theme:'Theme', upd_title:'Update', upd_hint:'Rebuilds from the latest release and restarts services. Your tunnels, keys and config are kept (a backup is taken first).', upd_cur:'current', upd_new:'latest', upd_now:'Update now', upd_check:'Check for update', upd_running:'update running…', upd_avail:'update available', upd_latest:'Your version is up to date', upd_warn:'Start the update now? The panel restarts during the update and you will have to sign in again.', upd_started:'update started', upd_reconnect:'panel is restarting… reconnecting', overview:'Overview', tunnels:'Tunnels', logs:'Logs', health:'Health', diagnose:'Diagnose', settings:'Settings', login:'Sign in', password:'Password', logout:'Sign out',
+ restart_panel:'Restart Panel', restart_core:'Restart Core', restart_panel_warn:'Restart the web panel now? You will be disconnected for a few seconds.', restart_core_warn:'Restart every tunnel now? Active connections on all tunnels will drop briefly.', restart_core_ok:'all tunnels restarted', restart_core_part:'some tunnels failed to restart - check Diagnose',
+ tab_general:'General', tab_appearance:'Appearance', tab_panel:'Web Panel', tab_peer:'Peer Sync', tab_security:'Security', tab_update:'Update',
+ panel_path:'Custom URL path (optional)', panel_path_ph:'leave empty for none', panel_path_hint:'Serve the panel under an extra secret path, e.g. https://host:port/thispath — harder to find by scanning. Empty = served at the root, as now.',
+ sync_proxy:'Sync via SOCKS5 proxy (optional)', sync_proxy_ph:'e.g. 127.0.0.1:1080', sync_proxy_hint:'Routes only this panel’s sync calls to the peer panel through a SOCKS5 proxy (e.g. this node’s own tunnel SOCKS5 port) — never the tunnel data itself. Useful when the two panels can’t reach each other directly but a tunnel can. Empty = connect directly.',
  diag_title:'Tunnel doctor', diag_hint:'Checks the whole tunnel path and names the setting at fault. Paste the OTHER host’s setup link for a two-sided check (ports, ICMP id, key and spoofed-IP pairing).', peer_link:'Peer setup link (optional)', run_diag:'Run diagnosis', mtu_for:'test tunnel:', mtu_test:'MTU test', mtu_path:'path MTU', mtu_rec:'recommended', mtu_cur:'current', mtu_apply:'Apply recommended',
- cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load / uptime', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX',
+ cpu:'CPU', mem:'Memory', disk:'Disk', load:'Load', uptime:'Uptime', restarts:'Auto-restarts', rss:'RAM', conns:'Connections', rx:'RX', tx:'TX', cavg:'AVG', cpeak:'PEAK', traffic:'Traffic', overall_speed:'live', overall_label:'Overall speed', upload:'Upload', download:'Download', sent:'Sent', received:'Received', conn_stats:'Connection Stats', conn_local:'local', conn_sessions:'sessions', open_sockets:'open sockets', client:'client', server:'server',
  active:'active', inactive:'stopped', failed:'failed', activating:'starting', monitor_down:'The monitor service is not running - metrics and history are unavailable.',
  events:'Recent events', none:'Nothing yet', details:'Details', start:'Start', stop:'Stop', restart:'Restart', del:'Delete', edit:'Edit', test:'Link test', key:'Key & link', link:'Setup link',
  create:'Create tunnel', import:'Import link', cancel:'Cancel', save:'Save', close:'Close', confirm_del:'Delete tunnel "%s"? Its service and config are removed.',
@@ -3518,9 +3736,13 @@ en: {
  note_key:'The pre-shared key authenticates every packet (HMAC). Both sides must use the identical key.', srv_test_hint:'Listens for client packets for 10 s. Press Run here, then run the test on the client at the same time.', no_tunnels:'No tunnels yet.', warnings:'Warnings'
 },
 fa: {
- ev_tab:'رویدادها', upd_failed:'آپدیت ناموفق بود - لاگ را ببین', ui_title:'ظاهر و رابط کاربری', ui_hint:'تنظیمات ظاهری فقط برای همین مرورگر (به‌صورت محلی ذخیره می‌شود). تغییرات فوراً اعمال می‌شود.', ui_theme:'تم', ui_pal:'پالت رنگ', ui_blur:'بلور منو و هدر', ui_cblur:'بلور باکس‌ها (کارت‌ها)', ui_glass:'شفافیت شیشه', ui_bg:'شدت رنگ بک‌گراند', ui_radius:'گردی گوشه‌ها', ui_speed:'سرعت حرکت بک‌گراند', ui_anim:'بک‌گراند متحرک', ui_shapes:'اشکال شیشه‌ای پشت باکس‌ها', ui_grid:'نمایش شبکه', ui_compact:'کارت‌های فشرده', ui_reset:'بازگشت به پیش‌فرض', th_dark:'تیره', th_light:'روشن', th_auto:'خودکار (سیستم)', pal_default:'آبی', pal_pink:'صورتی / بنفش', pal_ocean:'اقیانوسی', pal_emerald:'زمردی', pal_sunset:'غروب', pal_mono:'تک‌رنگ', sp_slow:'آهسته', sp_norm:'معمولی', sp_fast:'سریع', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
+ ev_tab:'رویدادها', upd_failed:'آپدیت ناموفق بود - لاگ را ببین', ui_title:'ظاهر و رابط کاربری', ui_hint:'تنظیمات ظاهری فقط برای همین مرورگر (به‌صورت محلی ذخیره می‌شود). تغییرات فوراً اعمال می‌شود.', ui_theme:'تم', ui_pal:'پالت رنگ', ui_blur:'بلور منو و هدر', ui_cblur:'بلور باکس‌ها (کارت‌ها)', ui_glass:'شفافیت شیشه', ui_bg:'شدت رنگ بک‌گراند', ui_radius:'گردی گوشه‌ها', ui_speed:'سرعت حرکت بک‌گراند', ui_anim:'بک‌گراند متحرک', ui_grid:'نمایش شبکه', ui_compact:'کارت‌های فشرده', ui_reset:'بازگشت به پیش‌فرض', th_dark:'تیره', th_light:'روشن', th_auto:'خودکار (سیستم)', pal_default:'آبی', pal_pink:'صورتی / بنفش', pal_ocean:'اقیانوسی', pal_emerald:'زمردی', pal_sunset:'غروب', pal_mono:'تک‌رنگ', sp_slow:'آهسته', sp_norm:'معمولی', sp_fast:'سریع', remember:'مرا در این دستگاه وارد نگه دار (۳۰ روز)', sec_general:'عمومی', sec_addr:'آدرس‌ها', sec_port:'پورت و اینترفیس', sec_perf:'کارایی', sec_rel:'پایداری و ری‌استارت', sec_sec:'امنیت', f_autorestart:'ری‌استارت خودکار', h_autorestart:'اگر پروسهٔ تونل بسته شد systemd چه کند', ar_fail:'هنگام خطا (پیش‌فرض)', ar_always:'همیشه', ar_no:'هرگز', f_restartsec:'تأخیر ری‌استارت (ثانیه)', link_check:'در حال بررسی ارتباط…', link_ok:'ارتباط برقرار', link_down:'طرف مقابل در دسترس نیست', hs:'هندشیک', no_hs:'هنوز هندشیکی نشده', peer_panel:'پنل مقابل', theme:'تم', upd_title:'آپدیت', upd_hint:'از آخرین نسخه دوباره build می‌کند و سرویس‌ها را ری‌استارت می‌کند. تونل‌ها، کلیدها و کانفیگ حفظ می‌شود (قبلش بکاپ گرفته می‌شود).', upd_cur:'فعلی', upd_new:'آخرین', upd_now:'آپدیت کن', upd_check:'بررسی آپدیت', upd_running:'در حال آپدیت…', upd_avail:'آپدیت موجود است', upd_latest:'نسخه شما به‌روز است', upd_warn:'آپدیت همین حالا شروع شود؟ پنل وسط آپدیت ری‌استارت می‌شود و باید دوباره وارد شوی.', upd_started:'آپدیت شروع شد', upd_reconnect:'پنل در حال ری‌استارت است… اتصال مجدد', overview:'نمای کلی', tunnels:'تونل‌ها', logs:'لاگ‌ها', health:'سلامت', diagnose:'عیب‌یابی', settings:'تنظیمات', login:'ورود', password:'رمز عبور', logout:'خروج',
+ restart_panel:'ری‌استارت پنل', restart_core:'ری‌استارت Core', restart_panel_warn:'وب‌پنل همین حالا ری‌استارت شود؟ چند ثانیه قطع می‌شوی.', restart_core_warn:'همهٔ تونل‌ها همین حالا ری‌استارت شوند؟ اتصال‌های فعال روی همهٔ تونل‌ها لحظه‌ای قطع می‌شود.', restart_core_ok:'همهٔ تونل‌ها ری‌استارت شدند', restart_core_part:'ری‌استارت بعضی تونل‌ها ناموفق بود - Diagnose را ببین',
+ tab_general:'عمومی', tab_appearance:'ظاهر', tab_panel:'وب‌پنل', tab_peer:'سینک طرف مقابل', tab_security:'امنیت', tab_update:'آپدیت',
+ panel_path:'مسیر سفارشی لینک (اختیاری)', panel_path_ph:'برای نداشتن مسیر خالی بگذار', panel_path_hint:'پنل را زیر یک مسیر مخفیِ اضافه سرو کن، مثلاً https://host:port/thispath — پیداکردنش با اسکن سخت‌تر می‌شود. خالی = مثل الان روی ریشه.',
+ sync_proxy:'سینک از طریق پراکسی SOCKS5 (اختیاری)', sync_proxy_ph:'مثلاً 127.0.0.1:1080', sync_proxy_hint:'فقط درخواست‌های سینکِ این پنل با پنلِ طرف مقابل را از یک پراکسی SOCKS5 (مثلاً پورت SOCKS5 تونل همین نود) عبور می‌دهد — نه ترافیک خود تونل را. وقتی دو پنل مستقیم به هم نمی‌رسند ولی یک تونل می‌رسد مفید است. خالی = اتصال مستقیم.',
  diag_title:'دکتر تونل', diag_hint:'کل مسیر تونل را بررسی می‌کند و تنظیمِ اشتباه را نام می‌برد. برای بررسی دوطرفه، لینکِ راه‌اندازیِ طرف مقابل را بچسبانید (پورت‌ها، ICMP id، کلید و جفت‌شدنِ IP جعلی).', peer_link:'لینک راه‌اندازی طرف مقابل (اختیاری)', run_diag:'اجرای عیب‌یابی', mtu_for:'تست MTU برای:', mtu_test:'تست MTU', mtu_path:'MTU مسیر', mtu_rec:'پیشنهادی', mtu_cur:'فعلی', mtu_apply:'اعمال پیشنهادی',
- cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار / آپ‌تایم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال',
+ cpu:'پردازنده', mem:'حافظه', disk:'دیسک', load:'بار سیستم', uptime:'آپ‌تایم', restarts:'ری‌استارت خودکار', rss:'رم', conns:'اتصال‌ها', rx:'دریافت', tx:'ارسال', cavg:'میانگین', cpeak:'اوج', traffic:'ترافیک', overall_speed:'لحظه‌ای', overall_label:'سرعت کلی', upload:'آپلود', download:'دانلود', sent:'ارسال‌شده', received:'دریافت‌شده', conn_stats:'وضعیت اتصال', conn_local:'محلی', conn_sessions:'نشست‌ها', open_sockets:'سوکت باز', client:'کلاینت', server:'سرور',
  active:'فعال', inactive:'متوقف', failed:'خراب', activating:'در حال شروع', monitor_down:'سرویس مانیتور اجرا نیست؛ آمار و تاریخچه در دسترس نیست.',
  events:'رویدادهای اخیر', none:'هنوز چیزی نیست', details:'جزئیات', start:'شروع', stop:'توقف', restart:'ری‌استارت', del:'حذف', edit:'ویرایش', test:'تست لینک', key:'کلید و لینک', link:'لینک راه‌اندازی',
  create:'ساخت تونل', import:'وارد کردن لینک', cancel:'انصراف', save:'ذخیره', close:'بستن', confirm_del:'تونل «%s» حذف شود؟ سرویس و کانفیگ آن پاک می‌شود.',
@@ -3655,19 +3877,71 @@ function showView(){
 }
 
 /* ---------- overview ---------- */
-function statCard(label,val,sub,vals,cls){return h('div',{class:'card'},h('div',{class:'lbl',text:label}),h('div',{class:'big',text:val}),h('div',{class:'lbl',text:sub||'\u00a0'}),spark(vals,cls))}
-function pill(a){const m={active:'ok',failed:'bad',activating:'warn',inactive:''};return h('span',{class:'pill '+(m[a]||'warn'),text:t(a)})}
+let CHART_UID=0;
+function miniChart(vals,opts){
+  opts=opts||{};
+  const ns='http://www.w3.org/2000/svg',W=260,H=58,id='mc'+(++CHART_UID);
+  const svg=document.createElementNS(ns,'svg');
+  svg.setAttribute('viewBox',`0 0 ${W} ${H}`);svg.setAttribute('preserveAspectRatio','none');
+  svg.setAttribute('class','mchart'+(opts.cls?(' '+opts.cls):''));
+  const vv=((vals||[]).filter(v=>typeof v==='number'&&isFinite(v)));
+  const defs=document.createElementNS(ns,'defs');
+  const grad=document.createElementNS(ns,'linearGradient');grad.setAttribute('id',id);grad.setAttribute('x1','0');grad.setAttribute('y1','0');grad.setAttribute('x2','0');grad.setAttribute('y2','1');
+  const s1=document.createElementNS(ns,'stop');s1.setAttribute('offset','0%');s1.setAttribute('class','gs1');
+  const s2=document.createElementNS(ns,'stop');s2.setAttribute('offset','100%');s2.setAttribute('class','gs2');
+  grad.append(s1,s2);defs.append(grad);svg.append(defs);
+  if(vv.length<2){
+    const fl=document.createElementNS(ns,'line');fl.setAttribute('x1','0');fl.setAttribute('y1',H-3);fl.setAttribute('x2',W);fl.setAttribute('y2',H-3);fl.setAttribute('class','mflat');svg.append(fl);
+    return svg;
+  }
+  let max=1e-9;for(const v of vv) if(v>max) max=v;
+  const n=vv.length,pad=3,yof=v=>H-pad-(v/max)*(H-pad*2-4);
+  const pts=vv.map((v,i)=>[(i/(n-1)*W),yof(v)]);
+  const line=pts.map(pt=>pt.join(',')).join(' ');
+  const area='M0,'+H+' L'+line.split(' ').join(' L')+' L'+W+','+H+' Z';
+  if(opts.fill!==false){const ap=document.createElementNS(ns,'path');ap.setAttribute('d',area);ap.setAttribute('fill',`url(#${id})`);ap.setAttribute('class','marea');svg.append(ap)}
+  const pl=document.createElementNS(ns,'polyline');pl.setAttribute('points',line);pl.setAttribute('fill','none');pl.setAttribute('class','mline');svg.append(pl);
+  return svg;
+}
+function chartStats(vals,fmt){
+  fmt=fmt||(v=>Math.round(v).toLocaleString());
+  const vv=(vals||[]).filter(v=>typeof v==='number'&&isFinite(v));
+  if(!vv.length) return h('div',{class:'cstats'},h('span',{text:t('avg')+' —'}),h('span',{text:t('peak')+' —'}));
+  const avg=vv.reduce((a,b)=>a+b,0)/vv.length,peak=Math.max(...vv);
+  return h('div',{class:'cstats'},h('span',{text:t('cavg')+' '+fmt(avg)}),h('span',{text:t('cpeak')+' '+fmt(peak)}));
+}
+function statCard(label,val,sub,vals,cls,fmt){
+  return h('div',{class:'card stat'},
+    h('div',{class:'lbl',text:label}),
+    h('div',{class:'big',text:val}),
+    h('div',{class:'lbl sub',text:sub||' '}),
+    h('div',{class:'chartwrap'},miniChart(vals,{cls})),
+    chartStats(vals,fmt));
+}
+function loadCard(sy){
+  const l=(Array.isArray(sy.load)&&sy.load.length===3)?sy.load:[0,0,0];
+  return h('div',{class:'card stat'},
+    h('div',{class:'lbl',text:t('load')}),
+    h('div',{class:'loadrow'},
+      ['1','5','15'].map((mm,i)=>h('div',{class:'loaditem'},h('div',{class:'big sm',text:l[i].toFixed(2)}),h('div',{class:'lbl',text:mm+'m'})))),
+    h('div',{class:'lbl sub',text:t('uptime')+': '+fmtD(sy.uptime)}));
+}
+function pill(a){
+  const m={active:'ok',failed:'bad',activating:'warn',inactive:''};
+  const cls=m[a]||'warn';
+  return h('span',{class:'pill '+cls+(a==='active'?' beat':'')},a==='active'&&h('i',{class:'hb'}),t(a));
+}
 function viewOverview(m){
   const o=S.ov,sy=o.system||{},sh=o.sys_history||{};
   fill(m,
     !o.monitor_up&&h('div',{class:'banner',text:t('monitor_down')}),
     h('div',{class:'grid'},
-      statCard(t('cpu'),(sy.cpu??0)+'%','',sh.cpu,'pink'),
-      statCard(t('mem'),sy.mem_total?Math.round(100*sy.mem_used/sy.mem_total)+'%':'-',fmtB(sy.mem_used)+' / '+fmtB(sy.mem_total),sh.mem),
+      statCard(t('cpu'),(sy.cpu??0)+'%','',sh.cpu,'pink',v=>v.toFixed(0)+'%'),
+      statCard(t('mem'),sy.mem_total?Math.round(100*sy.mem_used/sy.mem_total)+'%':'-',fmtB(sy.mem_used)+' / '+fmtB(sy.mem_total),sh.mem,'',v=>v.toFixed(0)+'%'),
       statCard(t('disk'),sy.disk_total?Math.round(100*sy.disk_used/sy.disk_total)+'%':'-',fmtB(sy.disk_used)+' / '+fmtB(sy.disk_total)),
-      statCard(t('load'),(Array.isArray(sy.load)&&sy.load.length?sy.load[0].toFixed(2):'-'),fmtD(sy.uptime))),
+      loadCard(sy)),
     h('h2',{text:t('tunnels')}),
-    o.tunnels.length?h('div',{class:'grid'},o.tunnels.map(tc)):h('div',{class:'card',text:t('no_tunnels')})
+    o.tunnels.length?h('div',{class:'grid'},o.tunnels.map(x=>tc(x,false))):h('div',{class:'card',text:t('no_tunnels')})
   );
 }
 function viewEvents(m){
@@ -3688,43 +3962,71 @@ function refreshPings(){
 }
 function linkBox(x){
   const pg=PING[x.name],now=S.ov.now,hs=x.last_established;
-  const chip=(c,txt)=>h('span',{class:'pill '+c,text:txt});
+  const chip=(c,txt)=>h('span',{class:'pill sm '+c,text:txt});
   if(!pg) return h('div',{class:'linkbox'},chip('warn',t('link_check')));
   const reach=pg.ping_ms!=null||pg.tcp_ms!=null||(hs&&now-hs<600);
   const parts=[chip(reach?'ok':'bad',reach?t('link_ok'):t('link_down')),
-    chip(pg.ping_ms!=null?'ok':'warn',pg.ping_ms!=null?'ping '+pg.ping_ms+' ms':'ping \u2014')];
+    chip(pg.ping_ms!=null?'ok':'warn',pg.ping_ms!=null?'ping '+pg.ping_ms+' ms':'ping —')];
   if(pg.tcp_ms!=null) parts.push(chip('','tcp '+pg.tcp_ms+' ms'));
   parts.push(chip(hs?'ok':'warn',hs?t('hs')+' '+fmtD(now-hs)+' '+t('ago'):t('no_hs')));
-  if(pg.peer_panel) parts.push(chip(pg.peer_panel.ok?'dim':'bad',t('peer_panel')+(pg.peer_panel.ok?' '+pg.peer_panel.ms+' ms':' \u2715')));
+  if(pg.peer_panel) parts.push(chip(pg.peer_panel.ok?'dim':'bad',t('peer_panel')+(pg.peer_panel.ok?' '+pg.peer_panel.ms+' ms':' ✕')));
   return h('div',{class:'linkbox'},parts);
 }
+function trafficBox(x){
+  const hs=x.history||{},nt=x.net_totals||{};
+  return h('div',{class:'subcard'},
+    h('div',{class:'row subhead'},h('b',{class:'subtitle',text:t('traffic')}),h('div',{class:'sp'}),h('span',{class:'lbl',text:t('overall_speed')})),
+    h('div',{class:'trow'},
+      h('div',{class:'titem'},h('span',{class:'lbl up',text:'↑ '+t('upload')}),h('span',{class:'v',text:fmtR(x.tx)})),
+      h('div',{class:'titem'},h('span',{class:'lbl dn',text:'↓ '+t('download')}),h('span',{class:'v',text:fmtR(x.rx)}))),
+    h('div',{class:'lbl ospeed',text:t('overall_label')}),
+    h('div',{class:'chartwrap dual'},miniChart(hs.tx,{cls:'up'}),miniChart(hs.rx,{cls:'dn'})),
+    h('div',{class:'trow sm'},
+      h('div',{class:'titem'},h('span',{class:'lbl',text:t('sent')}),h('span',{class:'v sm',text:fmtB(nt.tx||0)})),
+      h('div',{class:'titem'},h('span',{class:'lbl',text:t('received')}),h('span',{class:'v sm',text:fmtB(nt.rx||0)}))));
+}
+function connBox(x){
+  const hs=x.history||{};
+  return h('div',{class:'subcard'},
+    h('div',{class:'row subhead'},h('b',{class:'subtitle',text:t('conn_stats')}),h('div',{class:'sp'}),h('span',{class:'lbl',text:x.role==='client'?t('conn_local'):t('conn_sessions')})),
+    h('div',{class:'row'},h('div',{class:'big',text:String(x.conns??0)}),h('span',{class:'lbl',text:t('open_sockets')})),
+    h('div',{class:'chartwrap'},miniChart(hs.conns,{cls:'grn'})),
+    chartStats(hs.conns));
+}
 function tc(x,full){
-  const c=x.config||{},hs=x.history||{},l5=x.log5||{info:0,warn:0,error:0};
+  const c=x.config||{},l5=x.log5||{info:0,warn:0,error:0};
   const kv=(k,v)=>h('div',{},h('span',{class:'lbl',text:k}),h('span',{class:'v',text:v}));
+  const head=h('div',{class:'row'},h('b',{text:x.name}),h('span',{class:'tag',text:t(x.role)}),h('div',{class:'sp'}),pill(x.active));
+  const addr=h('div',{class:'lbl mono addr',text:`${c.real_ip||'?'} ⇄ ${c.peer_real_ip||'?'}  ·  ${(c.transport||'spoof')==='tcp'?'TCP':'UDP '+(c.data_port||'?')+' · ICMP '+(c.icmp_id??'?')}`});
+  if(!full){
+    return h('div',{class:'card tcard compact'},head,addr,
+      h('div',{class:'kv mini'},
+        kv(t('uptime'),fmtD(x.uptime)),
+        kv(t('rx')+'/'+t('tx'),fmtR(x.rx)+' / '+fmtR(x.tx)),
+        kv(t('last_est'),x.last_established?fmtD(S.ov.now-x.last_established)+' '+t('ago'):t('never')),
+        kv(t('conns'),x.conns??0)),
+      x.listening===false&&x.active==='active'&&h('div',{class:'pill bad sm',text:t('not_listening')}),
+      h('div',{class:'row'},h('button',{class:'btn sm',onclick:()=>{S.view='tunnels';renderShell()},text:t('tunnels')})));
+  }
   const acts=[
     h('button',{class:'btn sm',onclick:()=>act(x.name,x.active==='active'?'restart':'start'),text:x.active==='active'?t('restart'):t('start')}),
     x.active==='active'&&h('button',{class:'btn sm',onclick:()=>act(x.name,'stop'),text:t('stop')}),
-    h('button',{class:'btn sm',onclick:()=>{S.logs.name=x.name;S.view='logs';renderShell()},text:t('logs')})
-  ];
-  if(full) acts.push(
+    h('button',{class:'btn sm',onclick:()=>{S.logs.name=x.name;S.view='logs';renderShell()},text:t('logs')}),
     h('button',{class:'btn sm',onclick:()=>formModal('edit',x),text:t('edit')}),
     h('button',{class:'btn sm',onclick:()=>linkModal(x),text:t('link')}),
     h('button',{class:'btn sm',onclick:()=>keyModal(x),text:t('key')}),
     h('button',{class:'btn sm',onclick:()=>testModal(x),text:t('test')}),
-    x.name!=='main'&&h('button',{class:'btn sm dng',onclick:()=>del(x),text:t('del')}));
-  return h('div',{class:'card'},
-    h('div',{class:'row'},h('b',{text:x.name}),h('span',{class:'tag',text:x.role}),h('div',{class:'sp'}),pill(x.active)),
-    h('div',{class:'lbl mono',text:`${c.real_ip||'?'} ⇄ ${c.peer_real_ip||'?'}  ·  UDP ${c.data_port||'?'} · ICMP ${c.icmp_id??'?'}`}),
-    linkBox(x),
+    x.name!=='main'&&h('button',{class:'btn sm dng',onclick:()=>del(x),text:t('del')})];
+  return h('div',{class:'card tcard full'},
+    head,addr,linkBox(x),
     h('div',{class:'kv'},
-      kv(t('uptime'),fmtD(x.uptime)),kv(t('restarts'),x.restarts),kv(t('cpu'),(x.cpu??0)+'%'),kv(t('rss'),fmtB(x.rss)),
-      kv(t('conns'),x.conns??0),x.role==='client'?kv('SOCKS5','127.0.0.1:'+(c.socks5_port||'?')):kv(t('f_tun'),c.tunnel_count),
-      kv(t('rx'),fmtR(x.rx)),kv(t('tx'),fmtR(x.tx)),
-      kv(t('last_est'),x.last_established?fmtD(S.ov.now-x.last_established)+' '+t('ago'):t('never')),
+      kv(t('uptime'),fmtD(x.uptime)),kv(t('restarts'),x.restarts),
+      kv(t('cpu'),(x.cpu??0)+'%'),kv(t('rss'),fmtB(x.rss)),
+      x.role==='client'?kv('SOCKS5','127.0.0.1:'+(c.socks5_port||'?')):kv(t('f_tun'),c.tunnel_count),
       kv('log 5m',`${l5.info} / ${l5.warn} / ${l5.error}`)),
-    x.listening===false&&x.active==='active'&&h('div',{class:'pill bad',text:t('not_listening')}),
-    h('div',{class:'two'},spark(hs.rx,''),spark(hs.conns,'grn')),
-    h('div',{class:'row'},acts));
+    x.listening===false&&x.active==='active'&&h('div',{class:'pill bad sm',text:t('not_listening')}),
+    h('div',{class:'subgrid'},trafficBox(x),connBox(x)),
+    h('div',{class:'row acts'},acts));
 }
 async function act(name,a){try{await api('POST',`/api/tunnels/${name}/${a}`);toast('OK');S.ov=await api('GET','/api/overview');showView()}catch(e){if(!e.handled)toast(e.message,1)}}
 async function del(x){if(!confirm(t('confirm_del').replace('%s',x.name)))return;try{await api('DELETE','/api/tunnels/'+x.name);toast('OK');showView()}catch(e){if(!e.handled)toast(e.message,1)}}
@@ -3734,7 +4036,7 @@ function viewTunnels(m){
   const o=S.ov;
   m.replaceChildren(
     h('div',{class:'toolbar'},h('button',{class:'btn pri',onclick:()=>formModal('create'),text:'+ '+t('create')}),h('button',{class:'btn',onclick:importModal,text:t('import')})),
-    h('div',{class:'grid'},o.tunnels.length?o.tunnels.map(x=>tc(x,true)):h('div',{class:'card',text:t('no_tunnels')})));
+    h('div',{class:'grid wide'},o.tunnels.length?o.tunnels.map(x=>tc(x,true)):h('div',{class:'card',text:t('no_tunnels')})));
 }
 function fieldDefs(role){
   const me=t(role),peer=t(role==='client'?'server':'client');
@@ -3959,7 +4261,7 @@ function uiCard(){
       rng('bg',t('ui_bg'),0,150,5,'%'),
       rng('radius',t('ui_radius'),6,28,1,'px'),
       sel('speed',t('ui_speed'),[['1.6',t('sp_slow')],['1',t('sp_norm')],['0.6',t('sp_fast')]],true)),
-    h('div',{class:'uichecks'},chk('anim',t('ui_anim')),chk('grid',t('ui_grid')),chk('shapes',t('ui_shapes')),chk('compact',t('ui_compact'))),
+    h('div',{class:'uichecks'},chk('anim',t('ui_anim')),chk('grid',t('ui_grid')),chk('compact',t('ui_compact'))),
     h('div',{class:'row'},h('button',{class:'btn',text:t('ui_reset'),onclick:()=>{UI=Object.assign({},UI_DEF);saveUI();applyUI();renderShell()}})));
   const head=h('div',{class:'uihead'+(S.uiOpen?' open':''),onclick:()=>{S.uiOpen=!S.uiOpen;body.classList.toggle('hide',!S.uiOpen);head.classList.toggle('open',!!S.uiOpen)}},
     h('b',{text:t('ui_title')}),h('span',{class:'chev',text:'\u25BE'}));
@@ -3967,66 +4269,106 @@ function uiCard(){
 }
 async function viewSettings(m){
   const st=await api('GET','/api/settings').catch(()=>({watchdog:'off'}));
-  // update card
-  const ubuild=h('div',{class:'hint',text:t('running')});
-  const ulog=h('pre',{class:'log ulog'});
-  const ubtn=h('button',{class:'btn pri',text:t('upd_now')});
-  const ucheck=h('button',{class:'btn',text:t('upd_check')});
-  const uref=async(chk)=>{
-    try{
-      const r=await api('GET','/api/update/status'+(chk===false?'?check=0':''));
-      const st=r.running?t('upd_running'):r.failed?(t('upd_failed')+' (exit '+(r.exit||'?')+')'):r.error?r.error:r.available?t('upd_avail'):t('upd_latest');
-      ubuild.textContent=t('upd_cur')+': '+(r.current||'?')+(r.latest?'  ·  '+t('upd_new')+': '+r.latest:'')+'  ·  '+st;
-      ulog.textContent=r.log||'';ulog.scrollTop=ulog.scrollHeight;
-      ubtn.disabled=(!r.available&&!r.failed)||!!r.running;
-      if(r.running){clearInterval(S.timer);S.timer=setInterval(()=>uref(false),3000)} else if(S.timer){clearInterval(S.timer);S.timer=null}
-    }catch(e){ubuild.textContent=t('upd_reconnect');clearInterval(S.timer);S.timer=setInterval(()=>uref(false),4000)}
-  };
-  ubtn.onclick=async()=>{if(!confirm(t('upd_warn')))return;try{await api('POST','/api/update',{});toast(t('upd_started'));clearInterval(S.timer);S.timer=setInterval(()=>uref(false),3000);uref(false)}catch(e){if(!e.handled)toast(e.message,1)}};
-  ucheck.onclick=()=>uref(true);
-  uref(true);
-  // peer server pairing + status + auto-sync
-  const pr=await api('GET','/api/peer').catch(()=>({paired:false,peer_url:''}));
-  const purl=h('input',{value:pr.peer_url||'',placeholder:'https://<peer-ip>:7788'});
-  const ptok=h('input',{placeholder:t('peer_token_ph')});
-  const pstat=h('div',{class:'hint',text:t('peer_paired')+': '+(pr.paired?'✓':'—')});
-  const pgen=h('button',{class:'btn',text:t('peer_gen'),onclick:async()=>{try{const r=await api('POST','/api/peer',{generate:true});if(r.sync_token)openModal([h('h3',{text:t('peer_token')}),h('div',{class:'hint',text:t('peer_token_hint')}),h('div',{class:'copy mono',text:r.sync_token}),h('button',{class:'btn',onclick:closeModal,text:t('close')})]);toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
-  const ppair=h('button',{class:'btn pri',text:t('peer_pair'),onclick:async()=>{try{const body={peer_url:purl.value.trim()};if(ptok.value.trim())body.sync_token=ptok.value.trim();await api('POST','/api/peer',body);ptok.value='';toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
-  const pcheck=h('button',{class:'btn',text:t('peer_check'),onclick:async()=>{pstat.textContent=t('running');try{const r=await api('GET','/api/peer/status');pstat.replaceChildren(h('div',{},'✓ '+(r.host||'')+' ('+(r.role||'')+')  ·  build '+(r.build||'?')),...(r.tunnels||[]).map(x=>h('div',{class:'hint'},x.name+': '+(x.active||'?')+'  ·  '+x.transport+'  ·  port '+(x.data_port||'?'))));}catch(e){if(!e.handled)pstat.replaceChildren(h('div',{class:'err',text:e.message}))}}});
-  const punpair=h('button',{class:'btn dng',text:t('peer_unpair'),onclick:async()=>{try{await api('POST','/api/peer',{unpair:true});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
-  const wd=h('select',{},['off','30m','1h','6h','12h','24h'].map(v=>h('option',{value:v,text:v})));wd.value=st.watchdog;
-  const wdBtn=h('button',{class:'btn',text:t('apply'),onclick:async()=>{try{await api('POST','/api/settings/watchdog',{value:wd.value});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
-  const o=h('input',{type:'password',autocomplete:'current-password'}),n=h('input',{type:'password',autocomplete:'new-password'}),perr=h('div',{class:'err'});
-  const pwBtn=h('button',{class:'btn',text:t('save'),onclick:async()=>{perr.textContent='';try{await api('POST','/api/settings/password',{old:o.value,new:n.value});o.value=n.value='';toast(t('saved'))}catch(e){if(!e.handled)perr.textContent=e.message}}});
-  // web-panel address / TLS / enable
-  const pbind=h('input',{value:st.bind||'127.0.0.1'});
-  const pport=h('input',{value:st.port||7777,inputmode:'numeric'});
-  const ptls=h('select',{},[['off','HTTP'],['on','HTTPS (TLS)']].map(a=>h('option',{value:a[0],text:a[1]})));ptls.value=st.tls?'on':'off';
-  const psave=h('button',{class:'btn',text:t('panel_save'),onclick:async()=>{if(!confirm(t('panel_warn')))return;try{const r=await api('POST','/api/settings/panel',{bind:pbind.value.trim(),port:+pport.value,tls:ptls.value==='on'});toast(r.note||t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
-  const pdis=h('button',{class:'btn dng',text:t('panel_disable'),onclick:async()=>{if(!confirm(t('panel_dis_warn')))return;try{await api('POST','/api/settings/panel/toggle',{on:false});toast(t('panel_disabled'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+  S.setTab=S.setTab||'general';
   const b=(S.meta.build||{});
-  m.replaceChildren(
-    h('div',{class:'card'},h('b',{text:t('upd_title')}),h('div',{class:'hint',text:t('upd_hint')}),ubuild,h('div',{class:'row'},ubtn,ucheck),ulog),
-    h('div',{class:'lbl',text:'\u00a0'}),
-    uiCard(),
-    h('div',{class:'lbl',text:'\u00a0'}),
-    h('div',{class:'card'},h('b',{text:t('peer_cfg')}),h('div',{class:'hint',text:t('peer_hint')}),
-      h('label',{class:'f'},h('span',{text:t('peer_url')}),purl),
-      h('label',{class:'f'},h('span',{text:t('peer_token')}),ptok),
-      h('div',{class:'row'},ppair,pgen,pcheck,punpair),
-      pstat),
-    h('div',{class:'lbl',text:' '}),
-    h('div',{class:'card'},h('b',{text:t('panel_cfg')}),h('div',{class:'hint',text:t('panel_cfg_hint')}),
-      h('div',{class:'two'},h('label',{class:'f'},h('span',{text:t('panel_bind')}),pbind),h('label',{class:'f'},h('span',{text:t('panel_port')}),pport)),
-      h('label',{class:'f'},h('span',{text:'TLS'}),ptls),
-      h('div',{class:'row'},psave,pdis)),
-    h('div',{class:'lbl',text:'\u00a0'}),
-    h('div',{class:'card'},h('b',{text:t('wd')}),h('div',{class:'hint',text:t('wd_hint')}),h('div',{class:'row'},wd,wdBtn)),
-    h('div',{class:'lbl',text:'\u00a0'}),
-    h('div',{class:'card'},h('b',{text:t('chg_pw')}),h('label',{class:'f'},h('span',{text:t('old_pw')}),o),h('label',{class:'f'},h('span',{text:t('new_pw')}),n),perr,pwBtn),
-    h('div',{class:'lbl',text:'\u00a0'}),
-    h('div',{class:'card'},h('div',{class:'kv'},h('div',{},h('span',{class:'lbl',text:t('role')}),h('span',{class:'v',text:S.meta.role})),h('div',{},h('span',{class:'lbl',text:t('build')}),h('span',{class:'v mono',text:(b.commit||'?').slice(0,12)})),h('div',{},h('span',{class:'lbl',text:'Panel'}),h('span',{class:'v',text:`${st.bind||'?'}:${st.port||'?'} ${st.tls?'TLS':'HTTP'}`}))),
-      h('div',{class:'row'},h('button',{class:'btn',text:t('logout'),onclick:async()=>{try{await api('POST','/api/logout',{})}catch(e){}stopTimers();renderLogin()}}))));
+
+  // ---- top bar: sign out / restart panel / restart core ----
+  const doLogout=async()=>{try{await api('POST','/api/logout',{})}catch(e){}stopTimers();renderLogin()};
+  const doRestartPanel=async()=>{if(!confirm(t('restart_panel_warn')))return;try{await api('POST','/api/settings/panel/restart',{});toast(t('upd_reconnect'))}catch(e){if(!e.handled)toast(e.message,1)}};
+  const doRestartCore=async()=>{if(!confirm(t('restart_core_warn')))return;try{const r=await api('POST','/api/core/restart',{});toast(r.ok?t('restart_core_ok'):t('restart_core_part'));S.ov=await api('GET','/api/overview').catch(()=>S.ov)}catch(e){if(!e.handled)toast(e.message,1)}};
+  const topbar=h('div',{class:'row settop'},
+    h('button',{class:'btn dng',onclick:doLogout,text:t('logout')}),
+    h('button',{class:'btn',onclick:doRestartPanel,text:t('restart_panel')}),
+    h('button',{class:'btn',onclick:doRestartCore,text:t('restart_core')}),
+    h('div',{class:'sp'}),
+    h('span',{class:'tag',text:S.meta.role}),h('span',{class:'tag mono',text:(b.commit||'?').slice(0,8)}));
+
+  // ---- sub-tabs ----
+  const TABS=[['general',t('tab_general')],['appearance',t('tab_appearance')],['panel',t('tab_panel')],['peer',t('tab_peer')],['security',t('tab_security')],['update',t('tab_update')]];
+  const tabbar=h('nav',{class:'stabs'},TABS.map(([k,l])=>h('button',{class:S.setTab===k?'on':'',onclick:()=>{S.setTab=k;showView()},text:l})));
+
+  const sections=[];
+
+  if(S.setTab==='general'){
+    const wd=h('select',{},['off','30m','1h','6h','12h','24h'].map(v=>h('option',{value:v,text:v})));wd.value=st.watchdog;
+    const wdBtn=h('button',{class:'btn',text:t('apply'),onclick:async()=>{try{await api('POST','/api/settings/watchdog',{value:wd.value});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+    sections.push(
+      h('div',{class:'card'},h('b',{text:t('wd')}),h('div',{class:'hint',text:t('wd_hint')}),h('div',{class:'row'},wd,wdBtn)),
+      h('div',{class:'lbl',text:' '}),
+      h('div',{class:'card'},h('div',{class:'kv'},
+        h('div',{},h('span',{class:'lbl',text:t('role')}),h('span',{class:'v',text:S.meta.role})),
+        h('div',{},h('span',{class:'lbl',text:t('build')}),h('span',{class:'v mono',text:(b.commit||'?').slice(0,12)})),
+        h('div',{},h('span',{class:'lbl',text:'Panel'}),h('span',{class:'v',text:`${st.bind||'?'}:${st.port||'?'} ${st.tls?'TLS':'HTTP'}${st.path?'/'+st.path:''}`})))));
+  }
+
+  if(S.setTab==='appearance'){
+    sections.push(uiCard());
+  }
+
+  if(S.setTab==='panel'){
+    const pbind=h('input',{value:st.bind||'127.0.0.1'});
+    const pport=h('input',{value:st.port||7777,inputmode:'numeric'});
+    const ppath=h('input',{value:st.path||'',placeholder:t('panel_path_ph')});
+    const ptls=h('select',{},[['off','HTTP'],['on','HTTPS (TLS)']].map(a=>h('option',{value:a[0],text:a[1]})));ptls.value=st.tls?'on':'off';
+    const psave=h('button',{class:'btn pri',text:t('panel_save'),onclick:async()=>{if(!confirm(t('panel_warn')))return;try{const r=await api('POST','/api/settings/panel',{bind:pbind.value.trim(),port:+pport.value,tls:ptls.value==='on',path:ppath.value.trim()});toast(r.note||t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+    const pdis=h('button',{class:'btn dng',text:t('panel_disable'),onclick:async()=>{if(!confirm(t('panel_dis_warn')))return;try{await api('POST','/api/settings/panel/toggle',{on:false});toast(t('panel_disabled'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+    sections.push(
+      h('div',{class:'card'},h('b',{text:t('panel_cfg')}),h('div',{class:'hint',text:t('panel_cfg_hint')}),
+        h('div',{class:'two'},h('label',{class:'f'},h('span',{text:t('panel_bind')}),pbind),h('label',{class:'f'},h('span',{text:t('panel_port')}),pport)),
+        h('label',{class:'f'},h('span',{text:t('panel_path')}),ppath,h('div',{class:'hint',text:t('panel_path_hint')})),
+        h('label',{class:'f'},h('span',{text:'TLS'}),ptls),
+        h('div',{class:'row'},psave,pdis)));
+  }
+
+  if(S.setTab==='peer'){
+    const pr=await api('GET','/api/peer').catch(()=>({paired:false,peer_url:'',sync_proxy:''}));
+    const purl=h('input',{value:pr.peer_url||'',placeholder:'https://<peer-ip>:7788'});
+    const ptok=h('input',{placeholder:t('peer_token_ph')});
+    const pproxy=h('input',{value:pr.sync_proxy||'',placeholder:t('sync_proxy_ph')});
+    const pstat=h('div',{class:'hint',text:t('peer_paired')+': '+(pr.paired?'✓':'—')});
+    const pgen=h('button',{class:'btn',text:t('peer_gen'),onclick:async()=>{try{const r=await api('POST','/api/peer',{generate:true});if(r.sync_token)openModal([h('h3',{text:t('peer_token')}),h('div',{class:'hint',text:t('peer_token_hint')}),h('div',{class:'copy mono',text:r.sync_token}),h('button',{class:'btn',onclick:closeModal,text:t('close')})]);toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+    const ppair=h('button',{class:'btn pri',text:t('peer_pair'),onclick:async()=>{try{const body={peer_url:purl.value.trim(),sync_proxy:pproxy.value.trim()};if(ptok.value.trim())body.sync_token=ptok.value.trim();await api('POST','/api/peer',body);ptok.value='';toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+    const pcheck=h('button',{class:'btn',text:t('peer_check'),onclick:async()=>{pstat.textContent=t('running');try{const r=await api('GET','/api/peer/status');pstat.replaceChildren(h('div',{},'✓ '+(r.host||'')+' ('+(r.role||'')+')  ·  build '+(r.build||'?')),...(r.tunnels||[]).map(x=>h('div',{class:'hint'},x.name+': '+(x.active||'?')+'  ·  '+x.transport+'  ·  port '+(x.data_port||'?'))));}catch(e){if(!e.handled)pstat.replaceChildren(h('div',{class:'err',text:e.message}))}}});
+    const punpair=h('button',{class:'btn dng',text:t('peer_unpair'),onclick:async()=>{try{await api('POST','/api/peer',{unpair:true});toast(t('saved'))}catch(e){if(!e.handled)toast(e.message,1)}}});
+    sections.push(
+      h('div',{class:'card'},h('b',{text:t('peer_cfg')}),h('div',{class:'hint',text:t('peer_hint')}),
+        h('label',{class:'f'},h('span',{text:t('peer_url')}),purl),
+        h('label',{class:'f'},h('span',{text:t('peer_token')}),ptok),
+        h('label',{class:'f'},h('span',{text:t('sync_proxy')}),pproxy,h('div',{class:'hint',text:t('sync_proxy_hint')})),
+        h('div',{class:'row'},ppair,pgen,pcheck,punpair),
+        pstat));
+  }
+
+  if(S.setTab==='security'){
+    const o=h('input',{type:'password',autocomplete:'current-password'}),n=h('input',{type:'password',autocomplete:'new-password'}),perr=h('div',{class:'err'});
+    const pwBtn=h('button',{class:'btn pri',text:t('save'),onclick:async()=>{perr.textContent='';try{await api('POST','/api/settings/password',{old:o.value,new:n.value});o.value=n.value='';toast(t('saved'))}catch(e){if(!e.handled)perr.textContent=e.message}}});
+    sections.push(
+      h('div',{class:'card'},h('b',{text:t('chg_pw')}),h('label',{class:'f'},h('span',{text:t('old_pw')}),o),h('label',{class:'f'},h('span',{text:t('new_pw')}),n),perr,pwBtn));
+  }
+
+  if(S.setTab==='update'){
+    const ubuild=h('div',{class:'hint',text:t('running')});
+    const ulog=h('pre',{class:'log ulog'});
+    const ubtn=h('button',{class:'btn pri',text:t('upd_now')});
+    const ucheck=h('button',{class:'btn',text:t('upd_check')});
+    const uref=async(chk)=>{
+      try{
+        const r=await api('GET','/api/update/status'+(chk===false?'?check=0':''));
+        const stx=r.running?t('upd_running'):r.failed?(t('upd_failed')+' (exit '+(r.exit||'?')+')'):r.error?r.error:r.available?t('upd_avail'):t('upd_latest');
+        ubuild.textContent=t('upd_cur')+': '+(r.current||'?')+(r.latest?'  ·  '+t('upd_new')+': '+r.latest:'')+'  ·  '+stx;
+        ulog.textContent=r.log||'';ulog.scrollTop=ulog.scrollHeight;
+        ubtn.disabled=(!r.available&&!r.failed)||!!r.running;
+        if(r.running){clearInterval(S.timer);S.timer=setInterval(()=>uref(false),3000)} else if(S.timer){clearInterval(S.timer);S.timer=null}
+      }catch(e){ubuild.textContent=t('upd_reconnect');clearInterval(S.timer);S.timer=setInterval(()=>uref(false),4000)}
+    };
+    ubtn.onclick=async()=>{if(!confirm(t('upd_warn')))return;try{await api('POST','/api/update',{});toast(t('upd_started'));clearInterval(S.timer);S.timer=setInterval(()=>uref(false),3000);uref(false)}catch(e){if(!e.handled)toast(e.message,1)}};
+    ucheck.onclick=()=>uref(true);
+    uref(true);
+    sections.push(
+      h('div',{class:'card'},h('b',{text:t('upd_title')}),h('div',{class:'hint',text:t('upd_hint')}),ubuild,h('div',{class:'row'},ubtn,ucheck),ulog));
+  }
+
+  m.replaceChildren(topbar,tabbar,...sections);
 }
 
 /* ---------- start ---------- */
@@ -4089,6 +4431,16 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method):
         u = urlparse(self.path)
         path = u.path
+        prefix = str(load_panel().get("path") or "").strip("/")
+        if prefix:
+            pfx = "/" + prefix
+            if path == pfx:
+                path = "/"
+            elif path.startswith(pfx + "/"):
+                path = path[len(pfx):]
+            else:
+                self._json(404, {"error": "not found"})
+                return
         if method == "GET" and path in ("/", "/index.html"):
             nonce = secrets.token_urlsafe(16)
             body = INDEX_HTML.replace("__NONCE__", nonce).replace("__UIV__", ui_version()).encode()
@@ -4189,6 +4541,8 @@ class Handler(BaseHTTPRequestHandler):
                 return api_peer_status(req)
             if path == "/api/update/status":
                 return api_update_status(req)
+            if path == "/api/settings/panel/prefix":
+                return {"path": str(load_panel().get("path") or "")}
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/logs$", path)
             if m:
                 return api_logs(req, m.group(1))
@@ -4224,6 +4578,10 @@ class Handler(BaseHTTPRequestHandler):
                 return api_panel_toggle(req)
             if path == "/api/peer":
                 return api_peer_set(req)
+            if path == "/api/settings/panel/restart":
+                return api_panel_restart_now(req)
+            if path == "/api/core/restart":
+                return api_core_restart(req)
             if path == "/api/update":
                 return api_update_start(req)
             m = re.match(r"^/api/tunnels/([a-z0-9-]+)/(start|stop|restart)$", path)
@@ -4373,7 +4731,8 @@ def panel_url(cfg):
     host = cfg.get("bind", "127.0.0.1")
     if host in ("0.0.0.0", "::"):
         host = detect_ip() or "SERVER_IP"
-    return "%s://%s:%s" % ("https" if cfg.get("tls") else "http", host, cfg.get("port", 7777))
+    base = "%s://%s:%s" % ("https" if cfg.get("tls") else "http", host, cfg.get("port", 7777))
+    return base + ("/" + cfg["path"] if cfg.get("path") else "")
 
 
 def cmd_admin(argv):
@@ -4387,7 +4746,7 @@ def cmd_admin(argv):
     sub.add_parser("passwd-random")
     sub.add_parser("info")
     s = sub.add_parser("set")
-    s.add_argument("key", choices=["bind", "port", "tls"])
+    s.add_argument("key", choices=["bind", "port", "tls", "path"])
     s.add_argument("value")
     args = ap.parse_args(argv)
     cfg = load_panel()
@@ -4417,6 +4776,11 @@ def cmd_admin(argv):
             if not v_ip(args.value):
                 sys.exit("invalid IPv4 address")
             cfg["bind"] = args.value
+        elif args.key == "path":
+            v = args.value.strip().strip("/")
+            if v and not re.match(r"^[A-Za-z0-9_-]{1,64}$", v):
+                sys.exit("path may only contain letters, digits, _ and -")
+            cfg["path"] = v
         else:
             cfg["tls"] = args.value in ("1", "on", "true", "yes")
         save_panel(cfg)
